@@ -1,0 +1,152 @@
+---
+# verify.yml — Read-only health check
+# Usage: ansible-playbook -i inventories/hosts.ini verify.yml
+
+- name: Tesla DGX-1 — Cluster health verification
+  hosts: tesla
+  become: yes
+  gather_facts: no
+
+  tasks:
+    - name: munge active
+      ansible.builtin.command: systemctl is-active munge
+      register: r
+      changed_when: false
+      failed_when: r.stdout != "active"
+
+    - ansible.builtin.debug: { msg: "[1] PASS munge active" }
+
+    - name: mariadb active
+      ansible.builtin.command: systemctl is-active mariadb
+      register: r
+      changed_when: false
+      failed_when: r.stdout != "active"
+
+    - ansible.builtin.debug: { msg: "[2] PASS mariadb active" }
+
+    - name: slurmdbd active
+      ansible.builtin.command: systemctl is-active slurmdbd
+      register: r
+      changed_when: false
+      failed_when: r.stdout != "active"
+
+    - ansible.builtin.debug: { msg: "[3] PASS slurmdbd active" }
+
+    - name: slurmctld active
+      ansible.builtin.command: systemctl is-active slurmctld
+      register: r
+      changed_when: false
+      failed_when: r.stdout != "active"
+
+    - ansible.builtin.debug: { msg: "[4] PASS slurmctld active" }
+
+    - name: slurmd active
+      ansible.builtin.command: systemctl is-active slurmd
+      register: r
+      changed_when: false
+      failed_when: r.stdout != "active"
+
+    - ansible.builtin.debug: { msg: "[5] PASS slurmd active" }
+
+    - name: sinfo works
+      ansible.builtin.command: sinfo -o "%-20N %-10P %-8t %-20G"
+      register: si
+      changed_when: false
+      failed_when: si.rc != 0
+
+    - ansible.builtin.debug: { msg: "{{ ['[6] PASS sinfo:'] + si.stdout_lines }}" }
+
+    - name: GPU GRES present
+      ansible.builtin.command: sinfo -o "%G" --noheader
+      register: g
+      changed_when: false
+      failed_when: "'gpu' not in g.stdout or gpu_type not in g.stdout"
+
+    - ansible.builtin.debug: { msg: "[7] PASS GPU GRES {{ g.stdout }}" }
+
+    - name: cgroups v2
+      ansible.builtin.command: stat -fc %T /sys/fs/cgroup
+      register: cg
+      changed_when: false
+      failed_when: "'cgroup2' not in cg.stdout"
+
+    - ansible.builtin.debug: { msg: "[8] PASS cgroups v2" }
+
+    - name: pam_slurm_adopt configured
+      ansible.builtin.command: grep -q pam_slurm_adopt /etc/pam.d/sshd
+      register: p
+      changed_when: false
+      failed_when: p.rc != 0
+
+    - ansible.builtin.debug: { msg: "[9] PASS pam_slurm_adopt" }
+
+    - name: NVLink up at 25.78 GB/s × 48
+      ansible.builtin.shell: |
+        set -o pipefail
+        nvidia-smi nvlink --status 2>/dev/null | grep -c "25.781 GB/s" || echo 0
+      register: nvl
+      changed_when: false
+
+    - ansible.builtin.debug:
+        msg: "[10] {{ 'PASS' if (nvl.stdout|int) >= 48 else 'WARN' }} NVLink {{ nvl.stdout }}/48"
+
+    - name: All QoS exist in slurmdbd
+      ansible.builtin.command: sacctmgr -nP show qos format=name
+      register: q
+      changed_when: false
+
+    - name: Assert each tier QoS exists
+      ansible.builtin.assert:
+        that: item.qos in q.stdout
+        fail_msg: "QoS {{ item.qos }} missing from slurmdbd"
+      loop: "{{ tesla_tiers }}"
+      loop_control: { label: "{{ item.qos }}" }
+
+    - ansible.builtin.debug: { msg: "[11] PASS all {{ tesla_tiers | length }} QoS present" }
+
+    - name: All tier accounts exist
+      ansible.builtin.command: sacctmgr -nP show account format=account
+      register: a
+      changed_when: false
+
+    - name: Assert each tier account exists
+      ansible.builtin.assert:
+        that: item.name in a.stdout
+      loop: "{{ tesla_tiers }}"
+      loop_control: { label: "{{ item.name }}" }
+
+    - ansible.builtin.debug: { msg: "[12] PASS all {{ tesla_tiers | length }} tier accounts present" }
+
+    - name: /tools/miniconda3 installed
+      ansible.builtin.stat:
+        path: "{{ miniconda_root }}/bin/conda"
+      register: cb
+
+    - ansible.builtin.assert:
+        that: cb.stat.exists
+        fail_msg: "Miniconda not installed at {{ miniconda_root }}"
+
+    - ansible.builtin.debug: { msg: "[13] PASS miniconda at {{ miniconda_root }}" }
+
+    - name: /etc/skel/.profile has conda hook
+      ansible.builtin.command: grep -q "Tesla shared miniconda" /etc/skel/.profile
+      register: sk
+      changed_when: false
+      failed_when: sk.rc != 0
+
+    - ansible.builtin.debug: { msg: "[14] PASS /etc/skel/.profile has conda hook" }
+
+    - name: /home has usrquota
+      ansible.builtin.command: findmnt -no OPTIONS /home
+      register: m
+      changed_when: false
+      failed_when: "'usrquota' not in m.stdout"
+
+    - ansible.builtin.debug: { msg: "[15] PASS /home usrquota" }
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "All 15 checks passed. Tesla DGX-1 ready."
+          - "Submit jobs: sbatch <script>"
+          - "Status:      tesla-status [--all]"

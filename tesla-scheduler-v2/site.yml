@@ -1,0 +1,108 @@
+---
+# site.yml — Master playbook for Tesla DGX-1 GPU Cluster Setup
+#
+# ORDER MATTERS:
+#   slurm_base        → install packages, munge, slurm user
+#   storage_quotas    → apply 200GB quotas on /home (idempotent)
+#   shared_miniconda  → /tools/miniconda3 + /etc/skel snippet
+#   slurmdbd_setup    → MariaDB DB+user, slurmdbd.conf, slurmdbd up, sacctmgr accounts/QoS
+#   slurm_config      → slurm.conf, gres.conf, cgroup.conf, slurmctld+slurmd up
+#   gpu_isolation     → PAM, udev, NVLink check
+#   user_policy       → tier Unix groups, ulimits, tier-aware login banner
+#   admin_tools       → MOTD, helper scripts, logrotate, systemd watchdog
+#
+# Run with:  ansible-playbook -i inventories/hosts.ini site.yml -K
+#
+# Tags: base, quotas, conda, dbd, config, isolation, policy, tools
+
+- name: Tesla DGX-1 — Full cluster setup
+  hosts: tesla
+  become: yes
+  gather_facts: yes
+
+  pre_tasks:
+    - name: Verify OS
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == "Ubuntu"
+          - ansible_distribution_major_version | int >= 22
+        fail_msg: "Targets Ubuntu 22.04+ / DGX OS 6. Found: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+
+    - name: Verify nvidia-smi shows {{ num_gpus }} GPUs
+      ansible.builtin.shell: |
+        set -o pipefail
+        nvidia-smi --query-gpu=name --format=csv,noheader | wc -l
+      register: gpu_count
+      changed_when: false
+      failed_when: false
+      check_mode: false   # read-only; must run even in dry-run for the assert below
+
+    - name: Assert GPU count
+      ansible.builtin.assert:
+        that: gpu_count.stdout | int == num_gpus
+        fail_msg: "Expected {{ num_gpus }} GPUs, nvidia-smi reports {{ gpu_count.stdout | default('0') }}."
+
+    - name: Print cluster configuration summary
+      ansible.builtin.debug:
+        msg:
+          - "Cluster name : {{ cluster_name }}"
+          - "Hostname     : {{ control_machine_hostname }}"
+          - "GPUs         : {{ num_gpus }}x {{ gpu_type | upper }}"
+          - "Tiers        : {{ tesla_tiers | map(attribute='name') | join(', ') }}"
+          - "Default tier : {{ default_tier }}"
+          - "Home quota   : {{ home_quota_gb }} GB"
+          - "NAS root     : {{ nas_root }}"
+
+  roles:
+    - role: slurm_base
+      tags: [base]
+
+    - role: storage_quotas
+      tags: [quotas]
+
+    - role: shared_miniconda
+      tags: [conda]
+
+    - role: slurmdbd_setup
+      tags: [dbd]
+
+    - role: slurm_config
+      tags: [config]
+
+    - role: gpu_isolation
+      tags: [isolation]
+
+    - role: user_policy
+      tags: [policy]
+
+    - role: admin_tools
+      tags: [tools]
+
+  post_tasks:
+    - name: Final — sinfo
+      ansible.builtin.command: sinfo
+      register: sinfo_final
+      changed_when: false
+
+    - name: Final — sacctmgr show qos
+      ansible.builtin.command: sacctmgr -nP show qos format=name,priority,maxtresperjob,maxjobspu
+      register: qos_show
+      changed_when: false
+      failed_when: false
+
+    - name: Print final state
+      ansible.builtin.debug:
+        msg:
+          - "── sinfo ───────────────────────────────────"
+          - "{{ sinfo_final.stdout_lines }}"
+          - "── QoS ─────────────────────────────────────"
+          - "{{ qos_show.stdout_lines | default(['(slurmdbd not reachable)']) }}"
+          - "────────────────────────────────────────────"
+          - "✓ Tesla DGX-1 base setup complete."
+          - ""
+          - "Next: populate users via the CSV workflow:"
+          - "  sudo python3 tools/bootstrap_users_csv.py --out /tmp/users.csv.discovered"
+          - "  # review/edit, then:"
+          - "  sudo mv /tmp/users.csv.discovered {{ users_csv }}"
+          - "  sudo ansible-playbook -i inventories/hosts.ini sync_users.yml --check"
+          - "  sudo ansible-playbook -i inventories/hosts.ini sync_users.yml"

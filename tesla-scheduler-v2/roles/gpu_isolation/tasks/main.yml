@@ -1,0 +1,135 @@
+---
+# roles/gpu_isolation/tasks/main.yml
+#
+# Goal: Prevent users from running CUDA/GPU workloads outside of a SLURM
+# job allocation. This is achieved via two complementary mechanisms:
+#
+#   1. cgroup device isolation (via SLURM's cgroup plugin) — SLURM sets
+#      CUDA_VISIBLE_DEVICES and restricts /dev/nvidia* access to the job's
+#      cgroup. Any process outside a cgroup has no GPU access.
+#
+#   2. pam_slurm_adopt — SSH sessions are adopted into existing SLURM
+#      allocations, ensuring processes run inside the cgroup context.
+#
+# Together, even if a user tries `python train.py` directly in an SSH
+# session without submitting a job, they get no GPU access.
+
+# ── Verify cgroups v2 is active ─────────────────────────────────────────
+- name: Check that cgroups v2 is mounted
+  ansible.builtin.command: stat -fc %T /sys/fs/cgroup
+  register: cgroup_type
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Assert cgroups v2 is in use
+  ansible.builtin.assert:
+    that: "'cgroup2' in cgroup_type.stdout"
+    fail_msg: >
+      cgroups v2 not detected. Ubuntu 22.04+ (and DGX OS 6) use v2 by default.
+      Check your kernel cmdline: cat /proc/cmdline | grep cgroup.
+      You may need to add systemd.unified_cgroup_hierarchy=1 to GRUB.
+    success_msg: "cgroups v2 confirmed."
+
+# ── nvidia-smi check ────────────────────────────────────────────────────
+- name: Verify nvidia-smi is available
+  ansible.builtin.command: nvidia-smi --query-gpu=name --format=csv,noheader
+  register: nvidia_smi_out
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Display detected GPUs
+  ansible.builtin.debug:
+    msg: "Detected GPUs: {{ nvidia_smi_out.stdout_lines }}"
+  when: nvidia_smi_out.rc == 0
+
+- name: Warn if nvidia-smi not found
+  ansible.builtin.debug:
+    msg: >
+      WARNING: nvidia-smi not found. Ensure NVIDIA drivers are installed
+      before running this playbook. GPU isolation will be configured but
+      may not function until drivers are present.
+  when: nvidia_smi_out.rc != 0
+
+# ── Collect GPU bus IDs to verify gres.conf accurately ──────────────────
+- name: Get GPU PCI bus IDs
+  ansible.builtin.shell: |
+    set -o pipefail
+    nvidia-smi --query-gpu=index,pci.bus_id --format=csv,noheader 2>/dev/null || echo "NOT_FOUND"
+  register: gpu_bus_ids
+  changed_when: false
+  check_mode: false
+
+- name: Show GPU bus IDs (verify these match gres.conf and topology expectations)
+  ansible.builtin.debug:
+    msg:
+      - "GPU index,bus_id mapping:"
+      - "{{ gpu_bus_ids.stdout_lines }}"
+      - "Expected DGX-1 layout: 0-3 on NUMA0 (bus 06,07,0A,0B), 4-7 on NUMA1 (bus 85,86,89,8A)"
+
+# ── NVLink health check (DGX-1 specific) ─────────────────────────────────
+- name: Probe NVLink status
+  ansible.builtin.shell: |
+    set -o pipefail
+    nvidia-smi nvlink --status 2>/dev/null | grep -c "25.781 GB/s" || echo "0"
+  register: nvlink_up
+  changed_when: false
+  check_mode: false
+
+- name: Report NVLink link count
+  ansible.builtin.debug:
+    msg: "{{ nvlink_up.stdout | int }} NVLinks at 25.781 GB/s (expected 48 = 8 GPUs × 6 links on DGX-1)"
+
+- name: Warn if NVLink topology incomplete
+  ansible.builtin.debug:
+    msg: >
+      WARNING: Expected 48 NVLinks up at full speed but found {{ nvlink_up.stdout }}.
+      Multi-GPU NCCL/PyTorch DDP performance may be degraded.
+      Investigate with: nvidia-smi nvlink --status
+  when: nvlink_up.stdout | int < 48
+
+# ── PAM: configure pam_slurm_adopt ──────────────────────────────────────
+- name: Deploy PAM sshd config with pam_slurm_adopt
+  ansible.builtin.template:
+    src: pam_sshd.j2
+    dest: /etc/pam.d/sshd
+    owner: root
+    group: root
+    mode: "0644"
+    backup: yes
+  notify: Restart sshd
+
+# ── Permissions: restrict /dev/nvidia* to slurm-allocated jobs ──────────
+# SLURM's cgroup plugin handles this at runtime. We additionally set a
+# udev rule so that nvidia devices are group-owned by 'video', and we
+# do NOT add general users to the 'video' group (only slurm's cgroup
+# context provides device access).
+- name: Deploy udev rule to group-restrict nvidia devices
+  ansible.builtin.copy:
+    dest: /etc/udev/rules.d/99-tesla-nvidia.rules
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Tesla DGX-1: restrict GPU devices so only slurm cgroup jobs can access them.
+      # Users not in a SLURM allocation are blocked via cgroup device isolation.
+      # Wildcard nvidia[0-9]* covers /dev/nvidia0 through /dev/nvidia7 on the DGX-1.
+      SUBSYSTEM=="nvidia", KERNEL=="nvidia[0-9]*", GROUP="video", MODE="0660"
+      SUBSYSTEM=="nvidia", KERNEL=="nvidiactl",    GROUP="video", MODE="0660"
+      SUBSYSTEM=="nvidia", KERNEL=="nvidia-uvm",   GROUP="video", MODE="0660"
+      SUBSYSTEM=="nvidia", KERNEL=="nvidia-uvm-tools", GROUP="video", MODE="0660"
+      SUBSYSTEM=="nvidia", KERNEL=="nvidia-modeset",   GROUP="video", MODE="0660"
+  notify: Reload udev rules
+
+- name: Ensure regular users are NOT in the video group
+  # Users get GPU access only through SLURM cgroup allocation, not group membership.
+  ansible.builtin.shell: |
+    for user in {{ tesla_users | join(' ') }}; do
+      if id -nG "$user" 2>/dev/null | grep -qw video; then
+        gpasswd -d "$user" video && echo "Removed $user from video group"
+      fi
+    done
+  register: video_group_cleanup
+  changed_when: "'Removed' in video_group_cleanup.stdout"
+  ignore_errors: yes

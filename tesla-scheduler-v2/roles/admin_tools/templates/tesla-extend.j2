@@ -1,0 +1,45 @@
+#!/bin/bash
+# =============================================================
+# tesla-extend — Admin tool to extend a job's walltime
+# Usage: sudo tesla-extend <JOBID> <NEW_TIMELIMIT>
+#
+# Examples:
+#   sudo tesla-extend 42 72:00:00     # extend job 42 to 72 hours
+#   sudo tesla-extend 42 4-00:00:00   # extend to 4 days
+# =============================================================
+
+set -euo pipefail
+
+if [[ $EUID -ne 0 ]] && ! groups | grep -qw slurm_admins; then
+  echo "ERROR: Only admins (root or slurm_admins group) can extend jobs." >&2
+  exit 1
+fi
+
+if [[ $# -ne 2 ]]; then
+  echo "Usage: tesla-extend <JOBID> <TIMELIMIT>"
+  echo "  TIMELIMIT format: HH:MM:SS or D-HH:MM:SS"
+  exit 1
+fi
+
+JOBID="$1"
+TIMELIMIT="$2"
+
+# Validate job exists
+if ! scontrol show job "$JOBID" &>/dev/null; then
+  echo "ERROR: Job $JOBID not found." >&2
+  exit 1
+fi
+
+JOB_USER=$(scontrol show job "$JOBID" | grep -oP 'UserId=\K[^(]+')
+CURRENT_LIMIT=$(scontrol show job "$JOBID" | grep -oP 'TimeLimit=\K\S+')
+
+echo "Job       : $JOBID"
+echo "User      : $JOB_USER"
+echo "Current   : $CURRENT_LIMIT"
+echo "Extending : → $TIMELIMIT"
+echo ""
+read -rp "Confirm extension? [y/N] " confirm
+[[ "$confirm" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
+
+scontrol update JobId="$JOBID" TimeLimit="$TIMELIMIT"
+echo "✓ Job $JOBID time limit updated to $TIMELIMIT"

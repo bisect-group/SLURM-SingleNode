@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+# ============================================================
+# /usr/local/sbin/tesla-tier-change
+# Set a user's DEFAULT SLURM tier without removing existing tier
+# associations. Users accumulate access as they move between tiers,
+# matching SLURM's native multi-association model.
+#
+# Usage:    sudo tesla-tier-change <username> <new-tier>
+# Tiers:    none, gpu1, gpu2, gpu3, gpu4, deadline
+# Example:  sudo tesla-tier-change jash deadline
+#
+# What this does:
+#   1. ADD new tier association in sacctmgr if missing
+#      (with DefaultQOS baked in so the new association is born correct)
+#   2. SET the user's DefaultAccount + DefaultQOS to the new tier
+#   3. ADD the user to the new tier's Unix group
+#      (does NOT remove them from prior tier groups — multi-tier OK)
+#   4. Update /etc/tesla-cluster/users.csv to reflect the new default
+#
+# This is the AUTHORITATIVE way to change a user's default tier on the fly.
+# Use the explicit `--account=<tier>` flag on sbatch to submit under a
+# specific non-default tier (e.g. `--account=gpu1` for small jobs while on
+# deadline default).
+#
+# Multi-association safety:
+#   The job_submit.lua plugin keys its enforcement table by QoS NAME, not
+#   account. So `sbatch --account=gpu1 --gres=gpu:8` is correctly rejected
+#   (gpu1's tesla-gpu1 QoS caps at 1 GPU), and `sbatch --account=deadline
+#   --gres=gpu:8` is correctly accepted. Multi-association does not weaken
+#   tier enforcement.
+# ============================================================
+
+set -euo pipefail
+
+ALL_TIERS=(none gpu1 gpu2 gpu3 gpu4 deadline)
+CSV_PATH="/etc/tesla-cluster/users.csv"
+BACKUP_DIR="/etc/tesla-cluster/backups"
+
+# ─── Arg parsing ──────────────────────────────────────────────
+if [[ $# -ne 2 ]]; then
+    echo "Usage: $0 <username> <new-tier>"
+    echo "Tiers: ${ALL_TIERS[*]}"
+    exit 2
+fi
+
+USERNAME="$1"
+NEW_TIER="$2"
+
+# ─── Root check ───────────────────────────────────────────────
+if [[ $EUID -ne 0 ]]; then
+    echo "Error: must run as root (use sudo)"
+    exit 1
+fi
+
+# ─── Validation ───────────────────────────────────────────────
+valid=0
+for t in "${ALL_TIERS[@]}"; do
+    [[ "$t" == "$NEW_TIER" ]] && valid=1
+done
+if [[ $valid -ne 1 ]]; then
+    echo "Error: invalid tier '$NEW_TIER'"
+    echo "Valid tiers: ${ALL_TIERS[*]}"
+    exit 2
+fi
+
+if ! id "$USERNAME" &>/dev/null; then
+    echo "Error: user '$USERNAME' does not exist on this system"
+    exit 1
+fi
+
+if ! getent group "tesla-$NEW_TIER" &>/dev/null; then
+    echo "Error: Unix group 'tesla-$NEW_TIER' does not exist"
+    echo "Run the user_policy role first, or check group setup."
+    exit 1
+fi
+
+if [[ ! -f "$CSV_PATH" ]]; then
+    echo "Warning: $CSV_PATH does not exist — CSV update will be skipped."
+    SKIP_CSV=1
+else
+    SKIP_CSV=0
+    if ! grep -q "^${USERNAME}," "$CSV_PATH"; then
+        echo "Warning: '$USERNAME' is not in $CSV_PATH"
+        echo "  sacctmgr/group changes will still apply, but the CSV won't be updated."
+        echo "  Add the user to the CSV manually if they should be managed by sync_users.yml."
+        SKIP_CSV=1
+    fi
+fi
+
+echo "============================================================"
+echo "  Setting default tier for '$USERNAME' → '$NEW_TIER'"
+echo "============================================================"
+
+# ─── Show current state ───────────────────────────────────────
+echo
+echo "── Before ──"
+sacctmgr show user "$USERNAME" withassoc format=user,defaultaccount,account,defaultqos 2>/dev/null || true
+echo "Unix groups: $(groups "$USERNAME" 2>/dev/null | cut -d: -f2-)"
+if [[ $SKIP_CSV -eq 0 ]]; then
+    CURRENT_CSV_TIER=$(awk -F',' -v u="$USERNAME" '$1 == u {print $5; exit}' "$CSV_PATH")
+    echo "CSV tier:    $CURRENT_CSV_TIER"
+fi
+echo
+
+# ─── Step 1: add new association ──────────────────────────────
+echo "Step 1/4: ensuring sacctmgr association with '$NEW_TIER' ..."
+# Idempotent — sacctmgr says "Nothing new added" if the assoc already exists.
+# DefaultQOS=tesla-$NEW_TIER ensures NEW associations are born with the right QoS.
+sacctmgr -i add user "$USERNAME" \
+    Account="$NEW_TIER" \
+    DefaultQOS="tesla-$NEW_TIER" 2>&1 | sed 's/^/  /' || true
+
+# ─── Step 2: set DefaultAccount ───────────────────────────────
+# Note: we use DefaultAccount only (NOT DefaultQOS) in this modify, because
+# `modify user X set DefaultQOS=Y` applies the change to ALL of X's
+# associations, which fails noisily on stale ones. DefaultAccount, by
+# contrast, is a per-user attribute and modifies cleanly.
+echo "Step 2/4: setting DefaultAccount to '$NEW_TIER' ..."
+sacctmgr -i modify user "$USERNAME" set \
+    DefaultAccount="$NEW_TIER" 2>&1 | sed 's/^/  /'
+
+# ─── Step 3: add to Unix tier group (additive) ────────────────
+echo "Step 3/4: adding user to Unix group 'tesla-$NEW_TIER' ..."
+# Additive — does NOT remove from prior tier groups. Multi-tier membership
+# is fine; the actual SLURM enforcement is via QoS at submit time, not via
+# Unix groups. The tier group exists mostly for `getent group` visibility
+# and login-banner display.
+if id -nG "$USERNAME" | tr ' ' '\n' | grep -qx "tesla-$NEW_TIER"; then
+    echo "  (already a member — no change)"
+else
+    gpasswd -a "$USERNAME" "tesla-$NEW_TIER" 2>&1 | sed 's/^/  /'
+fi
+
+# ─── Step 4: update the CSV ───────────────────────────────────
+echo "Step 4/4: updating $CSV_PATH ..."
+if [[ $SKIP_CSV -eq 1 ]]; then
+    echo "  (skipped — user not in CSV or CSV missing)"
+else
+    # Backup with timestamp
+    mkdir -p "$BACKUP_DIR"
+    chmod 0750 "$BACKUP_DIR"
+    BACKUP_FILE="$BACKUP_DIR/users.csv.$(date +%Y%m%d-%H%M%S).bak"
+    cp -p "$CSV_PATH" "$BACKUP_FILE"
+    echo "  backed up CSV to $BACKUP_FILE"
+
+    # Lock for concurrent-safety with sync_users.py (which also uses flock).
+    (
+        flock -w 10 9 || { echo "  ERROR: could not lock CSV — aborting"; exit 3; }
+        # awk-based update: only touches column 5 (tier) of the matching row.
+        # Robust against commas in quoted fields (e.g. notes column).
+        awk -F',' -v OFS=',' -v u="$USERNAME" -v t="$NEW_TIER" '
+            $1 == u { $5 = t }
+            { print }
+        ' "$CSV_PATH" > "$CSV_PATH.tmp"
+
+        if cmp -s "$CSV_PATH" "$CSV_PATH.tmp"; then
+            echo "  no change needed (CSV already shows '$NEW_TIER')"
+            rm -f "$CSV_PATH.tmp"
+        else
+            mv "$CSV_PATH.tmp" "$CSV_PATH"
+            chown root:root "$CSV_PATH"
+            chmod 0640 "$CSV_PATH"
+            echo "  CSV updated"
+        fi
+    ) 9>"$CSV_PATH.lock"
+fi
+
+# ─── Verify ───────────────────────────────────────────────────
+echo
+echo "── After ──"
+sacctmgr show user "$USERNAME" withassoc format=user,defaultaccount,account,defaultqos
+echo "Unix groups: $(groups "$USERNAME" 2>/dev/null | cut -d: -f2-)"
+if [[ $SKIP_CSV -eq 0 ]]; then
+    NEW_CSV_TIER=$(awk -F',' -v u="$USERNAME" '$1 == u {print $5; exit}' "$CSV_PATH")
+    echo "CSV tier:    $NEW_CSV_TIER"
+fi
+
+echo
+echo "============================================================"
+echo "  Done. Default tier is now '$NEW_TIER'."
+echo
+echo "  Note: $USERNAME may still have associations with other tiers."
+echo "  To submit under a non-default tier explicitly:"
+echo "      sbatch --account=<tier> ..."
+echo "============================================================"

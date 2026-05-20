@@ -1,0 +1,12 @@
+---
+# roles/gpu_isolation/handlers/main.yml
+
+- name: Restart sshd
+  ansible.builtin.systemd:
+    name: ssh
+    state: restarted
+
+- name: Reload udev rules
+  ansible.builtin.shell: |
+    udevadm control --reload-rules && udevadm trigger
+  changed_when: true

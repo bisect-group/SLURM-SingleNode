@@ -1,0 +1,126 @@
+---
+# roles/admin_tools/tasks/main.yml
+# Installs admin/user helper scripts, MOTD, logrotate, systemd watchdog.
+
+- name: Deploy MOTD
+  ansible.builtin.template:
+    src: motd.j2
+    dest: /etc/motd
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Disable default Ubuntu MOTD scripts (noisy)
+  ansible.builtin.file:
+    path: "{{ item }}"
+    mode: "0644"
+  loop:
+    - /etc/update-motd.d/10-help-text
+    - /etc/update-motd.d/50-motd-news
+    - /etc/update-motd.d/91-release-upgrade
+  ignore_errors: yes
+
+# ── Admin scripts (root + slurm_admins) ─────────────────────────────────
+- name: Deploy tesla-extend admin script
+  ansible.builtin.template:
+    src: tesla-extend.j2
+    dest: /usr/local/sbin/tesla-extend
+    owner: root
+    group: slurm_admins
+    mode: "0750"
+
+- name: Deploy tesla-quota admin script
+  ansible.builtin.template:
+    src: tesla-quota.j2
+    dest: /usr/local/sbin/tesla-quota
+    owner: root
+    group: slurm_admins
+    mode: "0750"
+
+- name: Deploy tesla-userinfo admin script
+  ansible.builtin.template:
+    src: tesla-userinfo.j2
+    dest: /usr/local/sbin/tesla-userinfo
+    owner: root
+    group: slurm_admins
+    mode: "0750"
+
+- name: Deploy tesla-restore-user admin script
+  ansible.builtin.template:
+    src: tesla-restore-user.j2
+    dest: /usr/local/sbin/tesla-restore-user
+    owner: root
+    group: slurm_admins
+    mode: "0750"
+
+# ── User-facing scripts (world-readable) ────────────────────────────────
+- name: Deploy tesla-status script
+  ansible.builtin.template:
+    src: tesla-status.j2
+    dest: /usr/local/bin/tesla-status
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Deploy tesla-tier script (shows caller's tier)
+  ansible.builtin.template:
+    src: tesla-tier.j2
+    dest: /usr/local/bin/tesla-tier
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Deploy example job script to /etc/slurm
+  ansible.builtin.template:
+    src: example_job.sh.j2
+    dest: "{{ slurm_conf_dir }}/example_job.sh"
+    owner: root
+    group: root
+    mode: "0644"
+
+# ── Logrotate ───────────────────────────────────────────────────────────
+- name: Deploy logrotate config for SLURM logs
+  ansible.builtin.copy:
+    dest: /etc/logrotate.d/slurm
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      {{ slurm_log_dir }}/*.log {
+          weekly
+          rotate 8
+          compress
+          delaycompress
+          missingok
+          notifempty
+          sharedscripts
+          postrotate
+              /bin/kill -HUP $(cat {{ slurm_pid_dir }}/slurmctld.pid 2>/dev/null) 2>/dev/null || true
+              /bin/kill -HUP $(cat {{ slurm_pid_dir }}/slurmd.pid 2>/dev/null) 2>/dev/null || true
+              /bin/kill -HUP $(cat {{ slurm_pid_dir }}/slurmdbd.pid 2>/dev/null) 2>/dev/null || true
+          endscript
+      }
+
+# ── Systemd watchdog: auto-restart SLURM daemons on crash ──────────────
+- name: Create systemd override dirs for SLURM daemons
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ item }}.service.d"
+    state: directory
+    mode: "0755"
+  loop:
+    - slurmctld
+    - slurmd
+    - slurmdbd
+
+- name: Add restart policy to slurmctld/slurmd/slurmdbd
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ item }}.service.d/restart.conf"
+    content: |
+      [Service]
+      Restart=on-failure
+      RestartSec=10s
+  loop:
+    - slurmctld
+    - slurmd
+    - slurmdbd
+  notify: Reload systemd

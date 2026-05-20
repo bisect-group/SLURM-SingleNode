@@ -1,0 +1,131 @@
+---
+# roles/slurmdbd_setup/tasks/main.yml
+#
+# 1. Enable MariaDB
+# 2. Create slurm database + user with a generated password
+# 3. Deploy slurmdbd.conf
+# 4. Start slurmdbd
+# 5. Bootstrap the SLURM account hierarchy + QoS via sacctmgr (idempotent)
+
+- name: Ensure MariaDB is enabled and started
+  ansible.builtin.systemd:
+    name: mariadb
+    enabled: yes
+    state: started
+
+# ── Generate slurmdbd MySQL password once, store as root-only file ──────
+- name: Check whether slurmdbd MySQL password file exists
+  ansible.builtin.stat:
+    path: "{{ slurmdbd_db_password_file }}"
+  register: dbpw_stat
+
+- name: Generate slurmdbd MySQL password (32 random hex chars)
+  ansible.builtin.shell: |
+    umask 077
+    tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32 > {{ slurmdbd_db_password_file }}
+    chown slurm:slurm {{ slurmdbd_db_password_file }}
+    chmod 0400 {{ slurmdbd_db_password_file }}
+  when: not dbpw_stat.stat.exists
+  no_log: true
+
+- name: Read the slurmdbd MySQL password
+  ansible.builtin.slurp:
+    src: "{{ slurmdbd_db_password_file }}"
+  register: dbpw_b64
+  no_log: true
+
+- name: Set fact with the slurmdbd MySQL password
+  ansible.builtin.set_fact:
+    slurmdbd_db_password: "{{ dbpw_b64.content | b64decode | trim }}"
+  no_log: true
+
+# ── Create the database and user via raw mysql (unix_socket auth as root) ──
+- name: Create slurm accounting database
+  ansible.builtin.command: >
+    mysql --protocol=socket -uroot -e
+    "CREATE DATABASE IF NOT EXISTS {{ slurmdbd_db_name }}
+       CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+  register: db_create
+  changed_when: "'database exists' not in (db_create.stderr | default('') | lower)"
+
+- name: Create slurm DB user with full privileges on slurm DB
+  ansible.builtin.command: >
+    mysql --protocol=socket -uroot -e
+    "CREATE USER IF NOT EXISTS '{{ slurmdbd_db_user }}'@'localhost'
+       IDENTIFIED BY '{{ slurmdbd_db_password }}';
+     ALTER USER '{{ slurmdbd_db_user }}'@'localhost'
+       IDENTIFIED BY '{{ slurmdbd_db_password }}';
+     GRANT ALL PRIVILEGES ON {{ slurmdbd_db_name }}.*
+       TO '{{ slurmdbd_db_user }}'@'localhost';
+     FLUSH PRIVILEGES;"
+  no_log: true
+  changed_when: true
+
+# ── Deploy slurmdbd.conf ────────────────────────────────────────────────
+- name: Deploy slurmdbd.conf
+  ansible.builtin.template:
+    src: slurmdbd.conf.j2
+    dest: "{{ slurm_conf_dir }}/slurmdbd.conf"
+    owner: slurm
+    group: slurm
+    mode: "0600"
+  notify: Restart slurmdbd
+
+- name: Flush handlers to start slurmdbd before sacctmgr operations
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable and start slurmdbd
+  ansible.builtin.systemd:
+    name: slurmdbd
+    enabled: yes
+    state: started
+    daemon_reload: yes
+
+- name: Wait for slurmdbd to accept connections
+  ansible.builtin.wait_for:
+    port: "{{ slurmdbd_port }}"
+    host: 127.0.0.1
+    timeout: 30
+
+# ── Minimal slurm.conf stub so sacctmgr can find slurmdbd ──────────────
+# sacctmgr reads /etc/slurm/slurm.conf to discover the AccountingStorageHost
+# AND validates the full config. Stub is overwritten by slurm_config role.
+- name: Drop minimal slurm.conf stub for sacctmgr
+  ansible.builtin.copy:
+    dest: "{{ slurm_conf_dir }}/slurm.conf"
+    owner: slurm
+    group: slurm
+    mode: "0644"
+    content: |
+      # TEMPORARY stub - overwritten by slurm_config role.
+      ClusterName={{ cluster_name }}
+      SlurmctldHost={{ inventory_hostname }}
+      SlurmUser=slurm
+      AuthType=auth/munge
+      AccountingStorageType=accounting_storage/slurmdbd
+      AccountingStorageHost=localhost
+      AccountingStoragePort={{ slurmdbd_port }}
+      StateSaveLocation={{ slurm_spool_dir }}/slurmctld
+      SlurmctldPidFile=/run/slurmctld.pid
+      SlurmdPidFile=/run/slurmd.pid
+      ProctrackType=proctrack/cgroup
+      ReturnToService=2
+      SlurmctldPort=6817
+      SlurmdPort=6818
+
+
+# ── sacctmgr bootstrap: cluster, root account, per-tier accounts, QoS ───
+# Note: sacctmgr puts "already exists" on STDOUT (not stderr) when an entity
+# is already present. Both must be checked for idempotency.
+- name: Register cluster in slurmdbd
+  ansible.builtin.command: >
+    sacctmgr -i add cluster {{ cluster_name }}
+  register: sacctmgr_cluster
+  changed_when:
+    - sacctmgr_cluster.rc == 0
+    - "'already exists' not in (sacctmgr_cluster.stdout | default(''))"
+  failed_when:
+    - sacctmgr_cluster.rc != 0
+    - "'already exists' not in (sacctmgr_cluster.stdout | default(''))"
+    - "'already exists' not in (sacctmgr_cluster.stderr | default(''))"
+

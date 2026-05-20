@@ -1,0 +1,32 @@
+
+╔══════════════════════════════════════════════════════════════╗
+║         Welcome to Tesla — NVIDIA DGX-1 GPU Cluster          ║
+╠══════════════════════════════════════════════════════════════╣
+║                                                              ║
+║  Hardware : 8x NVIDIA Tesla V100-SXM2-32GB                   ║
+║  Fabric   : NVLink hybrid cube-mesh (48 links @ 25.78 GB/s)  ║
+║  CPUs     : 2 sockets × 20 cores × 2 threads = 80 logical    ║
+║  NUMA     : GPUs 0-3 → NUMA 0 │ GPUs 4-7 → NUMA 1            ║
+║  Scheduler: SLURM {{ slurm_version }} + slurmdbd                       ║
+║                                                              ║
+║  POLICIES                                                    ║
+║  ─────────────────────────────────────────────────────────   ║
+║  • Tiered access: gpu1 / gpu2 / gpu3 / gpu4 / deadline       ║
+║  • Run 'tesla-tier' to see your tier & per-job limits        ║
+║  • Storage: /home is 200GB SSD; /storage/nas/$USER unlimited ║
+║  • GPU access ONLY through SLURM job allocations             ║
+║                                                              ║
+║  QUICK START                                                 ║
+║  ─────────────────────────────────────────────────────────   ║
+║  Submit a job  :  sbatch myjob.sh                            ║
+║  Check queue   :  squeue -u $USER     (or:  tq)              ║
+║  Cluster view  :  tesla-status                               ║
+║  Cancel a job  :  scancel <JOBID>                            ║
+║  Your tier     :  tesla-tier                                 ║
+║                                                              ║
+║  Sample batch script at: /etc/slurm/example_job.sh           ║
+║                                                              ║
+║  TIP: For multi-GPU jobs, keep GPUs within one NUMA node     ║
+║       (0-3 or 4-7) to use NVLink instead of QPI.             ║
+║                                                              ║
+╚══════════════════════════════════════════════════════════════╝

@@ -1,0 +1,92 @@
+--[[
+   job_submit.lua — Tesla DGX-1
+   ----------------------------
+   Catches the most common "why was my job rejected?" cases at submit time
+   and returns a clear message naming the user's tier and their limits,
+   instead of the cryptic default "QOSMaxGRESPerJob" / "AssocMaxSubmitJobs".
+
+   SLURM evaluates this whenever a job is submitted; lua_job_submit()
+   returns slurm.SUCCESS to allow, or slurm.ERROR with a slurm.log_user()
+   call to reject. We are NON-AUTHORITATIVE — SLURM still enforces all the
+   real QoS limits afterward — we just make the rejection message friendly.
+]]
+
+-- Tier → max GPUs (kept in sync with group_vars/all.yml manually)
+local tier_max_gpus = {
+{% for t in tesla_tiers %}
+    ["{{ t.qos }}"] = {{ t.max_gpus }},
+{% endfor %}
+}
+
+local tier_max_cpus = {
+{% for t in tesla_tiers %}
+    ["{{ t.qos }}"] = {{ t.max_cpus }},
+{% endfor %}
+}
+
+local function tier_name_of(qos_name)
+    if qos_name == nil then return "(none)" end
+    return qos_name
+end
+
+function slurm_job_submit(job_desc, part_list, submit_uid)
+    -- Only check GPU partition jobs
+    if job_desc.partition ~= nil and job_desc.partition ~= "{{ default_partition }}" then
+        return slurm.SUCCESS
+    end
+
+    local user_qos = job_desc.qos
+    if user_qos == nil or user_qos == "" then
+        -- SLURM will use the user's DefaultQOS; we can't pre-flight check
+        -- without knowing the resolved QoS, so allow it through.
+        return slurm.SUCCESS
+    end
+
+    local max_gpus = tier_max_gpus[user_qos]
+    local max_cpus = tier_max_cpus[user_qos]
+
+    -- Parse gres request
+    local req_gpus = 0
+    if job_desc.tres_per_job ~= nil then
+        for g in string.gmatch(job_desc.tres_per_job, "gres/gpu=(%d+)") do
+            req_gpus = req_gpus + tonumber(g)
+        end
+    end
+    if job_desc.tres_per_node ~= nil then
+        for g in string.gmatch(job_desc.tres_per_node, "gres/gpu=(%d+)") do
+            req_gpus = req_gpus + tonumber(g)
+        end
+    end
+
+    if max_gpus ~= nil and req_gpus > max_gpus then
+        slurm.log_user(
+            string.format(
+                "Tesla: your tier '%s' allows at most %d GPU(s) per job; you requested %d. " ..
+                "Run 'tesla-tier' to see your tier, or contact a slurm_admin for an upgrade.",
+                tier_name_of(user_qos), max_gpus, req_gpus
+            )
+        )
+        return slurm.ERROR
+    end
+
+    local req_cpus = job_desc.num_tasks * (job_desc.cpus_per_task or 1)
+    if max_cpus ~= nil and req_cpus > max_cpus then
+        slurm.log_user(
+            string.format(
+                "Tesla: your tier '%s' allows at most %d CPU(s) per job; you requested %d. " ..
+                "Run 'tesla-tier' to see your tier, or contact a slurm_admin for an upgrade.",
+                tier_name_of(user_qos), max_cpus, req_cpus
+            )
+        )
+        return slurm.ERROR
+    end
+
+    return slurm.SUCCESS
+end
+
+function slurm_job_modify(job_desc, job_rec, part_list, modify_uid)
+    return slurm.SUCCESS
+end
+
+slurm.log_info("Tesla job_submit.lua loaded.")
+return slurm.SUCCESS

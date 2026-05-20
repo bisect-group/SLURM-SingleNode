@@ -1,0 +1,186 @@
+---
+# roles/slurm_config/tasks/main.yml
+# Deploys SLURM controller/worker config and starts slurmctld + slurmd.
+
+- name: Deploy slurm.conf from template
+  ansible.builtin.template:
+    src: slurm.conf.j2
+    dest: "{{ slurm_conf_dir }}/slurm.conf"
+    owner: slurm
+    group: slurm
+    mode: "0644"
+  notify:
+    - Restart slurmctld
+    - Restart slurmd
+
+- name: Deploy cgroup.conf from template
+  ansible.builtin.template:
+    src: cgroup.conf.j2
+    dest: "{{ slurm_conf_dir }}/cgroup.conf"
+    owner: slurm
+    group: slurm
+    mode: "0644"
+  notify:
+    - Restart slurmd
+
+- name: Deploy gres.conf from template
+  ansible.builtin.template:
+    src: gres.conf.j2
+    dest: "{{ slurm_conf_dir }}/gres.conf"
+    owner: slurm
+    group: slurm
+    mode: "0644"
+  notify:
+    - Restart slurmd
+
+- name: Deploy job_submit.lua for friendly tier-violation errors
+  ansible.builtin.template:
+    src: job_submit.lua.j2
+    dest: "{{ slurm_conf_dir }}/job_submit.lua"
+    owner: slurm
+    group: slurm
+    mode: "0644"
+  notify:
+    - Restart slurmctld
+
+- name: Generate JWT signing key
+  ansible.builtin.command:
+    cmd: dd if=/dev/urandom bs=32 count=1 of={{ slurm_conf_dir }}/jwt_hs256.key
+    creates: "{{ slurm_conf_dir }}/jwt_hs256.key"
+
+- name: Set JWT key permissions
+  ansible.builtin.file:
+    path: "{{ slurm_conf_dir }}/jwt_hs256.key"
+    owner: slurm
+    group: slurm
+    mode: "0600"
+
+- name: Ensure /scratch exists for per-job TmpFS
+  ansible.builtin.file:
+    path: /scratch
+    state: directory
+    owner: root
+    group: root
+    mode: "1777"   # like /tmp
+
+- name: Enable and start slurmctld
+  ansible.builtin.systemd:
+    name: slurmctld
+    enabled: yes
+    state: started
+    daemon_reload: yes
+
+- name: Enable and start slurmd
+  ansible.builtin.systemd:
+    name: slurmd
+    enabled: yes
+    state: started
+    daemon_reload: yes
+
+- name: Wait for SLURM to be fully up
+  ansible.builtin.command: sinfo
+  register: sinfo_result
+  retries: 10
+  delay: 5
+  until: sinfo_result.rc == 0
+  changed_when: false
+
+- name: Set node to IDLE if currently drained/down (no-op if already idle)
+  ansible.builtin.shell: |
+    state=$(sinfo -h -n {{ control_machine_hostname }} -o '%T' | head -1)
+    case "$state" in
+      drained|drain|down|down*|drng) scontrol update NodeName={{ control_machine_hostname }} State=RESUME ;;
+      *) echo "Node already in state '$state' - no action needed" ;;
+    esac
+  changed_when: false
+
+# ── QoS + accounts bootstrap (after slurmctld is up so gres/gpu TRES exists) ──
+- name: Wait for slurmctld to register TRES with slurmdbd
+  ansible.builtin.command: sacctmgr -nP show tres format=type,name
+  register: tres_list
+  retries: 6
+  delay: 5
+  until: "'gres' in tres_list.stdout and 'gpu' in tres_list.stdout"
+  changed_when: false
+
+- name: Create each tier QoS
+  ansible.builtin.command: >
+    sacctmgr -i add qos {{ item.qos }}
+      Priority={{ item.priority }}
+      MaxTRESPerJob=cpu={{ item.max_cpus }},gres/gpu={{ item.max_gpus }}
+      MaxJobsPerUser={{ item.max_jobs }}
+      MaxSubmitJobsPerUser={{ item.max_submit }}
+      Flags=DenyOnLimit
+  loop: "{{ tesla_tiers }}"
+  register: qos_add
+  changed_when:
+    - qos_add.rc == 0
+    - "'already exists' not in (qos_add.stdout | default(''))"
+    - "'Nothing new added' not in (qos_add.stdout | default(''))"
+  failed_when:
+    - qos_add.rc != 0
+    - "'already exists' not in (qos_add.stdout | default(''))"
+    - "'already exists' not in (qos_add.stderr | default(''))"
+    - "'Nothing new added' not in (qos_add.stdout | default(''))"
+
+- name: Update each tier QoS (in case limits changed since last run)
+  ansible.builtin.command: >
+    sacctmgr -i modify qos {{ item.qos }} set
+      Priority={{ item.priority }}
+      MaxTRESPerJob=cpu={{ item.max_cpus }},gres/gpu={{ item.max_gpus }}
+      MaxJobsPerUser={{ item.max_jobs }}
+      MaxSubmitJobsPerUser={{ item.max_submit }}
+      Flags=DenyOnLimit
+  loop: "{{ tesla_tiers }}"
+  changed_when: false
+
+
+- name: Create root 'tesla' account (parent of all tier accounts)
+  ansible.builtin.command: >
+    sacctmgr -i add account tesla
+      Description="Tesla DGX-1 root account"
+      Organization=tesla
+  register: root_account
+  changed_when:
+    - root_account.rc == 0
+    - "'already exists' not in (root_account.stdout | default(''))"
+    - "'Already existing' not in (root_account.stdout | default(''))"
+    - "'Nothing new added' not in (root_account.stdout | default(''))"
+  failed_when:
+    - root_account.rc != 0
+    - "'already exists' not in (root_account.stdout | default(''))"
+    - "'already exists' not in (root_account.stderr | default(''))"
+    - "'Already existing' not in (root_account.stdout | default(''))"
+    - "'Nothing new added' not in (root_account.stdout | default(''))"
+
+- name: Create per-tier sub-accounts
+  ansible.builtin.command: >
+    sacctmgr -i add account {{ item.name }}
+      Parent=tesla
+      Description="{{ item.description }}"
+      Qos={{ item.qos }}
+      DefaultQOS={{ item.qos }}
+      Organization=tesla
+  loop: "{{ tesla_tiers }}"
+  register: tier_accounts
+  changed_when:
+    - tier_accounts.rc == 0
+    - "'already exists' not in (tier_accounts.stdout | default(''))"
+    - "'Already existing' not in (tier_accounts.stdout | default(''))"
+    - "'Nothing new added' not in (tier_accounts.stdout | default(''))"
+  failed_when:
+    - tier_accounts.rc != 0
+    - "'already exists' not in (tier_accounts.stdout | default(''))"
+    - "'already exists' not in (tier_accounts.stderr | default(''))"
+    - "'Already existing' not in (tier_accounts.stdout | default(''))"
+    - "'Nothing new added' not in (tier_accounts.stdout | default(''))"
+
+
+- name: Refresh per-tier sub-account QoS settings (in case tier changed)
+  ansible.builtin.command: >
+    sacctmgr -i modify account {{ item.name }} set
+      Qos={{ item.qos }}
+      DefaultQOS={{ item.qos }}
+  loop: "{{ tesla_tiers }}"
+  changed_when: false
+

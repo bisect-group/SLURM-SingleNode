@@ -1,0 +1,98 @@
+---
+# update_config.yml — Re-deploy SLURM configuration without disturbing running jobs.
+#
+# Use this after editing slurm.conf, gres.conf, cgroup.conf, slurmdbd.conf,
+# or job_submit.lua. Running jobs continue; new submissions briefly wait
+# while slurmctld reloads.
+#
+# Tag selection:
+#   --tags slurm    → just slurm.conf + restart slurmctld/slurmd
+#   --tags dbd      → just slurmdbd.conf + restart slurmdbd
+#   --tags lua      → just job_submit.lua (slurmctld reload via SIGHUP — no restart)
+#   (default)       → all of the above
+
+- name: Tesla DGX-1 — Update SLURM configuration
+  hosts: tesla
+  become: yes
+  gather_facts: no
+
+  tasks:
+    # ── slurmdbd.conf ──
+    - block:
+        - name: Re-deploy slurmdbd.conf
+          ansible.builtin.template:
+            src: roles/slurmdbd_setup/templates/slurmdbd.conf.j2
+            dest: "{{ slurm_conf_dir }}/slurmdbd.conf"
+            owner: slurm
+            group: slurm
+            mode: "0600"
+          register: dbd_conf
+
+        - name: Restart slurmdbd if changed
+          ansible.builtin.systemd:
+            name: slurmdbd
+            state: restarted
+          when: dbd_conf.changed
+      tags: [dbd]
+
+    # ── slurm.conf ──
+    - block:
+        - name: Re-deploy slurm.conf
+          ansible.builtin.template:
+            src: roles/slurm_config/templates/slurm.conf.j2
+            dest: "{{ slurm_conf_dir }}/slurm.conf"
+            owner: slurm
+            group: slurm
+            mode: "0644"
+          register: slurm_conf
+
+        - name: Re-deploy gres.conf
+          ansible.builtin.template:
+            src: roles/slurm_config/templates/gres.conf.j2
+            dest: "{{ slurm_conf_dir }}/gres.conf"
+            owner: slurm
+            group: slurm
+            mode: "0644"
+          register: gres_conf
+
+        - name: Re-deploy cgroup.conf
+          ansible.builtin.template:
+            src: roles/slurm_config/templates/cgroup.conf.j2
+            dest: "{{ slurm_conf_dir }}/cgroup.conf"
+            owner: slurm
+            group: slurm
+            mode: "0644"
+          register: cgroup_conf
+
+        - name: scontrol reconfigure (running jobs unaffected)
+          ansible.builtin.command: scontrol reconfigure
+          when: slurm_conf.changed or gres_conf.changed or cgroup_conf.changed
+          changed_when: slurm_conf.changed or gres_conf.changed or cgroup_conf.changed
+      tags: [slurm]
+
+    # ── job_submit.lua ──
+    - block:
+        - name: Re-deploy job_submit.lua
+          ansible.builtin.template:
+            src: roles/slurm_config/templates/job_submit.lua.j2
+            dest: "{{ slurm_conf_dir }}/job_submit.lua"
+            owner: slurm
+            group: slurm
+            mode: "0644"
+          register: lua_changed
+
+        - name: SIGHUP slurmctld to reload Lua (no service restart)
+          ansible.builtin.command: scontrol reconfigure
+          when: lua_changed.changed
+          changed_when: lua_changed.changed
+      tags: [lua]
+
+    - name: Verify cluster still responsive
+      ansible.builtin.command: sinfo
+      register: sinfo_post
+      changed_when: false
+      failed_when: sinfo_post.rc != 0
+
+    - name: Show post-update state
+      ansible.builtin.debug:
+        msg: "{{ sinfo_post.stdout_lines }}"

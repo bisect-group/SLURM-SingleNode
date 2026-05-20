@@ -1,0 +1,59 @@
+#!/bin/bash
+# =============================================================
+# Example SLURM batch job script for the Tesla DGX-1
+# Copy this to your home dir and modify as needed.
+# Submit with:  sbatch example_job.sh
+#
+# Your tier controls what you can request. Run 'tesla-tier' to see yours:
+#   gpu1   → up to 1 GPU,  20 CPUs, 5 queued jobs
+#   gpu2   → up to 2 GPUs, 20 CPUs, 5 queued jobs
+#   gpu3   → up to 3 GPUs, 20 CPUs, 5 queued jobs
+#   gpu4   → up to 4 GPUs, 20 CPUs, 5 queued jobs
+#   deadline → up to 8 GPUs, 40 CPUs, 5 queued jobs, HIGHEST PRIORITY
+# =============================================================
+
+#SBATCH --job-name=my_experiment
+#SBATCH --partition=gpu
+#SBATCH --gres=gpu:1                # adjust to your tier's max
+#SBATCH --cpus-per-task=8           # max 20 (40 if deadline tier)
+#SBATCH --mem=64G                   # V100s pair well with 32-128G
+#SBATCH --time=04:00:00             # walltime HH:MM:SS (max 48:00:00)
+#SBATCH --output=%x_%j.out
+#SBATCH --error=%x_%j.err
+
+# --- Multi-GPU NUMA hints (only if your tier allows > 1 GPU): ---
+# Up to 4 GPUs within one NUMA node (NVLink only, no QPI):
+#   #SBATCH --gres=gpu:4
+#   #SBATCH --gres-flags=enforce-binding
+#   #SBATCH --cpus-per-task=16
+# Full node (deadline only):
+#   #SBATCH --gres=gpu:8 --cpus-per-task=32
+
+# --- Optional: email notifications ---
+##SBATCH --mail-type=BEGIN,END,FAIL
+##SBATCH --mail-user=you@iitm.ac.in
+
+# =============================================================
+# Environment
+# =============================================================
+echo "Job ID     : $SLURM_JOB_ID"
+echo "Node       : $SLURMD_NODENAME"
+echo "GPUs alloc : $CUDA_VISIBLE_DEVICES"
+echo "Scratch    : $TMPDIR (auto-cleaned on job exit)"
+echo "Start time : $(date)"
+
+# NCCL on DGX-1 hybrid cube-mesh
+export NCCL_P2P_LEVEL=NVL
+# export NCCL_DEBUG=INFO
+
+# Activate your conda env. Shared base is at /tools/miniconda3 for NEW users;
+# existing users keep their own conda setups.
+# source /tools/miniconda3/etc/profile.d/conda.sh
+# conda activate myenv
+
+# =============================================================
+# Workload
+# =============================================================
+python train.py --epochs 100 --batch-size 64
+
+echo "End time : $(date)"

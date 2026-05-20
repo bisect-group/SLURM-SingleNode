@@ -1,0 +1,69 @@
+#!/bin/bash
+# =============================================================
+# tesla-quota — Show /home quota usage; flag users near or over limit
+#
+# Usage:
+#   tesla-quota                      # all human users
+#   tesla-quota --over 150           # only users above 150 GB
+#   tesla-quota --user alice         # specific user
+#   tesla-quota --normalize alice    # reset alice to default 200GB
+#   tesla-quota --orphans            # list quota entries with no /etc/passwd row
+# =============================================================
+set -euo pipefail
+
+DEFAULT_QUOTA_GB={{ home_quota_gb }}
+HOME_FS={{ home_filesystem }}
+
+is_admin() {
+    [[ $EUID -eq 0 ]] || groups | grep -qw slurm_admins
+}
+
+if [[ "${1:-}" == "--normalize" ]]; then
+    is_admin || { echo "Admin only." >&2; exit 1; }
+    USER="${2:?Usage: tesla-quota --normalize <username>}"
+    SOFT=$(( (DEFAULT_QUOTA_GB - 10) * 1024 * 1024 ))
+    HARD=$(( DEFAULT_QUOTA_GB * 1024 * 1024 ))
+    setquota -u "$USER" "$SOFT" "$HARD" 0 0 "$HOME_FS"
+    echo "✓ Set ${USER} to default ${DEFAULT_QUOTA_GB} GB on $HOME_FS"
+    exit 0
+fi
+
+if [[ "${1:-}" == "--orphans" ]]; then
+    is_admin || { echo "Admin only." >&2; exit 1; }
+    echo "Orphan quota entries (UID in DB but not in /etc/passwd):"
+    repquota -u "$HOME_FS" | awk '/^#[0-9]+/ {print "  "$1"  used="$3" KB"}'
+    exit 0
+fi
+
+OVER=0
+FILTER_USER=""
+if [[ "${1:-}" == "--over" ]]; then
+    OVER="${2:?Usage: tesla-quota --over <GB>}"
+elif [[ "${1:-}" == "--user" ]]; then
+    FILTER_USER="${2:?Usage: tesla-quota --user <username>}"
+fi
+
+printf "\n%-20s %10s %10s %10s %s\n" "USER" "USED(GB)" "SOFT(GB)" "HARD(GB)" "STATUS"
+printf "%s\n" "─────────────────────────────────────────────────────────────────"
+
+repquota -u "$HOME_FS" | awk -v over="$OVER" -v user="$FILTER_USER" '
+  /^[a-zA-Z_]/ {
+    name = $1
+    used_kb = $3+0; soft_kb = $4+0; hard_kb = $5+0
+    used_gb = used_kb / 1024 / 1024
+    soft_gb = soft_kb / 1024 / 1024
+    hard_gb = hard_kb / 1024 / 1024
+
+    if (user != "" && name != user) next
+    if (over+0 > 0 && used_gb < over+0) next
+
+    status = "ok"
+    if (hard_gb > 0 && used_gb > hard_gb)     status = "OVER HARD"
+    else if (soft_gb > 0 && used_gb > soft_gb) status = "over soft"
+    if (hard_gb == 0)                          status = "unlimited"
+
+    printf "%-20s %10.2f %10.2f %10.2f %s\n", name, used_gb, soft_gb, hard_gb, status
+  }
+' | sort -k2 -nr
+
+echo

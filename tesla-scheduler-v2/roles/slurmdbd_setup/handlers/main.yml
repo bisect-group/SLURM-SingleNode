@@ -1,0 +1,8 @@
+---
+# roles/slurmdbd_setup/handlers/main.yml
+
+- name: Restart slurmdbd
+  ansible.builtin.systemd:
+    name: slurmdbd
+    state: restarted
+    daemon_reload: yes

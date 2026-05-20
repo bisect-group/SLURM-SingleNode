@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# /usr/local/bin/job-watch
+#
+# Live-monitor a running job: SLURM state, CPU/RAM, GPU utilization, log tail.
+#
+# Usage:  job-watch <jobid>
+#         job-watch              # if you have exactly one running job
+
+set -euo pipefail
+
+JOBID="${1:-}"
+
+# If no jobid given, try to find one running job for the user
+if [[ -z "$JOBID" ]]; then
+    JOBS=($(squeue -h --me -t RUNNING -o %i))
+    case "${#JOBS[@]}" in
+        0) echo "You have no running jobs."; exit 1 ;;
+        1) JOBID="${JOBS[0]}" ;;
+        *) echo "You have multiple running jobs. Specify one:"
+           squeue --me -t RUNNING
+           exit 2 ;;
+    esac
+fi
+
+# Validate
+squeue -h -j "$JOBID" >/dev/null 2>&1 || {
+    echo "Job $JOBID not found in queue."
+    sacct -j "$JOBID" --format=jobid,state,elapsed --noheader 2>/dev/null || true
+    exit 1
+}
+
+watch_cmd=$(cat <<EOF
+echo "═════════ Job $JOBID at \$(date) ═════════"
+echo
+echo "── SLURM state ──"
+squeue -j $JOBID --format='%.10i %.20j %.8T %.10M %.10L %.6D %.6C %.10b %R'
+echo
+echo "── Resources used so far ──"
+sstat -j $JOBID --format=jobid,maxrss,maxvmsize,avecpu 2>/dev/null \
+    | head -2 || echo "(stats not yet available — try again in a few seconds)"
+echo
+echo "── Output (last 15 lines) ──"
+LOG=\$(scontrol show job $JOBID 2>/dev/null | grep -oP 'StdOut=\K\S+' | head -1)
+if [[ -n "\$LOG" && -r "\$LOG" ]]; then
+    tail -15 "\$LOG"
+else
+    echo "(log not readable from here)"
+fi
+EOF
+)
+
+watch -n 5 -t bash -c "$watch_cmd"

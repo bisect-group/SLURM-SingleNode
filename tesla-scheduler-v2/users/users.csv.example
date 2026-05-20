@@ -1,0 +1,5 @@
+username,full_name,email,ssh_pubkey,tier,status,expiry_date,uid,gid,created_date,notes
+alice,Alice Sharma,alice@iitm.ac.in,"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample1ExampleKeyHashHere alice@laptop",gpu2,active,2027-08-31,,,,"PhD Y2 - vision group"
+bob,Bob Iyer,bob@iitm.ac.in,"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample2ExampleKeyHashHere bob@desktop",deadline,active,2026-06-15,,,,"NeurIPS deadline - upgrade temporarily"
+charlie,Charlie Rao,charlie@iitm.ac.in,"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample3ExampleKeyHashHere charlie@mac",gpu1,active,,,,,"Masters Y1"
+old_user,Graduated Student,old@example.com,"",none,inactive,,,,,"Graduated May 2025 - to be purged"

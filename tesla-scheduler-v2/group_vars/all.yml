@@ -1,0 +1,158 @@
+---
+# ============================================================
+# Tesla DGX-1 GPU Cluster — Global Variables
+# 8x NVIDIA Tesla V100-SXM2-32GB · DGX-1 hybrid cube-mesh NVLink
+# ============================================================
+
+# --- Ansible runtime ---
+# Force bash so `set -o pipefail` works (default /bin/sh is dash on Ubuntu).
+ansible_shell_executable: /bin/bash
+
+# --- Cluster identity ---
+cluster_name: tesla
+control_machine_hostname: rbcdsaidgx
+admin_email: "root@rbcdsaidgx"
+
+# --- SLURM version (informational; apt resolves the actual version) ---
+slurm_version: "23.11.x"
+
+# --- GPU configuration ---
+num_gpus: 8
+gpu_type: v100
+gpu_memory_gb: 32
+
+# --- CPU / NUMA topology (DGX-1: dual-socket Xeon) ---
+cpu_sockets: 2
+cores_per_socket: 20
+threads_per_core: 2
+total_cpus: 80
+real_memory_mb: 500000
+
+# --- NUMA topology hints (informational, used in docs/MOTD) ---
+gpu_numa_node0: "0,1,2,3"
+gpu_numa_node1: "4,5,6,7"
+
+# --- Partition / Queue config ---
+default_partition: gpu
+partition_nodes: "{{ control_machine_hostname }}"
+
+# --- Walltime policy ---
+default_walltime: "48:00:00"
+max_walltime: "48:00:00"
+
+# ============================================================
+# TIER / QoS DEFINITIONS — the heart of access control
+# ============================================================
+# Each tier maps to:
+#   - A SLURM QoS (tesla-<tier>) with MaxTRESPerJob, MaxJobsPU, Priority
+#   - A SLURM Account (<tier>) under the root 'tesla' account
+#   - A Unix group (tesla-<tier>) for filesystem/MOTD use
+#
+# Priority math: PriorityWeightQOS=10000, so a 900-point QoS priority
+# difference gives deadline jobs a head start over gpu1-4 jobs.
+# Within the same QoS, PriorityWeightAge breaks ties FCFS.
+tesla_tiers:
+  - name: none
+    qos: tesla-none
+    max_gpus: 0
+    max_cpus: 4
+    max_jobs: 1
+    max_submit: 1
+    priority: 0
+    description: "CPU-only, single job — for suspended/probationary users"
+  - name: gpu1
+    qos: tesla-gpu1
+    max_gpus: 1
+    max_cpus: 20
+    max_jobs: 5
+    max_submit: 5
+    priority: 100
+    description: "1 GPU per job — DEFAULT tier"
+  - name: gpu2
+    qos: tesla-gpu2
+    max_gpus: 2
+    max_cpus: 20
+    max_jobs: 5
+    max_submit: 5
+    priority: 100
+    description: "Up to 2 GPUs per job"
+  - name: gpu3
+    qos: tesla-gpu3
+    max_gpus: 3
+    max_cpus: 20
+    max_jobs: 5
+    max_submit: 5
+    priority: 100
+    description: "Up to 3 GPUs per job"
+  - name: gpu4
+    qos: tesla-gpu4
+    max_gpus: 4
+    max_cpus: 20
+    max_jobs: 5
+    max_submit: 5
+    priority: 100
+    description: "Up to 4 GPUs per job (one NUMA node, NVLink-local)"
+  - name: deadline
+    qos: tesla-deadline
+    max_gpus: 8
+    max_cpus: 40
+    max_jobs: 5
+    max_submit: 5
+    priority: 1000
+    description: "Up to 8 GPUs, 40 CPUs, HIGH PRIORITY — publications/deadline group"
+
+default_tier: gpu1
+
+# ============================================================
+# Storage policy
+# ============================================================
+home_quota_gb: 200
+home_filesystem: /home
+nas_root: /storage/nas
+archive_root: /storage/nas/_archive
+
+# Root has unlimited (no quota); admin users likewise if you want.
+exclude_quota_users:
+  - root
+
+# ============================================================
+# slurmdbd / MariaDB
+# ============================================================
+slurmdbd_db_name: slurm_acct_db
+slurmdbd_db_user: slurm
+slurmdbd_db_password_file: /etc/slurm/slurmdbd-mysql.password
+slurmdbd_storage_host: localhost
+slurmdbd_port: 6819
+
+# ============================================================
+# Shared miniconda (in /tools)
+# ============================================================
+miniconda_root: /tools/miniconda3
+miniconda_installer_url: "https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh"
+
+# ============================================================
+# CSV-driven user management
+# ============================================================
+users_csv: /etc/tesla-cluster/users.csv
+users_csv_backup_dir: /storage/nas/_archive/users-csv-backups
+users_csv_lock: /var/lock/tesla-users-csv.lock
+
+existing_user_uid_min: 1000
+existing_user_uid_max: 60000
+
+# ============================================================
+# Admin users (root has unrestricted access)
+# ============================================================
+slurm_admin_users:
+  - root
+  # - jash
+
+# ============================================================
+# cgroup version + paths
+# ============================================================
+cgroup_version: v2
+slurm_conf_dir: /etc/slurm
+slurm_log_dir: /var/log/slurm
+slurm_spool_dir: /var/spool/slurm
+slurm_pid_dir: /var/run/slurm
+slurmdbd_log_dir: /var/log/slurm

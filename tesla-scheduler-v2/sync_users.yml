@@ -1,0 +1,73 @@
+---
+# sync_users.yml — Reconcile users.csv against the system.
+#
+# Reads /etc/tesla-cluster/users.csv, validates, creates/updates/removes users.
+# Idempotent. Pass --check to do a dry run.
+#
+# Usage:
+#   sudo ansible-playbook -i inventories/hosts.ini sync_users.yml --check
+#   sudo ansible-playbook -i inventories/hosts.ini sync_users.yml
+#   sudo ansible-playbook -i inventories/hosts.ini sync_users.yml -e "single_user=alice"
+
+- name: Tesla DGX-1 — Reconcile users from CSV
+  hosts: tesla
+  become: yes
+  gather_facts: no
+
+  vars:
+    single_user: ""
+
+  pre_tasks:
+    - name: Confirm CSV exists
+      ansible.builtin.stat:
+        path: "{{ users_csv }}"
+      register: csv_stat
+
+    - name: Assert CSV exists
+      ansible.builtin.assert:
+        that: csv_stat.stat.exists
+        fail_msg: >
+          {{ users_csv }} does not exist. Either bootstrap with:
+            sudo python3 tools/bootstrap_users_csv.py
+          and move the result to {{ users_csv }}, or create it manually
+          using users/users.csv.example as a template.
+
+    - name: Ensure tools dir is on the host
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/tools/"
+        dest: /usr/local/lib/tesla-cluster/
+        mode: "0755"
+
+  tasks:
+    - name: Validate CSV (sanity check)
+      ansible.builtin.command: >
+        python3 /usr/local/lib/tesla-cluster/validate_csv.py --csv {{ users_csv }}
+      changed_when: false
+
+    - name: Run sync_users.py (dry run)
+      ansible.builtin.command: >
+        python3 /usr/local/lib/tesla-cluster/sync_users.py
+        --csv {{ users_csv }}
+        --check
+        {% if single_user | length > 0 %} --user {{ single_user }}{% endif %}
+      register: dry_out
+      changed_when: false
+
+    - name: Show planned changes
+      ansible.builtin.debug:
+        msg: "{{ dry_out.stdout_lines }}"
+
+    - name: Apply changes
+      ansible.builtin.command: >
+        python3 /usr/local/lib/tesla-cluster/sync_users.py
+        --csv {{ users_csv }}
+        {% if single_user | length > 0 %} --user {{ single_user }}{% endif %}
+      register: sync_out
+      when: ansible_check_mode | bool == false
+
+    - name: Show applied changes
+      ansible.builtin.debug:
+        msg: "{{ sync_out.stdout_lines }}"
+      when:
+        - ansible_check_mode | bool == false
+        - sync_out.stdout_lines is defined

@@ -1,0 +1,116 @@
+---
+# roles/slurm_base/tasks/main.yml
+# Installs SLURM, slurmdbd, munge, MariaDB, and all dependencies.
+# Targets DGX OS 6 on Ubuntu 24.04.
+
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: yes
+    cache_valid_time: 3600
+
+- name: Install SLURM and dependencies
+  ansible.builtin.apt:
+    name:
+      - slurm-wlm
+      - slurmd
+      - slurmctld
+      - slurmdbd                     # accounting daemon
+      - slurm-wlm-doc
+      - munge
+      - libmunge-dev
+      - libmunge2
+      - libpam-slurm-adopt
+      - mariadb-server               # DB backend for slurmdbd
+      - mariadb-client               # for raw mysql commands in slurmdbd_setup
+      - hwloc
+      - numactl
+      - cgroup-tools
+      - quota                        # filesystem quota tools (already enabled on /home)
+      - python3-pip
+      - acl                          # for setfacl on shared dirs
+      - liblua5.3-dev                # for job_submit/lua plugin
+      - lua5.3
+    state: present
+
+- name: Ensure slurm group exists
+  ansible.builtin.group:
+    name: slurm
+    system: yes
+    state: present
+
+- name: Ensure slurm user exists
+  ansible.builtin.user:
+    name: slurm
+    group: slurm
+    system: yes
+    shell: /bin/false
+    home: /var/lib/slurm
+    create_home: no
+    state: present
+
+- name: Create slurm_admins group
+  ansible.builtin.group:
+    name: slurm_admins
+    state: present
+
+- name: Add admin users to slurm_admins group
+  ansible.builtin.user:
+    name: "{{ item }}"
+    groups: slurm_admins
+    append: yes
+  loop: "{{ slurm_admin_users }}"
+  when:
+    - slurm_admin_users | length > 0
+    # In --check mode the group above is not actually created, so this
+    # task would fail with "Group slurm_admins does not exist". Skip it
+    # in dry-run; real apply runs it normally.
+    - not ansible_check_mode
+
+- name: Create required SLURM directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: slurm
+    group: slurm
+    mode: "0755"
+  loop:
+    - "{{ slurm_conf_dir }}"
+    - "{{ slurm_log_dir }}"
+    - "{{ slurm_spool_dir }}"
+    - "{{ slurm_spool_dir }}/slurmctld"
+    - "{{ slurm_spool_dir }}/slurmd"
+    - "{{ slurm_pid_dir }}"
+
+- name: Create tesla-cluster config directory
+  ansible.builtin.file:
+    path: /etc/tesla-cluster
+    state: directory
+    owner: root
+    group: slurm_admins
+    mode: "0750"
+
+- name: Generate munge key (if not already present)
+  ansible.builtin.command:
+    cmd: dd if=/dev/urandom bs=1 count=1024 of=/etc/munge/munge.key
+    creates: /etc/munge/munge.key
+
+- name: Set correct permissions on munge key
+  ansible.builtin.file:
+    path: /etc/munge/munge.key
+    owner: munge
+    group: munge
+    mode: "0400"
+
+- name: Enable and start munge
+  ansible.builtin.systemd:
+    name: munge
+    enabled: yes
+    state: started
+
+- name: Verify munge is working
+  ansible.builtin.shell: |
+    set -o pipefail
+    munge -n | unmunge
+  changed_when: false
+  register: munge_test
+  failed_when: munge_test.rc != 0

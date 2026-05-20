@@ -1,0 +1,70 @@
+---
+# roles/user_policy/tasks/main.yml
+#
+# - Creates all tier Unix groups (tesla-none, tesla-gpu1, ..., tesla-deadline)
+# - Creates the umbrella tesla_users group
+# - Sets system-wide ulimits for tesla_users
+# - Deploys a tier-aware login banner that runs from /etc/profile.d/
+
+# ── Tier groups ─────────────────────────────────────────────────────────
+- name: Create tesla_users umbrella group
+  ansible.builtin.group:
+    name: tesla_users
+    state: present
+
+- name: Create per-tier Unix groups
+  ansible.builtin.group:
+    name: "tesla-{{ item.name }}"
+    state: present
+  loop: "{{ tesla_tiers }}"
+
+# ── ulimits for all tesla_users ─────────────────────────────────────────
+- name: Set resource limits for tesla users
+  ansible.builtin.blockinfile:
+    path: /etc/security/limits.conf
+    marker: "# {mark} ANSIBLE MANAGED — Tesla DGX-1 user limits"
+    block: |
+      # Tesla DGX-1 GPU cluster user limits
+      # Prevent forkbombs and resource abuse outside of SLURM jobs
+      @tesla_users    soft    nproc           4096
+      @tesla_users    hard    nproc           8192
+      @tesla_users    soft    nofile          65536
+      @tesla_users    hard    nofile          65536
+      @tesla_users    soft    stack           unlimited
+      @tesla_users    hard    stack           unlimited
+      @tesla_users    soft    memlock         unlimited
+      @tesla_users    hard    memlock         unlimited
+
+# ── Shell environment + tier-aware MOTD ─────────────────────────────────
+- name: Deploy Tesla shell profile (aliases + GPU env guard)
+  ansible.builtin.copy:
+    dest: /etc/profile.d/tesla.sh
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Tesla DGX-1 cluster shell environment
+      # Sourced for all interactive login shells
+
+      alias tq='squeue -u $USER -o "%-10i %-20j %-8T %-12l %-12L %R"'
+      alias tqa='squeue -o "%-10i %-15u %-20j %-8T %-12l %-12L %R"'
+      alias tstatus='tesla-status'
+      alias tcancel='scancel'
+      alias tier='tesla-tier'
+
+      # NCCL/PyTorch DDP default for DGX-1 hybrid cube-mesh
+      export NCCL_P2P_LEVEL=NVL
+
+      # Warn when shell is outside a SLURM allocation
+      if [ -z "${SLURM_JOB_ID:-}" ]; then
+          export CUDA_VISIBLE_DEVICES=""
+      fi
+
+- name: Deploy tier-aware login banner script
+  ansible.builtin.template:
+    src: tier_login_banner.sh.j2
+    dest: /etc/profile.d/zz-tesla-banner.sh
+    owner: root
+    group: root
+    mode: "0644"
+

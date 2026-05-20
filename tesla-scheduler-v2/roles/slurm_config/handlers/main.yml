@@ -1,0 +1,14 @@
+---
+# roles/slurm_config/handlers/main.yml
+
+- name: Restart slurmctld
+  ansible.builtin.systemd:
+    name: slurmctld
+    state: restarted
+    daemon_reload: yes
+
+- name: Restart slurmd
+  ansible.builtin.systemd:
+    name: slurmd
+    state: restarted
+    daemon_reload: yes

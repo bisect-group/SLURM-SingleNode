@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# /usr/local/bin/myresources
+#
+# Show the user their tier, quota usage, recent job history, and current
+# allocation. Read-only.
+
+set -euo pipefail
+
+GREEN=$'\e[32m'; YELLOW=$'\e[33m'; RED=$'\e[31m'; BOLD=$'\e[1m'; RESET=$'\e[0m'
+
+echo "${BOLD}╔═══════════════════════════════════════════════════════════════╗${RESET}"
+echo "${BOLD}║  Resources for $USER on rbcdsaidgx (Tesla DGX-1)$(printf '%*s' $((15 - ${#USER})) '')║${RESET}"
+echo "${BOLD}╚═══════════════════════════════════════════════════════════════╝${RESET}"
+
+# ─── Tier ─────────────────────────────────────────────────────
+echo
+echo "${BOLD}── Your SLURM tier ──${RESET}"
+TIER_LINE=$(sacctmgr -nP show user "$USER" withassoc \
+    format=user,account,defaultqos 2>/dev/null | head -1)
+if [[ -n "$TIER_LINE" ]]; then
+    IFS='|' read -r _ acct qos <<< "$TIER_LINE"
+    qos_short="${qos#tesla-}"
+    echo "  Account:  $acct"
+    echo "  QoS:      $qos  ($qos_short)"
+
+    # Pull the QoS limits
+    LIMITS=$(sacctmgr -nP show qos "$qos" \
+        format=name,priority,maxtresperjob,maxjobspu 2>/dev/null | head -1)
+    if [[ -n "$LIMITS" ]]; then
+        IFS='|' read -r _ prio tres maxjobs <<< "$LIMITS"
+        echo "  Priority: $prio"
+        echo "  Limits:   $tres | max ${maxjobs} concurrent jobs"
+    fi
+else
+    echo "  ${RED}No SLURM account found — contact the admin.${RESET}"
+fi
+
+# ─── Quota ────────────────────────────────────────────────────
+echo
+echo "${BOLD}── Home disk quota (/home/$USER) ──${RESET}"
+read -r used soft hard < <(quota -u "$USER" 2>/dev/null \
+    | awk 'NR==3 {print $2, $3, $4}')
+used_gb=$((used / 1024 / 1024))
+hard_gb=$((hard / 1024 / 1024))
+[[ "$hard" -eq 0 ]] && hard_gb=999999
+pct=$((used * 100 / (hard == 0 ? 1 : hard)))
+
+bar=""
+filled=$((pct / 5))
+for _ in $(seq 1 20); do
+    [[ $((filled--)) -gt 0 ]] && bar+="█" || bar+="░"
+done
+
+color="$GREEN"
+[[ $pct -ge 75 ]] && color="$YELLOW"
+[[ $pct -ge 90 ]] && color="$RED"
+
+printf "  ${color}[%s] %s%% used   (%d GB of %d GB)${RESET}\n" "$bar" "$pct" "$used_gb" "$hard_gb"
+
+if [[ $pct -ge 90 ]]; then
+    echo "  ${RED}⚠ You're near your quota limit. Move large files to /storage/nas/$USER/${RESET}"
+fi
+
+# ─── NAS ──────────────────────────────────────────────────────
+if [[ -d "/storage/nas/$USER" ]]; then
+    NAS_SIZE=$(du -sh "/storage/nas/$USER" 2>/dev/null | cut -f1)
+    echo
+    echo "${BOLD}── NAS usage (/storage/nas/$USER) ──${RESET}"
+    echo "  Total: $NAS_SIZE  (no quota — use freely for datasets, checkpoints)"
+fi
+
+# ─── Active jobs ──────────────────────────────────────────────
+echo
+echo "${BOLD}── Currently running ──${RESET}"
+RUN=$(squeue -h --me -t RUNNING | wc -l)
+PEND=$(squeue -h --me -t PENDING | wc -l)
+if [[ $((RUN + PEND)) -eq 0 ]]; then
+    echo "  (no jobs in queue)"
+else
+    echo "  ${GREEN}$RUN running${RESET}, ${YELLOW}$PEND pending${RESET}"
+    squeue --me --format='  %.10i  %.20j  %.8T  %.10M  %.6C  %.10b' | tail -n +1
+fi
+
+# ─── Last 7 days ──────────────────────────────────────────────
+echo
+echo "${BOLD}── Job history (last 7 days) ──${RESET}"
+SINCE=$(date -d '7 days ago' +%Y-%m-%d 2>/dev/null || date -v-7d +%Y-%m-%d)
+HIST=$(sacct -u "$USER" --starttime="$SINCE" \
+    --format=jobid,jobname,state,elapsed,reqgres \
+    --noheader --parsable2 2>/dev/null | grep -v '\.batch\|\.extern' || true)
+
+if [[ -z "$HIST" ]]; then
+    echo "  (no jobs since $SINCE)"
+else
+    COMPLETED=$(echo "$HIST" | grep -c 'COMPLETED' || true)
+    FAILED=$(echo "$HIST" | grep -cE '(FAILED|TIMEOUT|CANCELLED|OUT_OF_MEMORY)' || true)
+    TOTAL=$(echo "$HIST" | wc -l)
+    echo "  $TOTAL total | ${GREEN}$COMPLETED completed${RESET} | ${RED}$FAILED failed${RESET}"
+    echo "  (run 'sacct -u \$USER --starttime=$SINCE' for full table)"
+fi
+
+echo
+echo "Useful next commands:"
+echo "  ${BOLD}myjobs${RESET}        — see your queue with colors"
+echo "  ${BOLD}gpu-shell${RESET}     — interactive GPU session"
+echo "  ${BOLD}gpu-jupyter${RESET}   — launch Jupyter via SSH tunnel"

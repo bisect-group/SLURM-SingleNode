@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# /usr/local/bin/myjobs
+#
+# Friendlier `squeue --me` with running/pending counts and a clean format.
+
+set -euo pipefail
+
+GREEN=$'\e[32m'; YELLOW=$'\e[33m'; CYAN=$'\e[36m'; RESET=$'\e[0m'
+
+# Counts
+RUNNING=$(squeue -h --me -t RUNNING | wc -l)
+PENDING=$(squeue -h --me -t PENDING | wc -l)
+TOTAL=$((RUNNING + PENDING))
+
+if [[ "$TOTAL" -eq 0 ]]; then
+    echo "${CYAN}You have no jobs in the queue.${RESET}"
+    echo "Submit something with 'sbatch your-script.sh' or 'gpu-shell'."
+    exit 0
+fi
+
+echo "${CYAN}You have $TOTAL job(s): ${GREEN}$RUNNING running${RESET}, ${YELLOW}$PENDING pending${RESET}"
+echo
+
+# Detailed table
+squeue --me --format='%.10i %.12P %.20j %.8T %.10M %.6D %.6C %.16b %R' \
+    | head -1
+squeue --me --format='%.10i %.12P %.20j %.8T %.10M %.6D %.6C %.16b %R' \
+    | tail -n +2 \
+    | while IFS= read -r line; do
+        if [[ "$line" == *"RUNNING"* ]]; then
+            echo "${GREEN}${line}${RESET}"
+        elif [[ "$line" == *"PENDING"* ]]; then
+            echo "${YELLOW}${line}${RESET}"
+        else
+            echo "$line"
+        fi
+    done
+
+echo
+echo "Hints:"
+echo "  scontrol show job <jobid>   # detail of one job"
+echo "  scancel <jobid>             # kill one job"
+echo "  scancel --me                # kill ALL your jobs"

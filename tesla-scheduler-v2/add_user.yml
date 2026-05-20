@@ -1,0 +1,13 @@
+---
+# add_user.yml — DEPRECATED but kept as a convenience alias.
+#
+# All user management now flows through users.csv + sync_users.yml.
+# To add a user:
+#   1. Append a row to /etc/tesla-cluster/users.csv
+#   2. Run:  sudo ansible-playbook -i inventories/hosts.ini sync_users.yml -e "single_user=NEWNAME"
+#
+# This playbook just calls sync_users.yml for a single user. It exists for
+# muscle memory only — `add_user.yml` was the old name in v1.
+
+- name: Tesla — Add/sync a single user (alias for sync_users.yml --user)
+  ansible.builtin.import_playbook: sync_users.yml

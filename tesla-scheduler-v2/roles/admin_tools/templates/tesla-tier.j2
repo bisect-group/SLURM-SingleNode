@@ -1,0 +1,43 @@
+#!/bin/bash
+# =============================================================
+# tesla-tier — Print the calling user's tier and limits
+# (or any user, if called as admin)
+# Usage:
+#   tesla-tier                # for yourself
+#   tesla-tier alice          # admin: someone else
+# =============================================================
+set -euo pipefail
+
+USER="${1:-$USER}"
+
+GROUPS_=$(id -nG "$USER" 2>/dev/null || echo "")
+TIER="(unassigned)"
+MAX_GPUS="?"
+MAX_CPUS="?"
+MAX_JOBS="?"
+PRIORITY="?"
+
+{% for t in tesla_tiers | reverse %}
+if echo " $GROUPS_ " | grep -q " tesla-{{ t.name }} "; then
+    TIER="{{ t.name }}"
+    MAX_GPUS="{{ t.max_gpus }}"
+    MAX_CPUS="{{ t.max_cpus }}"
+    MAX_JOBS="{{ t.max_jobs }}"
+    PRIORITY="{{ t.priority }}"
+fi
+{% endfor %}
+
+echo
+echo "  User      : $USER"
+echo "  Tier      : $TIER"
+echo "  Max GPUs  : $MAX_GPUS per job"
+echo "  Max CPUs  : $MAX_CPUS per job"
+echo "  Max queue : $MAX_JOBS jobs"
+echo "  Priority  : $PRIORITY"
+
+if [[ "$TIER" == "(unassigned)" ]]; then
+    echo
+    echo "  You don't have a tier — GPU jobs will be rejected."
+    echo "  Contact a slurm_admin to be added to a tier."
+fi
+echo

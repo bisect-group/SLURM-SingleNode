@@ -1,0 +1,120 @@
+---
+# roles/shared_miniconda/tasks/main.yml
+#
+# Installs Miniconda to /tools/miniconda3 (root-owned 755, world-readable
+# but write-protected). Adds an activation snippet to /etc/skel/.profile
+# so NEW users automatically pick up conda. Existing users are left
+# untouched per the user's instruction (they have their own setups).
+#
+# This mirrors the andromeda shared-miniconda pattern: per-user envs/cache
+# redirected to ~/.conda/{envs,pkgs} via a .condarc dropped into /etc/skel.
+
+- name: Ensure /tools exists
+  ansible.builtin.file:
+    path: /tools
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Check whether Miniconda is already installed at {{ miniconda_root }}
+  ansible.builtin.stat:
+    path: "{{ miniconda_root }}/bin/conda"
+  register: conda_bin
+
+- name: Download Miniconda installer
+  ansible.builtin.get_url:
+    url: "{{ miniconda_installer_url }}"
+    dest: /tmp/miniconda-installer.sh
+    mode: "0755"
+  when: not conda_bin.stat.exists
+
+- name: Run Miniconda installer to {{ miniconda_root }}
+  ansible.builtin.command:
+    cmd: /tmp/miniconda-installer.sh -b -p {{ miniconda_root }}
+    creates: "{{ miniconda_root }}/bin/conda"
+  when: not conda_bin.stat.exists
+
+- name: Remove Miniconda installer
+  ansible.builtin.file:
+    path: /tmp/miniconda-installer.sh
+    state: absent
+
+- name: Ensure /tools/miniconda3 is root-owned and world-readable
+  ansible.builtin.file:
+    path: "{{ miniconda_root }}"
+    owner: root
+    group: root
+    recurse: yes
+
+- name: Set top-level miniconda dir 0755 (so users can read)
+  ansible.builtin.file:
+    path: "{{ miniconda_root }}"
+    state: directory
+    mode: "0755"
+
+# Note: a "conda update -n base" task used to live here. It was removed
+# because (a) the installer already ships a current version, (b) Anaconda's
+# new ToS gate on the `defaults` channel makes non-interactive updates fail.
+# To upgrade later, an admin runs (one-time per channel):
+#   /tools/miniconda3/bin/conda tos accept --override-channels \
+#       --channel https://repo.anaconda.com/pkgs/main
+#   /tools/miniconda3/bin/conda tos accept --override-channels \
+#       --channel https://repo.anaconda.com/pkgs/r
+#   /tools/miniconda3/bin/conda update -n base -c defaults conda
+
+# ── /etc/skel: only affects NEW users created from this point on ───────
+- name: Append conda activation block to /etc/skel/.profile
+  ansible.builtin.blockinfile:
+    path: /etc/skel/.profile
+    create: yes
+    owner: root
+    group: root
+    mode: "0644"
+    marker: "# {mark} ANSIBLE MANAGED — Tesla shared miniconda"
+    block: |
+      # Tesla cluster: shared miniconda at {{ miniconda_root }}
+      # Per-user envs and pkg cache live in ~/.conda/{envs,pkgs}
+      if [ -f {{ miniconda_root }}/etc/profile.d/conda.sh ]; then
+          . {{ miniconda_root }}/etc/profile.d/conda.sh
+      fi
+
+- name: Deploy default .condarc into /etc/skel
+  ansible.builtin.copy:
+    dest: /etc/skel/.condarc
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Tesla cluster default .condarc
+      # Envs and pkg cache go into your /home (200GB SSD quota).
+      # For larger envs (>50 GB), keep them on /storage/nas/$USER/conda_envs/
+      # and symlink: ln -s /storage/nas/$USER/conda_envs/big_env ~/.conda/envs/big_env
+      #
+      # Channels: conda-forge first (no ToS required). The `defaults` channel
+      # is intentionally omitted — Anaconda requires per-user ToS acceptance
+      # for it. If you need defaults, run:
+      #   conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
+      #   conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
+      envs_dirs:
+        - ~/.conda/envs
+      pkgs_dirs:
+        - ~/.conda/pkgs
+      auto_activate_base: false
+      channel_priority: strict
+      channels:
+        - conda-forge
+
+- name: Show miniconda version
+  ansible.builtin.command: "{{ miniconda_root }}/bin/conda --version"
+  register: conda_version
+  changed_when: false
+
+- name: Report
+  ansible.builtin.debug:
+    msg:
+      - "Miniconda installed at: {{ miniconda_root }}"
+      - "{{ conda_version.stdout }}"
+      - "Existing users: NOT modified — they keep their own conda setup."
+      - "New users (via sync_users.yml): will automatically pick up shared conda."
+      - "Default channel: conda-forge only (no Anaconda ToS gate)."

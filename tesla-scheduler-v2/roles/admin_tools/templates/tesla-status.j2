@@ -1,0 +1,57 @@
+#!/bin/bash
+# =============================================================
+# tesla-status — Quick cluster overview for users and admins
+# Usage: tesla-status [--all]
+# =============================================================
+WIDE=${1:-""}
+
+echo ""
+echo "══════════════════════════════════════════════════"
+echo "  Tesla DGX-1 Status  —  $(date '+%Y-%m-%d %H:%M:%S')"
+echo "══════════════════════════════════════════════════"
+
+echo ""
+echo "── GPU Resources ──────────────────────────────────"
+sinfo -o "%-20N %-10P %-8t %-20G" --noheader
+
+echo ""
+echo "── Queue (all jobs) ───────────────────────────────"
+squeue -o "%-10i %-15u %-12q %-15j %-8T %-12l %-12L %-6C %-8m %R" \
+       --sort='-Q,+T,+i' 2>/dev/null || echo "(queue empty)"
+
+echo ""
+echo "── Per-user job counts ────────────────────────────"
+squeue -h -o "%u" 2>/dev/null | sort | uniq -c | sort -rn | \
+  awk '{printf "  %-20s %s jobs\n", $2, $1}' || echo "  (no active jobs)"
+
+if [[ "$WIDE" == "--all" ]]; then
+  echo ""
+  echo "── Recent completions (last 10) ───────────────────"
+  if [[ -f {{ slurm_log_dir }}/job_completions.log ]]; then
+    tail -10 {{ slurm_log_dir }}/job_completions.log
+  else
+    echo "  (no completion log yet)"
+  fi
+
+  echo ""
+  echo "── GPU utilization (live) ─────────────────────────"
+  nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu \
+             --format=csv,noheader 2>/dev/null | \
+    awk -F', ' '{printf "  GPU%-2s %-22s util=%4s%% mem=%6s/%-6s temp=%3sC\n", $1, $2, $3, $4, $5, $6}'
+
+  echo ""
+  echo "── NVLink health ──────────────────────────────────"
+  nvl_up=$(nvidia-smi nvlink --status 2>/dev/null | grep -c "25.781 GB/s" || true)
+  echo "  Links up at 25.78 GB/s: $nvl_up / 48 expected"
+
+  echo ""
+  echo "── QoS state (sacctmgr) ───────────────────────────"
+  sacctmgr -nP show qos format=name,priority,maxtresperjob,maxsubmitjobsperuser 2>/dev/null \
+    | column -t -s'|' || echo "  (slurmdbd not yet up)"
+fi
+
+echo ""
+echo "── Node health ────────────────────────────────────"
+scontrol show node "$(hostname)" 2>/dev/null \
+  | grep -E 'NodeName|CPUTot|RealMemory|AllocTRES|CfgTRES|State' || true
+echo ""

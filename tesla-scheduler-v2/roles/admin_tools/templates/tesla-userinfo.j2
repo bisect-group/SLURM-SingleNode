@@ -1,0 +1,86 @@
+#!/bin/bash
+# =============================================================
+# tesla-userinfo — One-shot summary of a user's status
+# Usage: tesla-userinfo <username>
+# =============================================================
+set -euo pipefail
+
+USER="${1:?Usage: tesla-userinfo <username>}"
+
+if ! id "$USER" &>/dev/null; then
+    echo "User '$USER' does not exist on this system." >&2
+    exit 1
+fi
+
+UID_=$(id -u "$USER")
+GID_=$(id -g "$USER")
+GROUPS_=$(id -nG "$USER" | tr ' ' ',' )
+SHELL_=$(getent passwd "$USER" | cut -d: -f7)
+HOME_=$(getent passwd "$USER" | cut -d: -f6)
+GECOS_=$(getent passwd "$USER" | cut -d: -f5 | cut -d, -f1)
+
+echo "═══════════════════════════════════════════════════"
+echo "  $USER  (uid=$UID_  gid=$GID_)"
+echo "═══════════════════════════════════════════════════"
+echo
+echo "  Full name : ${GECOS_:-(not set)}"
+echo "  Home      : $HOME_"
+echo "  Shell     : $SHELL_"
+echo "  Groups    : $GROUPS_"
+echo
+
+# Tier
+TIER="(none)"
+for t in deadline gpu4 gpu3 gpu2 gpu1 none; do
+    if echo "$GROUPS_" | tr ',' '\n' | grep -qx "tesla-$t"; then
+        TIER="$t"
+        break
+    fi
+done
+echo "  SLURM tier: $TIER"
+echo
+
+# SLURM accounting view
+echo "── SLURM accounting (sacctmgr) ──"
+sacctmgr -nP show user "$USER" format=user,defaultaccount,account,defaultqos 2>/dev/null \
+    | column -t -s'|' || echo "  (user not in slurmdbd — they cannot submit jobs yet)"
+echo
+
+# Quota
+echo "── /home quota ──"
+quota -u "$USER" 2>/dev/null | tail -n +2 || echo "  (no quota set)"
+echo
+
+# Active jobs
+echo "── Active SLURM jobs ──"
+squeue -u "$USER" -o "%-10i %-15j %-8T %-12l %-12L %-5C %-6m %R" 2>/dev/null || echo "  (none)"
+echo
+
+# Disk usage of $HOME and NAS
+echo "── Disk usage ──"
+if [[ -d "$HOME_" ]]; then
+    HOME_USAGE=$(du -sh "$HOME_" 2>/dev/null | awk '{print $1}')
+    echo "  $HOME_  : $HOME_USAGE"
+fi
+NAS_DIR=/storage/nas/$USER
+if [[ -d "$NAS_DIR" ]]; then
+    NAS_USAGE=$(du -sh "$NAS_DIR" 2>/dev/null | awk '{print $1}')
+    echo "  $NAS_DIR  : $NAS_USAGE"
+fi
+
+# Archive presence
+ARCHIVES=$(ls -1 /storage/nas/_archive/home_${USER}_*.tar.gz 2>/dev/null || true)
+if [[ -n "$ARCHIVES" ]]; then
+    echo
+    echo "── Archived backups in NAS ──"
+    echo "$ARCHIVES" | while read -r f; do
+        SIZE=$(du -sh "$f" 2>/dev/null | awk '{print $1}')
+        echo "  $f ($SIZE)"
+    done
+fi
+
+# Last login
+echo
+echo "── Last login ──"
+last "$USER" 2>/dev/null | head -3 || echo "  (none)"
+echo

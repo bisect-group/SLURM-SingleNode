@@ -1,0 +1,147 @@
+---
+# roles/storage_quotas/tasks/main.yml
+#
+# Set a flat 200GB hard quota on /home for every user EXCEPT root and
+# entries in exclude_quota_users. The /home filesystem already has
+# usrquota,grpquota mount options (confirmed via findmnt /home).
+#
+# Behavior:
+#   - Users currently OVER 200GB will hit "disk quota exceeded" on their
+#     next write. Admin (root) is expected to migrate their data to NAS
+#     and ask them to clean up. This is intentional per spec.
+#   - Orphan quota entries (UIDs not in /etc/passwd) are reported and
+#     can be cleaned via `quotacheck -ufm /home`.
+#   - Root and any user in exclude_quota_users get 0/0 (unlimited).
+
+- name: Verify /home has quota enabled in current mount options
+  ansible.builtin.command: findmnt -no OPTIONS {{ home_filesystem }}
+  register: mount_opts
+  changed_when: false
+  check_mode: false   # read-only; needed for the assert below in --check mode
+
+- name: Assert /home is mounted with usrquota
+  ansible.builtin.assert:
+    that:
+      - "'usrquota' in mount_opts.stdout"
+    fail_msg: >
+      /home does not appear to have usrquota enabled in current mount options:
+      {{ mount_opts.stdout }}
+      Add 'usrquota,grpquota' to /etc/fstab for {{ home_filesystem }} and
+      remount or reboot, then re-run.
+    success_msg: "/home has usrquota enabled."
+
+- name: Ensure quota database files exist
+  ansible.builtin.shell: |
+    set -o pipefail
+    if [ ! -f {{ home_filesystem }}/aquota.user ]; then
+      quotacheck -cufm {{ home_filesystem }}
+      quotaon {{ home_filesystem }}
+    fi
+  changed_when: false
+  args:
+    creates: "{{ home_filesystem }}/aquota.user"
+
+# ── Snapshot of current usage before applying limits ───────────────────
+- name: Capture current repquota state
+  ansible.builtin.command: repquota -u {{ home_filesystem }}
+  register: repquota_before
+  changed_when: false
+  check_mode: false
+
+- name: Identify users currently over the new {{ home_quota_gb }}G limit
+  ansible.builtin.shell: |
+    set -o pipefail
+    repquota -u {{ home_filesystem }} | awk -v limit_kb=$(( {{ home_quota_gb }} * 1024 * 1024 )) '
+      /^[a-zA-Z_]/ && $3+0 > limit_kb {
+        printf "  %-20s %d GB\n", $1, $3 / 1024 / 1024
+      }
+    '
+  register: over_limit
+  changed_when: false
+  check_mode: false
+
+- name: Report users currently over the new limit
+  ansible.builtin.debug:
+    msg:
+      - "Users currently OVER {{ home_quota_gb }} GB on {{ home_filesystem }}:"
+      - "{{ over_limit.stdout_lines | default(['  (none)']) }}"
+      - ""
+      - "These users will get 'disk quota exceeded' on their next write."
+      - "Admin should migrate their data to /storage/nas/$user manually."
+
+# ── Get all human users from /etc/passwd to apply per-user quota ───────
+- name: Build list of users to apply quota to
+  ansible.builtin.shell: |
+    set -o pipefail
+    awk -F: -v min={{ existing_user_uid_min }} -v max={{ existing_user_uid_max }} '
+      $3 >= min && $3 <= max && $1 != "nobody" { print $1 }
+    ' /etc/passwd | sort -u
+  register: quota_target_users
+  changed_when: false
+  check_mode: false
+
+- name: Apply {{ home_quota_gb }}G hard quota to each user (except root + exclusions)
+  ansible.builtin.shell: |
+    set -e
+    BLOCKS_HARD=$(( {{ home_quota_gb }} * 1024 * 1024 ))
+    BLOCKS_SOFT=$(( ({{ home_quota_gb }} - 10) * 1024 * 1024 ))
+    setquota -u "{{ item }}" $BLOCKS_SOFT $BLOCKS_HARD 0 0 {{ home_filesystem }}
+  loop: "{{ quota_target_users.stdout_lines }}"
+  when:
+    - item not in exclude_quota_users
+  changed_when: true   # setquota is idempotent but doesn't report no-op
+
+- name: Ensure root has unlimited quota on {{ home_filesystem }}
+  ansible.builtin.command: setquota -u root 0 0 0 0 {{ home_filesystem }}
+  changed_when: false
+
+# ── Orphan quota entries (UIDs not in /etc/passwd) ─────────────────────
+- name: Find orphan quota entries (UIDs not in /etc/passwd)
+  ansible.builtin.shell: |
+    set -o pipefail
+    repquota -u {{ home_filesystem }} \
+      | awk '/^#[0-9]+/ {print $1}' \
+      | tr -d '#'
+  register: orphan_uids
+  changed_when: false
+  check_mode: false
+
+- name: Report orphan quota entries
+  ansible.builtin.debug:
+    msg:
+      - "Orphan quota entries (UID in quota DB but not in /etc/passwd):"
+      - "{{ orphan_uids.stdout_lines | default(['  (none)']) }}"
+      - ""
+      - "To clean these: sudo quotaoff {{ home_filesystem }} && sudo quotacheck -ufm {{ home_filesystem }} && sudo quotaon {{ home_filesystem }}"
+      - "(safe to do but takes a few seconds, briefly stops quota enforcement)"
+
+# ── Ensure archive dir exists on NAS ───────────────────────────────────
+- name: Ensure /storage/nas/_archive exists
+  ansible.builtin.file:
+    path: "{{ archive_root }}"
+    state: directory
+    owner: root
+    group: slurm_admins
+    mode: "0750"
+
+- name: Ensure /storage/nas exists (sanity check)
+  ansible.builtin.stat:
+    path: "{{ nas_root }}"
+  register: nas_stat
+
+- name: Warn if NAS root is missing
+  ansible.builtin.debug:
+    msg: >
+      WARNING: {{ nas_root }} does not exist or isn't mounted.
+      User home/NAS dir creation and archiving will fail.
+      Mount your NAS export at {{ nas_root }} before running sync_users.yml.
+  when: not nas_stat.stat.exists
+
+- name: Print final repquota summary
+  ansible.builtin.command: repquota -u {{ home_filesystem }}
+  register: repquota_after
+  changed_when: false
+
+- name: Show post-apply repquota
+  ansible.builtin.debug:
+    msg: "{{ repquota_after.stdout_lines }}"

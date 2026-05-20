@@ -1,0 +1,109 @@
+#!/bin/bash
+# =============================================================
+# tesla-restore-user — Restore an inactive user's /home from archive
+#
+# Workflow:
+#   1. Set status=active in users.csv
+#   2. Run sync_users.yml (creates user with fresh /home)
+#   3. Run this script to overlay the archived /home contents
+#
+# Usage:
+#   sudo tesla-restore-user <username>
+#   sudo tesla-restore-user <username> --archive /path/to/specific.tar.gz
+#   sudo tesla-restore-user --list <username>
+# =============================================================
+set -euo pipefail
+
+[[ $EUID -eq 0 ]] || { echo "Must run as root." >&2; exit 1; }
+
+ARCHIVE_DIR=/storage/nas/_archive
+LIST_ONLY=0
+SPECIFIC_ARCHIVE=""
+USERNAME=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --list) LIST_ONLY=1; shift ;;
+        --archive) SPECIFIC_ARCHIVE="$2"; shift 2 ;;
+        -*) echo "Unknown option: $1" >&2; exit 1 ;;
+        *) USERNAME="$1"; shift ;;
+    esac
+done
+
+[[ -n "$USERNAME" ]] || { echo "Usage: tesla-restore-user <username> [--archive PATH]"; exit 1; }
+
+# List mode
+if [[ $LIST_ONLY -eq 1 ]]; then
+    echo "Archives for $USERNAME:"
+    ls -lh "$ARCHIVE_DIR"/home_"${USERNAME}"_*.tar.gz 2>/dev/null || echo "  (none)"
+    exit 0
+fi
+
+# Find archive
+if [[ -z "$SPECIFIC_ARCHIVE" ]]; then
+    SPECIFIC_ARCHIVE=$(ls -1t "$ARCHIVE_DIR"/home_"${USERNAME}"_*.tar.gz 2>/dev/null | head -1 || true)
+fi
+if [[ -z "$SPECIFIC_ARCHIVE" || ! -f "$SPECIFIC_ARCHIVE" ]]; then
+    echo "ERROR: No archive found for $USERNAME in $ARCHIVE_DIR" >&2
+    echo "       Either:"
+    echo "       - User was deleted before archives were enabled, OR"
+    echo "       - Archive was manually purged (only /home is archived; /storage/nas/$USERNAME is untouched on inactive — check there)"
+    exit 1
+fi
+
+# Sanity: user must exist (sync_users should have re-created them)
+if ! id "$USERNAME" &>/dev/null; then
+    echo "ERROR: Unix user '$USERNAME' does not exist." >&2
+    echo "       Set status=active in users.csv and run sync_users.yml FIRST," >&2
+    echo "       then re-run tesla-restore-user." >&2
+    exit 1
+fi
+
+HOME_DIR=$(getent passwd "$USERNAME" | cut -d: -f6)
+UID_=$(id -u "$USERNAME")
+GID_=$(id -g "$USERNAME")
+
+echo "═════════════════════════════════════════════════════════"
+echo "  Restore plan"
+echo "═════════════════════════════════════════════════════════"
+echo "  User    : $USERNAME (uid=$UID_, gid=$GID_)"
+echo "  Home    : $HOME_DIR"
+echo "  Archive : $SPECIFIC_ARCHIVE"
+echo "  Size    : $(du -sh "$SPECIFIC_ARCHIVE" | awk '{print $1}')"
+echo "═════════════════════════════════════════════════════════"
+echo
+read -rp "Proceed? [y/N] " confirm
+[[ "$confirm" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
+
+# Move freshly-created home aside, extract archive, fix ownership
+BACKUP_NEW=$(mktemp -d /tmp/tesla-restore.XXXXXX)
+echo "Backing up current $HOME_DIR → $BACKUP_NEW (temporary)"
+mv "$HOME_DIR" "$BACKUP_NEW/" 2>/dev/null || true
+
+echo "Extracting archive..."
+mkdir -p "$(dirname "$HOME_DIR")"
+tar -xzf "$SPECIFIC_ARCHIVE" -C "$(dirname "$HOME_DIR")"
+
+# Archive was created with `arcname=username`, so it extracts to /home/$USERNAME
+if [[ ! -d "$HOME_DIR" ]]; then
+    echo "ERROR: extraction did not produce $HOME_DIR" >&2
+    # Try to recover the fresh home
+    if [[ -d "$BACKUP_NEW/$USERNAME" ]]; then
+        mv "$BACKUP_NEW/$USERNAME" "$HOME_DIR"
+    fi
+    exit 1
+fi
+
+echo "Fixing ownership (uid=$UID_, gid=$GID_)..."
+chown -R "$UID_:$GID_" "$HOME_DIR"
+
+echo "Cleaning up temporary backup..."
+rm -rf "$BACKUP_NEW"
+
+echo "✓ Restored $USERNAME's /home from $SPECIFIC_ARCHIVE"
+echo
+echo "Next steps:"
+echo "  - Verify: ls -la $HOME_DIR"
+echo "  - If you want to keep the archive: it stays in $ARCHIVE_DIR"
+echo "  - If you want to delete it: rm $SPECIFIC_ARCHIVE"
+echo "  - The user's /storage/nas/$USERNAME was never touched."

@@ -14,17 +14,23 @@ Initial profiles should cover:
 - A generic NVIDIA GPU server.
 - A CPU-only server.
 
+The current CPU-only machine is the development and test target. It should be represented by the CPU-only profile and can be used to prove the generalized installer locally before GPU rollout.
+
+The NVMe plus six-SATA RAID0 machine is the first target generic NVIDIA GPU server profile. It is not the CPU-only development machine.
+
 The first implementation should do a moderate reorganization: keep the useful Ansible role/tooling ideas, but rename and generalize directories, templates, variables, docs, and scripts. Do not do a clean rewrite unless the existing structure blocks the implementation.
 
 ## Repository And Config Layout
 
-Use `profiles/` plus `policies/`.
+Use `profiles/` plus domain policy files under `policies/`.
 
 - `profiles/` contains machine profiles such as `dgx-v100.yml`, `generic-gpu.yml`, and `cpu-only.yml`.
-- `policies/` contains reusable policy templates for tiers, storage, modules, caches, login limits, and defaults.
+- `policies/` contains reusable domain files such as `tiers.yml`, `storage.yml`, `modules.yml`, `cache.yml`, `login.yml`, and `defaults.yml`.
 - Machine profiles remain separate from user policy templates.
 - Admins select a profile explicitly with a command such as `ansible-playbook ... -e profile=generic-gpu`.
 - Hardware discovery generates a draft profile YAML for admin review; discovery output is not applied directly.
+- Policy/profile inheritance uses deep merge semantics: nested maps merge, while lists replace unless a schema field explicitly supports extension.
+- Human-readable units are allowed in authored YAML, for example `100GB`, `48h`, and `30d`. Validation should normalize them before rendering templates.
 
 Validation must be strict. If the selected profile, policies, mounts, users, tiers, quotas, or limits are inconsistent, the playbook should fail before touching the system.
 
@@ -58,19 +64,33 @@ Reason: the intended policy includes tiers, priorities, fairshare, preemption le
 
 ## User Policy Model
 
-Use YAML, not CSV, for the future user source of truth.
+Use YAML, not CSV, for the future user source of truth. The deployed source of truth is `/etc/slurm-single-node/users.yml`.
 
 - Existing CSV migration is not required because the CSV system has not been deployed in production.
 - A bootstrap/discovery tool should scan local human users from `/etc/passwd`, home directories, and authorized keys into a draft `users.yml` for admin review.
 - Only clearly named test users may be created/deleted during local implementation testing.
+- The file has `schema_version: 1`.
+- Users are keyed by username, not by a list item with a username field.
+- The YAML file contains desired state, not runtime bookkeeping.
+- Local runtime state is stored separately at `/var/lib/slurm-single-node/users-state.yml`.
+- Supported user statuses are `active`, `suspended`, and `inactive`.
+- Active users require `tier` and `status`. Missing metadata such as full name, email, or SSH keys should warn, not fail.
+- SSH keys are labeled objects, not raw strings. Labels make later key removal and audit easier.
+- If a user has no SSH keys in YAML, warn and leave that user's `authorized_keys` unmanaged rather than deleting access unexpectedly.
+- Absent existing local users are report-only by default. The sync should not delete unmanaged accounts unless a future explicit cleanup mode is added.
 
 Use tier templates as the policy inheritance model.
 
 - Machine profiles describe hardware and site layout.
 - Policy templates describe reusable limits such as CPU, GPU, RAM, `/home`, `/data`, `/scratch`, preemption, and fairshare behavior.
 - User tiers compose templates.
-- Per-user overrides may change inherited values permanently or until an expiry date.
-- Temporary overrides should auto-revert after expiry.
+- Per-user overrides are named records with a reason, values, and an optional `expires_at`.
+- Per-user overrides may change inherited values permanently or until expiry.
+- A scheduled reconcile should expire temporary overrides and restore the inherited policy.
+- Expired overrides enforce immediately. Where a running job must be interrupted, use the standard 5-minute grace period when possible.
+- Only admins may grant priority/emergency tiers or temporary overrides.
+- Unix groups are managed from policy. Use an umbrella Slurm user group plus per-tier groups.
+- Users should have private primary groups.
 
 Starter tiers should be compact:
 
@@ -78,9 +98,25 @@ Starter tiers should be compact:
 - `priority`
 - `emergency`
 
-Only admins may grant priority/emergency tiers or temporary overrides.
+The first generic NVIDIA GPU target should assume four GPUs until discovery pins exact hardware values.
 
-Exact resource values for these starter tiers are still open.
+- `standard`: up to 1 GPU per job.
+- `priority`: up to 2 GPUs per job.
+- `emergency`: up to all GPUs per job.
+- Running/submitted job limits: `standard=3`, `priority=5`, `emergency=10`.
+- Maximum walltime: `standard=48h`, `priority=72h`, `emergency=96h`.
+- Default walltime: `4h`.
+- Memory caps: `standard=25%`, `priority=50%`, `emergency=90%` of node RAM.
+- Preemption ranks: `standard=0`, `priority=50`, `emergency=100`.
+- Admins may extend jobs beyond normal tier walltime limits.
+- Exact CPU-per-job values are profile-specific and should be discovered, reviewed, then pinned.
+- CPU-only profiles use the same tier names, with GPU fields omitted or disabled.
+
+Lifecycle semantics:
+
+- `suspended` blocks SSH/login and Slurm submission/execution, but does not archive or delete user data.
+- `inactive` locks `/data/$USER`, prunes and archives `/home/$USER`, and removes the local account after the archive workflow succeeds.
+- Reactivating an inactive user restores access to `/data/$USER` instead of treating the user as new.
 
 ## Slurm Partitions And Job Requests
 
@@ -108,7 +144,7 @@ Use fairshare first, not hard daily compute quotas, for normal users.
 - Default GPU billing weight: one GPU-hour counts like 64 CPU-hours.
 - RAM is enforced per job/per tier only; do not implement RAM-hour quotas initially.
 
-Hard compute quotas may be reconsidered later for visitor/trial tiers, but they are not part of the locked initial direction.
+Hard compute quotas are future work only, possibly for visitor/trial tiers. They are not part of v1.
 
 ## Preemption
 
@@ -132,20 +168,29 @@ Users may SSH into the all-in-one node for:
 - Copying, moving, syncing, and organizing data.
 - Submitting jobs.
 - Checking queue and job state.
-- Running status tools such as `htop`, `btop`, `gpustat`, and `nvidia-smi`.
+- Running lightweight status tools such as `htop`, `btop`, and the managed GPU status wrapper.
 - Running remote editor servers lightly, as long as they stay within login caps.
 
 Users should not run real CPU or GPU workloads directly in their login shell. Real compute, including CPU notebooks, should go through Slurm.
 
 Implement login constraints with PAM/systemd/cgroup limits for non-Slurm login sessions:
 
-- Small interactive login caps by default.
-- No GPU compute access outside Slurm allocations.
-- Read-only GPU status visibility should remain available outside Slurm where feasible.
+- 2 CPUs per non-admin user outside Slurm.
+- 4 GB RAM per non-admin user outside Slurm.
+- 128 tasks/processes per non-admin user outside Slurm.
+- Lower I/O weight for login sessions rather than hard I/O caps.
+- Admin users are exempt from these login caps.
+- Remote IDEs are allowed, but they are still constrained by the same login caps.
+
+GPU isolation should be strong outside Slurm:
+
+- Users should not directly access `/dev/nvidia*` outside Slurm jobs.
+- Direct GPU tools such as `nvidia-smi` and `gpustat` should friendly-deny outside Slurm and point users to Slurm or the status wrapper.
+- Install a profile-prefixed status wrapper such as `<prefix>-gpu-status`.
+- The wrapper reads a root/service-collected snapshot refreshed every 10 seconds.
+- The snapshot should show GPU utilization, memory, temperature, and Slurm job/user mapping.
 
 Strict Slurm-only SSH is not the default because the same machine is the login node and compute node.
-
-Exact login caps are still open; current intent is roughly 1-2 CPUs and 4-8 GB RAM per login session.
 
 ## Storage Policy
 
@@ -155,7 +200,9 @@ Use optional storage features per profile, but the desired general model has sep
 - `/data`: persistent, quota-managed, intended for datasets, checkpoints, results, and expensive persistent caches.
 - `/scratch`: non-persistent, quota-managed, intended for temporary data, rebuildable caches, and job staging.
 
-For the specific upcoming non-production server:
+Storage paths are optional per profile. A CPU-only development profile may omit `/data`, `/scratch`, or archive roots if that machine does not have those mounts.
+
+For the target generic NVIDIA GPU server:
 
 - NVMe is expected to hold `/` and `/home`.
 - `/` may be a separate 512 GB partition.
@@ -175,24 +222,35 @@ Use both scratch types:
 - `/scratch/$USER` for user-scoped TTL scratch and rebuildable caches.
 - Per-job scratch for temporary job working data.
 
-Default scratch cleanup age is 30 days.
+Default scratch cleanup age is 30 days and must be configurable by profile.
+
+Scratch cleanup should be managed age-based cleanup, preferably with `systemd-tmpfiles` or a systemd timer. Do not rely on filesystem-native TTL as the primary design because it is not portable across the target filesystems. Cleanup should write reports/logs and then delete eligible files by age.
 
 ## Cache Policy
 
 Use a default cache map with profile overrides. Do not try to infer cache importance automatically from file contents.
 
-Default direction:
+Default cache direction:
 
-- Rebuildable caches go to `/scratch/$USER/cache`.
-- Expensive model/data caches go to `/data/$USER/cache` under the user's data quota.
+- Use a broad development cache map.
+- `XDG_CACHE_HOME` points to scratch.
+- Rebuildable development caches go to `/scratch/$USER/cache`.
+- Hugging Face model/dataset caches go to persistent `/data/$USER/cache/huggingface`.
+- Package-manager caches, including pip, uv, Pixi, and Conda package caches, go to scratch.
+- Actual environments may live in `/home` or `/data`, depending on user choice and quota.
+- W&B runs and offline directories go to `/data`; W&B cache and temporary artifacts go to scratch.
+- Cache environment applies to both login shells and Slurm jobs.
 
 Likely scratch/TTL cache candidates:
 
 - `PIP_CACHE_DIR`
 - `UV_CACHE_DIR`
+- Pixi cache variables.
+- Conda package cache variables.
 - `XDG_CACHE_HOME`
 - `TRITON_CACHE_DIR`
 - `NUMBA_CACHE_DIR`
+- W&B cache/temp variables.
 - temporary build directories
 
 Likely persistent data-cache candidates:
@@ -200,20 +258,28 @@ Likely persistent data-cache candidates:
 - `HF_HOME`
 - `HF_DATASETS_CACHE`
 - `TORCH_HOME`
+- W&B run/offline directories.
 - large model stores
 - large reference databases
 
-The exact default cache variable map is still open.
+The exact default cache environment variable names and path map still need a concrete schema/example before implementation.
 
 ## Inactive Users And Archives
 
 When a user is marked inactive:
 
-- Prune known rebuildable environment/cache paths first.
+- Lock `/data/<user>` so data remains preserved but unavailable to the inactive account.
+- Prune known rebuildable environment/cache paths from `/home/<user>` first.
 - Compress the remaining `/home/<user>` with `7zz -mx=9`.
 - Store the archive under a profile-defined archive root, expected to be under `/data/_archive` for the new storage model.
 - Run expensive compression as a Slurm admin job, not directly inside the sync playbook.
 - Keep local inactive-user archives indefinitely by default.
+- Remove the local account after the archive workflow succeeds.
+- Reactivation restores `/data/<user>` access instead of creating a fresh data directory.
+
+Known home prune candidates should include caches and common environment directories, such as `.cache`, package caches, `.conda/envs`, `.conda/pkgs`, `.pixi/envs`, and obvious top-level virtualenv directories such as `.venv`, `venv`, and `env`.
+
+Inactive cleanup should produce a dry plan first, then run the real apply non-interactively after admin approval or when explicitly invoked in apply mode.
 
 External backup hooks are supported only for inactive-user archives.
 
@@ -221,11 +287,17 @@ External backup hooks are supported only for inactive-user archives.
 - If a hook fails, keep the local archive, warn loudly, write logs, and continue the local account lifecycle.
 - Hooks do not make this repo a full backup system.
 
-The exact prune list for known environments and caches is still open.
+The exact prune path list still needs to be written as concrete policy data.
 
 ## Modules And Shared Software
 
 Use Lmod as the module system.
+
+Shared software roots are profile-defined, with defaults under `/tools`:
+
+- `/tools/apps`
+- `/tools/modules`
+- `/tools/containers`
 
 Modules should support:
 
@@ -237,9 +309,11 @@ Modules should support:
 
 Use a per-module update policy:
 
-- Low-risk loaders may auto-update.
+- Low-risk loaders may auto-update weekly.
+- CUDA may update monthly by default.
 - CUDA and heavy scientific apps may define their own policy.
 - Scientific/domain apps can be native central modules or container-backed modules.
+- Scientific/domain apps should use a check-and-approve workflow rather than blind updates.
 
 Default CUDA behavior:
 
@@ -252,6 +326,14 @@ The driver-only smoke check is intentionally lightweight and will not catch all 
 
 Shared domain software, such as protein docking tools, should be installable centrally and exposed through modules so users do not keep identical copies against their quotas.
 
+## Project Groups
+
+Support basic project/lab groups in `users.yml`.
+
+- Groups are useful for Unix permissions and future policy hooks.
+- Do not add shared group storage in v1.
+- Module visibility is global to all users in v1.
+
 ## User-Facing Docs And Examples
 
 Generate user docs/examples per profile.
@@ -263,7 +345,7 @@ Generate user docs/examples per profile.
 
 ## Testing And Rollout
 
-The current development machine is a non-production CPU-only server and may be used for full local live testing.
+The current development machine is a non-production CPU-only server and may be used for full local live testing. The NVMe plus six-SATA RAID0 machine is the target NVIDIA GPU server and should receive the generalized GPU profile only after local CPU-only validation and render review.
 
 Local testing may:
 
@@ -272,7 +354,7 @@ Local testing may:
 - Apply the CPU-only profile locally.
 - Create and remove clearly named test users.
 
-Production/DGX rollout must use a render-review gate first:
+GPU server and DGX rollout must use a render-review gate first:
 
 - Generate resolved production config and rendered service files.
 - Review before applying to production.
@@ -295,11 +377,7 @@ After each iteration, promote locked decisions into the sections above and keep 
 
 These are not yet locked and need follow-up before implementation details are final:
 
-- Exact resource values for starter tiers: `standard`, `priority`, and `emergency`.
-- Exact login caps for small interactive sessions.
-- Exact `users.yml` schema.
-- Exact policy/template schema.
-- How to provide read-only `nvidia-smi`/`gpustat` visibility while blocking CUDA compute outside Slurm.
+- Exact CPU-per-job tier limits for the CPU-only development profile and the target NVIDIA GPU profile after hardware discovery.
 - Exact cache environment variable map and default paths.
-- Exact environment/cache prune list before inactive-user archive.
-- Whether hard compute quotas should later exist for special visitor/trial tiers.
+- Exact inactive-home prune path list before archive.
+- Concrete example YAML for `users.yml` and each first-pass policy domain file.

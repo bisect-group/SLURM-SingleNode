@@ -41,6 +41,10 @@ Validation must be strict. If the selected profile, policies, mounts, users, tie
 
 Dry-run/check mode should produce a full plan: validate config and show intended filesystem, user, and Slurm changes without applying them. It should print readable text and also write a machine-readable JSON plan artifact.
 
+Plan artifacts live under `/var/lib/slurm-single-node/plans`, are retained for 90 days by default, and are protected as root-owned files group-readable by `slurm_admins`: directories `0750`, files `0640`.
+
+Risky operations require a reviewed plan id/hash token before apply. This includes inactive-user prune/archive workflows and production service-changing apply operations. Low-risk validation and read-only status commands do not require plan tokens.
+
 The target should get a resolved audit file at `/etc/slurm-single-node/config.yml` containing the final merged profile, policy, and override values.
 
 ## Target Scope
@@ -64,7 +68,7 @@ Installed helper command names should use a configurable prefix from the profile
 - The default generalized command prefix is `ssn-*`.
 - The DGX/V100 profile may install optional `tesla-*` compatibility aliases or symlinks for old muscle memory.
 - Do not use `slurm-*` as the helper prefix, to avoid confusion with upstream Slurm commands.
-- The v1 core helper set should cover discovery, render/validate, user sync, verification, GPU status, and archive/status workflows.
+- The v1 core helper commands are `ssn-discover`, `ssn-render`, `ssn-apply`, `ssn-sync-users`, `ssn-verify`, `ssn-gpu-status`, and `ssn-archive-status`.
 
 The deployed user source of truth should live at a generic path: `/etc/slurm-single-node/users.yml`.
 
@@ -86,6 +90,9 @@ Use YAML, not CSV, for the future user source of truth. The deployed source of t
 
 - Existing CSV migration is not required because the CSV system has not been deployed in production.
 - A bootstrap/discovery tool should scan local human users from `/etc/passwd`, home directories, and authorized keys into a draft `users.yml` for admin review.
+- User discovery imports UID `1000-60000` users by default, excluding known service/admin accounts.
+- User discovery imports all valid `authorized_keys` entries as labeled keys such as `imported-1`, `imported-2`, preserving key comments where present.
+- Discovered users default to `active` status and `standard` tier in the draft YAML.
 - Only clearly named test users may be created/deleted during local implementation testing.
 - The file has `schema_version: 1`.
 - Users are keyed by username, not by a list item with a username field.
@@ -94,10 +101,15 @@ Use YAML, not CSV, for the future user source of truth. The deployed source of t
 - Supported user statuses are `active`, `suspended`, and `inactive`.
 - Active users require `tier` and `status`. Missing metadata such as full name, email, or SSH keys should warn, not fail.
 - SSH keys are map objects keyed by label, not raw strings. Labels make later key removal and audit easier.
+- Dry-run plans should show SSH key labels and fingerprints, not full public key blobs.
 - If a user has no SSH keys in YAML, warn and leave that user's `authorized_keys` unmanaged rather than deleting access unexpectedly.
 - Absent existing local users are report-only by default. The sync should not delete unmanaged accounts unless a future explicit cleanup mode is added.
+- A user recorded in managed state but removed from `users.yml` should fail validation. Admins must mark users `inactive`; YAML deletion is not a lifecycle action.
 - UID/GID values are auto-allocated by default. Existing local IDs should be preserved, and explicit `uid`/`gid` overrides are allowed only when needed for restore or migration.
 - The concrete v1 `users.yml` shape uses top-level `schema_version`, `groups`, and a keyed `users` map.
+- Before tool-managed writes, back up `users.yml` under `/var/backups/slurm-single-node/users` with 90-day retention.
+- Each user's `groups` field is authoritative for project/lab membership. Top-level `groups` contains metadata only.
+- Admin-exempt users are declared in profile/site config, not researcher `users.yml`.
 
 Use tier templates as the policy inheritance model.
 
@@ -111,6 +123,7 @@ Use tier templates as the policy inheritance model.
 - Expired overrides enforce immediately. Where a running job must be interrupted, use the standard 5-minute grace period when possible.
 - Only admins may grant priority/emergency tiers or temporary overrides.
 - Unix groups are managed from policy. Use an umbrella Slurm user group plus per-tier groups.
+- Policy/system groups use the profile group prefix, for example `ssn-users` and `ssn-tier-standard`. Project/lab groups keep the YAML names.
 - Users should have private primary groups.
 
 Starter tiers should be compact:
@@ -394,15 +407,18 @@ Modules should support:
 Use a per-module update policy:
 
 - Low-risk loaders may auto-update weekly.
-- CUDA may update monthly by default.
+- CUDA toolkit ownership is profile-selectable.
+- The default CUDA toolkit mode is validate-only: admins install the toolkit, and automation validates/discovers it and exposes modules.
+- Managed CUDA toolkit installation/update is opt-in per profile.
+- Managed CUDA toolkit updates are admin-run only, with smoke checks. Do not use unattended CUDA toolkit upgrades by default.
 - CUDA and heavy scientific apps may define their own policy.
 - Scientific/domain apps can be native central modules or container-backed modules.
 - Scientific/domain apps should use a check-and-approve workflow rather than blind updates.
 
 Default CUDA behavior:
 
-- `module load cuda` points to the CUDA installation provided by the apt `cuda` metapackage.
-- The apt `cuda` metapackage may auto-upgrade.
+- `module load cuda` points to the profile-selected default CUDA installation.
+- Expose both `cuda` and `cuda/<version>` modules when version detection supports it.
 - Before changing the default, perform driver-only smoke checks.
 - Surface CUDA/default changes through MOTD plus admin logs.
 
@@ -419,6 +435,9 @@ If Apptainer is enabled by a profile, root-managed container images live under `
 Support basic project/lab groups in `users.yml`.
 
 - Groups are useful for Unix permissions and future policy hooks.
+- Each user's `groups` field is authoritative for membership.
+- Top-level `groups` contains metadata only.
+- Project/lab groups keep the YAML names.
 - Do not add shared group storage in v1.
 - Module visibility is global to all users in v1.
 
@@ -434,11 +453,8 @@ schema_version: 1
 groups:
   wetlab:
     description: "Wet lab project group"
-    members:
-      - alice
   visitors:
     description: "Short-term external users"
-    members: []
 
 users:
   alice:
@@ -480,7 +496,14 @@ identity:
   cluster_name: ssn-gpu
   node_name: REVIEW_REQUIRED
   command_prefix: ssn
+  group_prefix: ssn
   default_partition: compute
+
+admins:
+  users:
+    - root
+  groups:
+    - slurm_admins
 
 hardware:
   discovered_at: null
@@ -498,6 +521,20 @@ policies:
   cache: broad-dev
   modules: tools-miniconda
   login: constrained
+
+operations:
+  plan_artifacts:
+    root: /var/lib/slurm-single-node/plans
+    retention: 90d
+    owner: root
+    group: slurm_admins
+    directory_mode: "0750"
+    file_mode: "0640"
+    risky_apply_requires_token: true
+  backups:
+    users_yml:
+      root: /var/backups/slurm-single-node/users
+      retention: 90d
 
 overrides: {}
 ```
@@ -678,6 +715,12 @@ policies:
     shared_env_base:
       type: miniconda
       root: /tools/miniconda3
+    cuda:
+      toolkit_mode: validate_only
+      managed_updates: admin_run
+      modules:
+        default: cuda
+        versioned: auto_detect
     apptainer:
       enabled: false
       container_root: /tools/containers
@@ -752,4 +795,3 @@ After each iteration, promote locked decisions into the sections above and keep 
 These are not yet locked and need follow-up before implementation details are final:
 
 - Exact CPU-per-job tier limits for the target NVIDIA GPU profile after hardware discovery.
-- Optional profile-extension cache variables beyond the locked core map, if future sites need npm, Cargo, Go, R, or other ecosystem-specific tuning.

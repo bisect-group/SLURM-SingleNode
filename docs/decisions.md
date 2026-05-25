@@ -131,7 +131,8 @@ The first generic NVIDIA GPU target should assume four GPUs until discovery pins
 - Preemption ranks: `standard=0`, `priority=50`, `emergency=100`.
 - Admins may extend jobs beyond normal tier walltime limits.
 - Exact CPU-per-job values are explicit per profile, not formula-derived. Discovery may suggest values, but profile review pins the final numbers.
-- CPU caps for the current CPU-only development machine are deferred until profile review.
+- CPU caps for the current CPU-only development machine are locked as `standard=4`, `priority=10`, and `emergency=18` CPUs per job on the 20-CPU dev/test host, preserving the 2-CPU reserve.
+- CPU caps for the target NVIDIA GPU profile remain `REVIEW_REQUIRED` until hardware discovery and profile review.
 - Generic profile defaults reserve 2 CPUs and 4 GB RAM for the OS, login sessions, and services before exposing capacity to Slurm. Profiles may override this.
 - CPU-only profiles use the same tier names, with GPU fields omitted or disabled.
 
@@ -278,30 +279,57 @@ Default cache direction:
 - Injected cache variables are defaults only. If a user intentionally sets a managed variable before submission or in their job, the user value wins.
 - Rebuildable cache cleanup uses the same TTL as `/scratch/$USER` cleanup, default 30 days.
 - If a profile has no `/data`, persistent expensive caches fall back to a profile-defined quota-managed path under `/home/$USER`.
+- The core exact cache map is locked for v1. Obscure or tool-version-specific cache variables remain profile extensions.
 
-Likely scratch/TTL cache candidates:
+Core scratch/TTL cache defaults:
 
-- `PIP_CACHE_DIR`
-- `UV_CACHE_DIR`
-- Pixi cache variables.
-- Conda package cache variables.
-- `XDG_CACHE_HOME`
-- `TRITON_CACHE_DIR`
-- `NUMBA_CACHE_DIR`
-- W&B cache/temp variables.
-- Jupyter, Matplotlib, npm, Cargo, Go, and R cache variables where sensible.
-- temporary build directories
+- `XDG_CACHE_HOME=/scratch/$USER/cache/xdg`
+- `PIP_CACHE_DIR=/scratch/$USER/cache/pip`
+- `UV_CACHE_DIR=/scratch/$USER/cache/uv`
+- `CONDA_PKGS_DIRS=/scratch/$USER/cache/conda/pkgs`
+- `PIXI_CACHE_DIR=/scratch/$USER/cache/pixi`
+- `RATTLER_CACHE_DIR=/scratch/$USER/cache/rattler`
+- `TRITON_CACHE_DIR=/scratch/$USER/cache/triton`
+- `NUMBA_CACHE_DIR=/scratch/$USER/cache/numba`
+- `TORCH_HOME=/scratch/$USER/cache/torch`
+- `WANDB_CACHE_DIR=/scratch/$USER/cache/wandb`
+- `WANDB_DATA_DIR=/scratch/$USER/cache/wandb-data`
+- `WANDB_ARTIFACT_DIR=/scratch/$USER/cache/wandb-artifacts`
+- `TMPDIR=/scratch/$USER/tmp`
+- `TMP=/scratch/$USER/tmp`
+- `TEMP=/scratch/$USER/tmp`
+- `JUPYTER_RUNTIME_DIR=/scratch/$USER/cache/jupyter/runtime`
+- `MPLCONFIGDIR=/scratch/$USER/cache/matplotlib`, with documentation warning that Matplotlib uses this for both customizations and caches.
 
-Likely persistent data-cache candidates:
+Core persistent data defaults:
 
-- `HF_HOME`
-- `HF_DATASETS_CACHE`
-- `TORCH_HOME`
-- W&B run/offline directories.
-- large model stores
-- large reference databases
+- `HF_HUB_CACHE=/data/$USER/cache/huggingface/hub`
+- `HF_DATASETS_CACHE=/data/$USER/cache/huggingface/datasets`
+- `HF_ASSETS_CACHE=/data/$USER/cache/huggingface/assets`
+- `HF_XET_CACHE=/data/$USER/cache/huggingface/xet`
+- `WANDB_DIR=/data/$USER/wandb`
 
-The exact default cache environment variable names and path map still need a concrete schema/example before implementation.
+Core home config/auth defaults:
+
+- `HF_HOME=/home/$USER/.config/huggingface`
+- `WANDB_CONFIG_DIR=/home/$USER/.config/wandb`
+
+Conda package cache redirection should use the global environment default `CONDA_PKGS_DIRS`. Do not manage user `.condarc` files in v1.
+
+Profile extensions may add additional ecosystem-specific cache variables, such as npm, Cargo, Go, R, or site-specific ML framework variables, after local review.
+
+Reference anchors for the core env names:
+
+- pip caching/configuration: https://pip.pypa.io/en/stable/topics/caching/ and https://pip.pypa.io/en/stable/topics/configuration/
+- uv cache: https://docs.astral.sh/uv/concepts/cache/
+- Conda package cache: https://docs.conda.io/projects/conda/en/stable/user-guide/configuration/settings.html
+- Pixi/Rattler cache: https://pixi.prefix.dev/latest/reference/environment_variables/
+- Hugging Face environment variables and dataset cache: https://huggingface.co/docs/huggingface_hub/en/package_reference/environment_variables and https://huggingface.co/docs/datasets/main/cache
+- W&B environment variables: https://docs.wandb.ai/models/track/environment-variables
+- PyTorch Hub cache: https://docs.pytorch.org/docs/stable/hub.html
+- Numba cache: https://numba.readthedocs.io/en/latest/reference/envvars.html
+- Jupyter runtime directory: https://jupyter-core.readthedocs.io/en/latest/api/jupyter_core.html
+- Matplotlib `MPLCONFIGDIR`: https://matplotlib.org/stable/install/environment_variables_faq.html
 
 ## Inactive Users And Archives
 
@@ -317,11 +345,24 @@ When a user is marked inactive:
 - Remove the local account after the archive workflow succeeds.
 - Reactivation restores `/data/<user>` access instead of creating a fresh data directory.
 
-Known home prune candidates should include caches and common environment directories, such as `.cache`, package caches, `.conda/envs`, `.conda/pkgs`, `.pixi/envs`, and obvious virtualenv directories such as `.venv`, `venv`, and `env`.
+The default inactive prune allowlist should delete:
 
-Pruning should recursively scan for allowlisted cache/env names, not only fixed top-level paths. Because recursive pruning is stronger, it must be driven only by an explicit allowlist and must never delete arbitrary large directories by heuristic.
+- The entire `/home/$USER/.cache` tree.
+- Marker-detected Python virtual environments, for example directories containing `pyvenv.cfg`.
+- Marker-detected Conda environments, for example directories containing `conda-meta/history`.
+- `/home/$USER/.conda/pkgs`.
+- `/home/$USER/.conda/envs`.
+- `/home/$USER/.pixi/cache`.
+- `/home/$USER/.pixi/envs`.
+- `/home/$USER/.local/share/Trash`.
 
-Inactive cleanup should produce a dry plan first, then run the real apply non-interactively after admin approval or when explicitly invoked in apply mode.
+Pruning should recursively scan for allowlisted cache/env names, not only fixed top-level paths. Because recursive pruning is stronger, it must be driven only by the explicit allowlist and must never delete arbitrary large directories by heuristic.
+
+Never follow symlinks while pruning. If an allowlisted prune path is a symlink, remove only the symlink and record that in the manifest.
+
+Dependency/build trees such as `node_modules`, Rust `target`, `build`, `dist`, Go module caches, and similar directories are report-only by default.
+
+Inactive cleanup should produce a dry plan first, then run the real apply non-interactively after admin approval or when explicitly invoked in apply mode. The dry plan writes a plan id/hash, and real apply must reference that reviewed plan token.
 
 Prune audit should write a manifest of deleted paths, sizes, timestamps, and the matching rule. Do not preserve deleted cache contents.
 
@@ -331,8 +372,6 @@ External backup hooks are supported only for inactive-user archives.
 - If a hook fails, keep the local archive, warn loudly, write logs, and continue the local account lifecycle.
 - Hooks do not make this repo a full backup system.
 - Hooks are configured as executable scripts in an archive hook directory with documented environment variables.
-
-The exact prune path list still needs to be written as concrete policy data.
 
 ## Modules And Shared Software
 
@@ -385,7 +424,7 @@ Support basic project/lab groups in `users.yml`.
 
 ## Canonical YAML Sketches
 
-These sketches are the intended v1 interfaces unless implementation discovers a concrete blocker. They are canonical for structure and field names. Values marked `REVIEW_REQUIRED` or `TO_FINALIZE` remain open until hardware discovery or the next policy-detail pass.
+These sketches are the intended v1 interfaces unless implementation discovers a concrete blocker. They are canonical for structure and field names. Values marked `REVIEW_REQUIRED` remain open until hardware discovery or the next policy-detail pass.
 
 `users.yml` shape:
 
@@ -499,6 +538,35 @@ policies:
         max_walltime: 96h
         memory_percent: 90
         preempt_rank: 100
+
+  starter-cpu-dev:
+    slurm_account: default
+    default_tier: standard
+    tiers:
+      standard:
+        max_cpus_per_job: 4
+        max_running_jobs: 3
+        max_submitted_jobs: 3
+        default_walltime: 4h
+        max_walltime: 48h
+        memory_percent: 25
+        preempt_rank: 0
+      priority:
+        max_cpus_per_job: 10
+        max_running_jobs: 5
+        max_submitted_jobs: 5
+        default_walltime: 4h
+        max_walltime: 72h
+        memory_percent: 50
+        preempt_rank: 50
+      emergency:
+        max_cpus_per_job: 18
+        max_running_jobs: 10
+        max_submitted_jobs: 10
+        default_walltime: 4h
+        max_walltime: 96h
+        memory_percent: 90
+        preempt_rank: 100
 ```
 
 `policies/storage.yml` shape:
@@ -525,6 +593,28 @@ policies:
       implementation: prolog_epilog
       env_var: SLURM_TMPDIR
       root: /scratch/jobs
+    inactive_archive:
+      compression: 7zz-mx9
+      apply_requires_plan_token: true
+      prune_manifest: true
+      symlinks: remove_link_only
+      delete_fixed_paths:
+        - .cache
+        - .conda/pkgs
+        - .conda/envs
+        - .pixi/cache
+        - .pixi/envs
+        - .local/share/Trash
+      recursive_marker_rules:
+        python_venv:
+          marker_file: pyvenv.cfg
+        conda_env:
+          marker_file: conda-meta/history
+      report_only_names:
+        - node_modules
+        - target
+        - build
+        - dist
 ```
 
 `policies/cache.yml` shape:
@@ -542,15 +632,36 @@ policies:
       scratch_cache: /scratch/$USER/cache
       persistent_cache: /data/$USER/cache
       persistent_cache_fallback: /home/$USER/.cache/persistent
+      home_config: /home/$USER/.config
+      scratch_tmp: /scratch/$USER/tmp
     env:
       scratch:
         XDG_CACHE_HOME: /scratch/$USER/cache/xdg
-        PIP_CACHE_DIR: TO_FINALIZE
-        UV_CACHE_DIR: TO_FINALIZE
+        PIP_CACHE_DIR: /scratch/$USER/cache/pip
+        UV_CACHE_DIR: /scratch/$USER/cache/uv
+        CONDA_PKGS_DIRS: /scratch/$USER/cache/conda/pkgs
+        PIXI_CACHE_DIR: /scratch/$USER/cache/pixi
+        RATTLER_CACHE_DIR: /scratch/$USER/cache/rattler
+        TRITON_CACHE_DIR: /scratch/$USER/cache/triton
+        NUMBA_CACHE_DIR: /scratch/$USER/cache/numba
+        TORCH_HOME: /scratch/$USER/cache/torch
+        WANDB_CACHE_DIR: /scratch/$USER/cache/wandb
+        WANDB_DATA_DIR: /scratch/$USER/cache/wandb-data
+        WANDB_ARTIFACT_DIR: /scratch/$USER/cache/wandb-artifacts
+        TMPDIR: /scratch/$USER/tmp
+        TMP: /scratch/$USER/tmp
+        TEMP: /scratch/$USER/tmp
+        JUPYTER_RUNTIME_DIR: /scratch/$USER/cache/jupyter/runtime
+        MPLCONFIGDIR: /scratch/$USER/cache/matplotlib
       persistent:
-        HF_HOME: /data/$USER/cache/huggingface
-        HF_DATASETS_CACHE: TO_FINALIZE
+        HF_HUB_CACHE: /data/$USER/cache/huggingface/hub
+        HF_DATASETS_CACHE: /data/$USER/cache/huggingface/datasets
+        HF_ASSETS_CACHE: /data/$USER/cache/huggingface/assets
+        HF_XET_CACHE: /data/$USER/cache/huggingface/xet
         WANDB_DIR: /data/$USER/wandb
+      home_config:
+        HF_HOME: /home/$USER/.config/huggingface
+        WANDB_CONFIG_DIR: /home/$USER/.config/wandb
 ```
 
 `policies/modules.yml` shape:
@@ -640,6 +751,5 @@ After each iteration, promote locked decisions into the sections above and keep 
 
 These are not yet locked and need follow-up before implementation details are final:
 
-- Exact CPU-per-job tier limits for the CPU-only development profile and the target NVIDIA GPU profile after hardware discovery.
-- Exact cache environment variable names and default path map for the broad dev policy.
-- Exact recursive inactive-home prune allowlist before archive.
+- Exact CPU-per-job tier limits for the target NVIDIA GPU profile after hardware discovery.
+- Optional profile-extension cache variables beyond the locked core map, if future sites need npm, Cargo, Go, R, or other ecosystem-specific tuning.

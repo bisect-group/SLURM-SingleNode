@@ -795,3 +795,11 @@ After each iteration, promote locked decisions into the sections above and keep 
 These are not yet locked and need follow-up before implementation details are final:
 
 - Exact CPU-per-job tier limits for the target NVIDIA GPU profile after hardware discovery.
+- Inactive-user reactivation must define UID/GID reuse semantics. Current decisions preserve `/data/$USER` but also allow auto-allocated IDs, so reactivation could orphan preserved data unless state records and reuses the original UID/GID.
+- SSH key discovery must define how OpenSSH key options are preserved. Importing all `authorized_keys` entries as plain public keys could accidentally drop restrictions such as `from=`, `command=`, or forwarding disables.
+- The broad cache policy must define behavior for profiles without `/scratch`. Either `broad-dev` requires scratch, or profiles need an explicit scratch-cache fallback.
+- `MPLCONFIGDIR` needs reconsideration because Matplotlib uses it for user customizations as well as caches. Decide whether it belongs under scratch, home config, or outside the default cache map.
+- CUDA default changes need toolkit-level smoke checks, not only driver checks. Decide the required checks for `cuda` and `cuda/<version>` module changes.
+- Scratch cleanup must explicitly exclude Slurm-managed per-job scratch and active job directories. Epilog should own job scratch cleanup.
+- `suspended` currently kills pending/running jobs immediately. Confirm that destructive behavior is intended, or split access suspension from job termination.
+- Tier memory percentages must define their base: physical node RAM or Slurm allocatable memory after OS/login reserves. Prefer allocatable memory after reserve unless overridden.

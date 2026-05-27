@@ -59,6 +59,8 @@ GPU support in v1 is NVIDIA plus CPU-only. AMD and Intel GPU support are out of 
 
 For NVIDIA GPU profiles, admins install the NVIDIA driver before running this automation. The automation validates `nvidia-smi`, GPU count, and Slurm GRES wiring, but does not install or own the driver lifecycle in v1.
 
+GPU mapping verification is a boot-and-apply health gate. Verify `gres.conf`, device files, NVML ordering, CUDA ordering, and status-wrapper mapping after boot and after apply before marking a GPU profile healthy. If verification fails on a mixed CPU/GPU node, mark GPU resources unhealthy, disable or drain GPU GRES, and block GPU jobs while keeping CPU jobs available where safe.
+
 The automation should manage Apptainer only as an optional feature enabled by a profile, mainly for container-backed modules. Apptainer is off by default.
 
 ## Commands And Compatibility
@@ -91,23 +93,27 @@ Use YAML, not CSV, for the future user source of truth. The deployed source of t
 - Existing CSV migration is not required because the CSV system has not been deployed in production.
 - A bootstrap/discovery tool should scan local human users from `/etc/passwd`, home directories, and authorized keys into a draft `users.yml` for admin review.
 - User discovery imports UID `1000-60000` users by default, excluding known service/admin accounts.
-- User discovery imports all valid `authorized_keys` entries as labeled keys such as `imported-1`, `imported-2`, preserving key comments where present.
+- User discovery imports all valid `authorized_keys` entries as labeled keys such as `imported-1`, `imported-2`, preserving key comments and OpenSSH key options where present.
 - Discovered users default to `active` status and `standard` tier in the draft YAML.
 - Only clearly named test users may be created/deleted during local implementation testing.
 - The file has `schema_version: 1`.
 - Users are keyed by username, not by a list item with a username field.
 - The YAML file contains desired state, not runtime bookkeeping.
-- Local runtime state is stored separately at `/var/lib/slurm-single-node/users-state.yml`.
+- Local runtime state is stored separately at `/var/lib/slurm-single-node/users-state.yml`, including original UID/GID values needed for inactive-user reactivation.
 - Supported user statuses are `active`, `suspended`, and `inactive`.
 - Active users require `tier` and `status`. Missing metadata such as full name, email, or SSH keys should warn, not fail.
 - SSH keys are map objects keyed by label, not raw strings. Labels make later key removal and audit easier.
+- SSH key objects may include structured OpenSSH `authorized_keys` options. Options discovered during import must be preserved and rendered back rather than stripped.
+- Preserve SSH key options losslessly with raw-plus-parsed storage. The raw OpenSSH option prefix is authoritative for rendering; parsed metadata is for review and validation when possible.
 - Dry-run plans should show SSH key labels and fingerprints, not full public key blobs.
 - If a user has no SSH keys in YAML, warn and leave that user's `authorized_keys` unmanaged rather than deleting access unexpectedly.
+- Missing or null `ssh_keys` means `authorized_keys` is unmanaged for that user. `ssh_keys: {}` means the user has an intentionally managed empty key set.
 - Absent existing local users are report-only by default. The sync should not delete unmanaged accounts unless a future explicit cleanup mode is added.
 - A user recorded in managed state but removed from `users.yml` should fail validation. Admins must mark users `inactive`; YAML deletion is not a lifecycle action.
 - UID/GID values are auto-allocated by default. Existing local IDs should be preserved, and explicit `uid`/`gid` overrides are allowed only when needed for restore or migration.
+- Reactivating an inactive user must reuse the original UID/GID recorded in state. Validation must fail if either value is unavailable or conflicts with another account.
 - The concrete v1 `users.yml` shape uses top-level `schema_version`, `groups`, and a keyed `users` map.
-- Before tool-managed writes, back up `users.yml` under `/var/backups/slurm-single-node/users` with 90-day retention.
+- Before tool-managed writes, back up `users.yml` and `/var/lib/slurm-single-node/users-state.yml` under `/var/backups/slurm-single-node/users` with 90-day retention.
 - Each user's `groups` field is authoritative for project/lab membership. Top-level `groups` contains metadata only.
 - Admin-exempt users are declared in profile/site config, not researcher `users.yml`.
 
@@ -140,7 +146,7 @@ The first generic NVIDIA GPU target should assume four GPUs until discovery pins
 - Running/submitted job limits: `standard=3`, `priority=5`, `emergency=10`.
 - Maximum walltime: `standard=48h`, `priority=72h`, `emergency=96h`.
 - Default walltime: `4h`.
-- Memory caps: `standard=25%`, `priority=50%`, `emergency=90%` of node RAM.
+- Memory caps: `standard=25%`, `priority=50%`, `emergency=90%` of Slurm allocatable memory after OS/login reserves.
 - Preemption ranks: `standard=0`, `priority=50`, `emergency=100`.
 - Admins may extend jobs beyond normal tier walltime limits.
 - Exact CPU-per-job values are explicit per profile, not formula-derived. Discovery may suggest values, but profile review pins the final numbers.
@@ -153,7 +159,7 @@ Lifecycle semantics:
 
 - `suspended` blocks SSH/login and Slurm submission/execution, kills pending/running jobs immediately, but does not archive or delete user data.
 - `inactive` kills all pending/running jobs, verifies the queue is clear for that user, locks `/data/$USER`, prunes and archives `/home/$USER`, and removes the local account after the archive workflow succeeds.
-- Reactivating an inactive user restores access to `/data/$USER` instead of treating the user as new.
+- Reactivating an inactive user restores access to `/data/$USER` under the original UID/GID instead of treating the user as new.
 
 ## Slurm Partitions And Job Requests
 
@@ -194,6 +200,8 @@ Support preemption for both CPU and GPU work.
 - Preemption only matters when the requested CPU/GPU resource has no free capacity.
 - Use multiple preemption levels represented by a linear `preempt_rank`.
 - Higher `preempt_rank` tiers can preempt lower `preempt_rank` tiers.
+- Use QOS-based preemption in v1 with `PreemptType=preempt/qos`, `PreemptMode=REQUEUE`, `JobRequeue=1`, and QOS `GraceTime=300` seconds.
+- Define QOS `Preempt=` relationships by tier rank: higher-ranked tiers can preempt lower-ranked tiers. Normal user jobs in preemptible tiers must remain requeueable; user opt-out from requeue is not supported in v1 except by admin override.
 - Preemption should gracefully requeue lower-priority jobs by default.
 - Jobs should be requeueable by default.
 - Preempted jobs get a 5-minute warning/grace period before requeue.
@@ -227,7 +235,9 @@ GPU isolation should be strong outside Slurm:
 
 - Users should not directly access `/dev/nvidia*` outside Slurm jobs.
 - Direct GPU tools such as `nvidia-smi` and `gpustat` should friendly-deny outside Slurm and point users to Slurm or the status wrapper.
-- Friendly denials should use PATH wrappers for common GPU tools. Wrappers are only user experience; cgroup/device policy remains the enforcement boundary.
+- Enforce non-Slurm GPU denial through systemd/cgroup v2 device policy for non-admin login sessions.
+- GPU profiles fail closed if hard non-Slurm login-session GPU denial cannot be proven safe on the target OS/cgroup stack.
+- Friendly denials should use PATH wrappers for common GPU tools. Wrappers are only user experience; systemd/cgroup device policy remains the enforcement boundary.
 - Install a profile-prefixed status wrapper such as `<prefix>-gpu-status`.
 - The wrapper reads a root/service-collected snapshot refreshed every 10 seconds.
 - The snapshot should show GPU utilization, memory, temperature, and Slurm job/user mapping.
@@ -241,7 +251,7 @@ Do not add a process-policing daemon in v1. Login CPU enforcement is the configu
 Use optional storage features per profile, but the desired general model has separate persistent and scratch areas:
 
 - `/home`: persistent, quota-managed, intended for environments, code, configs, and small outputs.
-- `/data`: persistent, quota-managed, intended for datasets, checkpoints, results, and expensive persistent caches.
+- `/data`: persistent, quota-managed, intended for datasets, checkpoints, results, and expensive persistent caches. On RAID0-backed profiles it is persistent across normal reboots but not durable against disk failure.
 - `/scratch`: non-persistent, quota-managed, intended for temporary data, rebuildable caches, and job staging.
 
 Storage paths are optional per profile. A CPU-only development profile may omit `/data`, `/scratch`, or archive roots if that machine does not have those mounts.
@@ -252,6 +262,7 @@ For the target generic NVIDIA GPU server:
 - `/` may be a separate 512 GB partition.
 - Remaining NVMe space may be `/home`.
 - Six SATA SSDs are expected to form a RAID0 pool used for `/data` and `/scratch`.
+- The target RAID0 layout is acceptable for capacity and speed, but it is not a substitute for durable storage. Important `/data` contents and inactive-user archives require external backup or replication.
 
 The Slurm automation should not partition, format, or create RAID in the main setup. Admins provision filesystems first; this automation verifies mounts and then manages quotas, directories, cleanup, and policy.
 
@@ -268,11 +279,11 @@ Use both scratch types:
 - `/scratch/$USER` for user-scoped TTL scratch and rebuildable caches.
 - Per-job scratch for temporary job working data.
 
-Per-job scratch should be managed by Slurm prolog/epilog in v1. Jobs should receive a managed scratch directory through `SLURM_TMPDIR`, and epilog cleanup should remove the per-job directory after completion.
+Per-job scratch should be managed by Slurm prolog/epilog in v1. Root prolog/epilog owns directory creation and cleanup, while TaskProlog exports `SLURM_TMPDIR`, `TMPDIR`, `TMP`, and `TEMP` into user tasks. Login shells keep the broader `/scratch/$USER/tmp` defaults. Slurm `job_container/tmpfs` is not the v1 default; it may become a future/profile-optional enhancement after validation.
 
 Default scratch cleanup age is 30 days and must be configurable by profile.
 
-Scratch cleanup should be managed age-based cleanup, preferably with `systemd-tmpfiles` or a systemd timer. Do not rely on filesystem-native TTL as the primary design because it is not portable across the target filesystems. Cleanup should write reports/logs and then delete eligible files by age.
+Scratch cleanup should be managed age-based cleanup, preferably with `systemd-tmpfiles` or a systemd timer. Do not rely on filesystem-native TTL as the primary design because it is not portable across the target filesystems. Cleanup should write reports/logs and then delete eligible files by age. Age-based cleanup excludes Slurm-managed per-job scratch roots and active job directories; prolog/epilog owns those paths.
 
 ## Cache Policy
 
@@ -281,6 +292,7 @@ Use a default cache map with profile overrides. Do not try to infer cache import
 Default cache direction:
 
 - Use a broad development cache map.
+- The `broad-dev` cache policy requires `/scratch`. Profiles without `/scratch` must choose a smaller cache policy or define explicit alternate cache paths.
 - `XDG_CACHE_HOME` points to scratch.
 - Rebuildable development caches go to `/scratch/$USER/cache`.
 - Hugging Face model/dataset caches go to persistent `/data/$USER/cache/huggingface`.
@@ -289,7 +301,8 @@ Default cache direction:
 - W&B runs and offline directories go to `/data`; W&B cache and temporary artifacts go to scratch.
 - Cache environment applies to both login shells and Slurm jobs.
 - Cache defaults should be centrally injected, including into Slurm jobs, so a bare `sbatch` inherits policy defaults.
-- Injected cache variables are defaults only. If a user intentionally sets a managed variable before submission or in their job, the user value wins.
+- Injected cache variables are defaults only. If a user intentionally sets a managed variable before submission or in their job, the user value wins, except for the Slurm job temp variables managed by TaskProlog at task start.
+- For Slurm jobs, TaskProlog overrides `TMPDIR`, `TMP`, and `TEMP` to the per-job scratch directory after cache defaults are applied. Users may still override them inside their own job scripts after startup if needed.
 - Rebuildable cache cleanup uses the same TTL as `/scratch/$USER` cleanup, default 30 days.
 - If a profile has no `/data`, persistent expensive caches fall back to a profile-defined quota-managed path under `/home/$USER`.
 - The core exact cache map is locked for v1. Obscure or tool-version-specific cache variables remain profile extensions.
@@ -312,7 +325,8 @@ Core scratch/TTL cache defaults:
 - `TMP=/scratch/$USER/tmp`
 - `TEMP=/scratch/$USER/tmp`
 - `JUPYTER_RUNTIME_DIR=/scratch/$USER/cache/jupyter/runtime`
-- `MPLCONFIGDIR=/scratch/$USER/cache/matplotlib`, with documentation warning that Matplotlib uses this for both customizations and caches.
+
+Matplotlib configuration/cache environment is not managed by the default cache map because it can contain user customizations as well as caches. Profiles may add a site-specific Matplotlib override after review.
 
 Core persistent data defaults:
 
@@ -342,7 +356,6 @@ Reference anchors for the core env names:
 - PyTorch Hub cache: https://docs.pytorch.org/docs/stable/hub.html
 - Numba cache: https://numba.readthedocs.io/en/latest/reference/envvars.html
 - Jupyter runtime directory: https://jupyter-core.readthedocs.io/en/latest/api/jupyter_core.html
-- Matplotlib `MPLCONFIGDIR`: https://matplotlib.org/stable/install/environment_variables_faq.html
 
 ## Inactive Users And Archives
 
@@ -353,10 +366,12 @@ When a user is marked inactive:
 - Prune known rebuildable environment/cache paths from `/home/<user>` first.
 - Compress the remaining `/home/<user>` with `7zz -mx=9`.
 - Store the archive under a profile-defined archive root, expected to be under `/data/_archive` for the new storage model.
-- Run expensive compression as a Slurm admin job, not directly inside the sync playbook.
+- Run expensive compression as a Slurm admin job under a root/slurm-admin service identity, not directly inside the sync playbook.
 - Keep local inactive-user archives indefinitely by default.
-- Remove the local account after the archive workflow succeeds.
+- Keep the local user account locked until the archive job succeeds, then remove it.
 - Reactivation restores `/data/<user>` access instead of creating a fresh data directory.
+- Inactive/archive transitions require a configured archive root. If a profile lacks an archive root, validation must block inactive transitions rather than deleting accounts without a durable archive target.
+- If Slurm is unavailable, block the inactive transition until Slurm is healthy enough to run the archive job.
 
 The default inactive prune allowlist should delete:
 
@@ -382,7 +397,7 @@ Prune audit should write a manifest of deleted paths, sizes, timestamps, and the
 External backup hooks are supported only for inactive-user archives.
 
 - Hooks run after the local archive is created.
-- If a hook fails, keep the local archive, warn loudly, write logs, and continue the local account lifecycle.
+- If a hook fails, keep the local archive, warn loudly, write logs, and continue the local account lifecycle. The archive remains non-durable until external backup or replication succeeds.
 - Hooks do not make this repo a full backup system.
 - Hooks are configured as executable scripts in an archive hook directory with documented environment variables.
 
@@ -410,7 +425,7 @@ Use a per-module update policy:
 - CUDA toolkit ownership is profile-selectable.
 - The default CUDA toolkit mode is validate-only: admins install the toolkit, and automation validates/discovers it and exposes modules.
 - Managed CUDA toolkit installation/update is opt-in per profile.
-- Managed CUDA toolkit updates are admin-run only, with smoke checks. Do not use unattended CUDA toolkit upgrades by default.
+- Managed CUDA toolkit updates are admin-run only, with balanced smoke checks. Do not use unattended CUDA toolkit upgrades by default.
 - CUDA and heavy scientific apps may define their own policy.
 - Scientific/domain apps can be native central modules or container-backed modules.
 - Scientific/domain apps should use a check-and-approve workflow rather than blind updates.
@@ -419,10 +434,10 @@ Default CUDA behavior:
 
 - `module load cuda` points to the profile-selected default CUDA installation.
 - Expose both `cuda` and `cuda/<version>` modules when version detection supports it.
-- Before changing the default, perform driver-only smoke checks.
+- Before changing the default, perform balanced CUDA smoke checks.
 - Surface CUDA/default changes through MOTD plus admin logs.
 
-The driver-only smoke check is intentionally lightweight and will not catch all `nvcc` or framework-level breakages.
+Balanced CUDA smoke checks include module load/unload, `nvcc --version` when `nvcc` is present, `nvidia-smi`, library path sanity, and an optional CUDA sample compile/run when the sample toolchain is available.
 
 Shared domain software, such as protein docking tools, should be installable centrally and exposed through modules so users do not keep identical copies against their quotas.
 
@@ -447,6 +462,8 @@ These sketches are the intended v1 interfaces unless implementation discovers a 
 
 `users.yml` shape:
 
+In this sketch, omitted or null `ssh_keys` leaves `authorized_keys` unmanaged. An explicit empty map means the managed key set is intentionally empty.
+
 ```yaml
 schema_version: 1
 
@@ -469,6 +486,11 @@ users:
     ssh_keys:
       laptop:
         public_key: "ssh-ed25519 AAAA... alice@laptop"
+        options_raw: 'from="203.0.113.0/24",no-agent-forwarding'
+        options:
+          from:
+            - "203.0.113.0/24"
+          no_agent_forwarding: true
         comment: "Primary laptop"
         added_by: "admin"
     overrides:
@@ -482,6 +504,7 @@ users:
   bob:
     status: suspended
     tier: standard
+    # Managed empty key set.
     ssh_keys: {}
 ```
 
@@ -535,6 +558,20 @@ operations:
     users_yml:
       root: /var/backups/slurm-single-node/users
       retention: 90d
+    users_state_yml:
+      root: /var/backups/slurm-single-node/users
+      retention: 90d
+  gpu_verification:
+    run_after_boot: true
+    run_after_apply: true
+    health_gate: true
+    on_failure: disable_gpu_keep_cpu
+    checks:
+      - gres_conf
+      - device_files
+      - nvml_ordering
+      - cuda_ordering
+      - status_wrapper_mapping
 
 overrides: {}
 ```
@@ -547,6 +584,23 @@ policies:
   starter:
     slurm_account: default
     default_tier: standard
+    memory_percent_base: allocatable_after_reserve
+    preemption:
+      type: qos
+      mode: requeue
+      grace_time: 300s
+      job_requeue: true
+      allow_user_no_requeue: false
+      relationships:
+        standard:
+          preempts: []
+        priority:
+          preempts:
+            - standard
+        emergency:
+          preempts:
+            - standard
+            - priority
     tiers:
       standard:
         max_gpus_per_job: 1
@@ -579,6 +633,23 @@ policies:
   starter-cpu-dev:
     slurm_account: default
     default_tier: standard
+    memory_percent_base: allocatable_after_reserve
+    preemption:
+      type: qos
+      mode: requeue
+      grace_time: 300s
+      job_requeue: true
+      allow_user_no_requeue: false
+      relationships:
+        standard:
+          preempts: []
+        priority:
+          preempts:
+            - standard
+        emergency:
+          preempts:
+            - standard
+            - priority
     tiers:
       standard:
         max_cpus_per_job: 4
@@ -617,6 +688,9 @@ policies:
       data: /data
       scratch: /scratch
       archive: /data/_archive
+    durability:
+      data: persistent_not_durable_on_raid0
+      archive: requires_external_backup_or_replication
     quotas:
       home: 100GB
       data: 500GB
@@ -626,11 +700,27 @@ policies:
       age: 30d
       implementation: systemd-tmpfiles
       report: true
+      exclude_job_scratch: true
+      exclude_active_jobs: true
     job_scratch:
       implementation: prolog_epilog
       env_var: SLURM_TMPDIR
+      task_prolog_exports:
+        - SLURM_TMPDIR
+        - TMPDIR
+        - TMP
+        - TEMP
       root: /scratch/jobs
+      create_with: root_prolog
+      export_with: task_prolog
+      cleanup_with: root_epilog
+      job_container_tmpfs: optional_future
     inactive_archive:
+      requires_archive_root: true
+      service_identity: root_slurm_admin
+      user_account_until_success: locked
+      slurm_unavailable: block_transition
+      external_backup_required_for_durability: true
       compression: 7zz-mx9
       apply_requires_plan_token: true
       prune_manifest: true
@@ -660,10 +750,13 @@ policies:
 schema_version: 1
 policies:
   broad-dev:
+    requires:
+      scratch: true
     injection:
       login_shells: true
       slurm_jobs: true
       mode: default_only
+      slurm_job_temp_override: per_job_scratch
     ttl: inherit_scratch
     roots:
       scratch_cache: /scratch/$USER/cache
@@ -689,7 +782,6 @@ policies:
         TMP: /scratch/$USER/tmp
         TEMP: /scratch/$USER/tmp
         JUPYTER_RUNTIME_DIR: /scratch/$USER/cache/jupyter/runtime
-        MPLCONFIGDIR: /scratch/$USER/cache/matplotlib
       persistent:
         HF_HUB_CACHE: /data/$USER/cache/huggingface/hub
         HF_DATASETS_CACHE: /data/$USER/cache/huggingface/datasets
@@ -721,6 +813,12 @@ policies:
       modules:
         default: cuda
         versioned: auto_detect
+      smoke_checks:
+        module_load_unload: true
+        nvcc_version_if_present: true
+        nvidia_smi: true
+        library_path_sanity: true
+        optional_sample_compile_run: true
     apptainer:
       enabled: false
       container_root: /tools/containers
@@ -742,6 +840,8 @@ policies:
     remote_ides: allowed_limited
     gpu_outside_slurm:
       direct_access: deny
+      enforcement: systemd_cgroup_v2_devices
+      fail_closed_if_unavailable: true
       friendly_path_wrappers: true
       status_wrapper: ssn-gpu-status
 ```
@@ -795,11 +895,3 @@ After each iteration, promote locked decisions into the sections above and keep 
 These are not yet locked and need follow-up before implementation details are final:
 
 - Exact CPU-per-job tier limits for the target NVIDIA GPU profile after hardware discovery.
-- Inactive-user reactivation must define UID/GID reuse semantics. Current decisions preserve `/data/$USER` but also allow auto-allocated IDs, so reactivation could orphan preserved data unless state records and reuses the original UID/GID.
-- SSH key discovery must define how OpenSSH key options are preserved. Importing all `authorized_keys` entries as plain public keys could accidentally drop restrictions such as `from=`, `command=`, or forwarding disables.
-- The broad cache policy must define behavior for profiles without `/scratch`. Either `broad-dev` requires scratch, or profiles need an explicit scratch-cache fallback.
-- `MPLCONFIGDIR` needs reconsideration because Matplotlib uses it for user customizations as well as caches. Decide whether it belongs under scratch, home config, or outside the default cache map.
-- CUDA default changes need toolkit-level smoke checks, not only driver checks. Decide the required checks for `cuda` and `cuda/<version>` module changes.
-- Scratch cleanup must explicitly exclude Slurm-managed per-job scratch and active job directories. Epilog should own job scratch cleanup.
-- `suspended` currently kills pending/running jobs immediately. Confirm that destructive behavior is intended, or split access suspension from job termination.
-- Tier memory percentages must define their base: physical node RAM or Slurm allocatable memory after OS/login reserves. Prefer allocatable memory after reserve unless overridden.

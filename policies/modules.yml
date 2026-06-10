@@ -1,0 +1,32 @@
+schema_version: 1
+policies:
+  tools-miniconda:
+    roots:
+      apps: /tools/apps
+      modules: /tools/modules
+      containers: /tools/containers
+    lmod: true
+    updates:
+      mode: admin_run
+      versioned_roots: true
+      smoke_checks_required: true
+      rollback_targets: keep_previous
+      unattended_updates: false
+    shared_env_base:
+      type: miniconda
+      root: /tools/miniconda3
+    cuda:
+      toolkit_mode: validate_only
+      managed_updates: admin_run
+      modules:
+        default: cuda
+        versioned: auto_detect
+      smoke_checks:
+        module_load_unload: true
+        nvcc_version_if_present: true
+        nvidia_smi: true
+        library_path_sanity: true
+        optional_sample_compile_run: true
+    apptainer:
+      enabled: false
+      container_root: /tools/containers

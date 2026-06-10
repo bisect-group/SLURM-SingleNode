@@ -1,0 +1,116 @@
+schema_version: 1
+profile: generic-gpu
+
+identity:
+  cluster_name: ssn-gpu
+  node_name: REVIEW_REQUIRED
+  command_prefix: ssn
+  group_prefix: ssn
+  default_partition: compute
+
+admins:
+  users:
+    - root
+  groups:
+    - slurm_admins
+
+services:
+  munge:
+    key_mode: generate_if_absent
+    auto_rotate: false
+    backup: local_protected
+    validate_permissions: true
+    require_service_healthy: true
+
+hardware:
+  discovered_at: null
+  gpus: REVIEW_REQUIRED
+  gpu_vendor: nvidia
+  gpu_type: REVIEW_REQUIRED
+  gpu_modes:
+    mig: fail_closed
+    mps: fail_closed
+    shared_gpu: fail_closed
+  gpu_affinity:
+    mode: discover_review_pin
+    render_gres_cores: reviewed_only
+    cores: REVIEW_REQUIRED
+  cpus_total: REVIEW_REQUIRED
+  cpus_allocatable: REVIEW_REQUIRED
+  memory_total: REVIEW_REQUIRED
+  memory_allocatable: REVIEW_REQUIRED
+  reserved_cpus: 2
+  reserved_memory: 4GB
+  memory_defaults:
+    def_mem_per_cpu: REVIEW_REQUIRED
+    max_mem_per_cpu: REVIEW_REQUIRED
+
+policies:
+  slurm_core: strict-cons-tres
+  tiers: starter
+  storage: standard-three-area
+  cache: broad-dev
+  modules: tools-miniconda
+  login: constrained
+
+operations:
+  capability_checks:
+    ubuntu: "24.04_or_26.04_with_required_features"
+    slurm: apt_package_with_cons_tres_cgroup_v2_lua
+    database: mariadb_supported
+    gpu: nvidia_nvml_when_gpu_profile
+  plan_artifacts:
+    root: /var/lib/slurm-single-node/plans
+    retention: 90d
+    owner: root
+    group: slurm_admins
+    directory_mode: "0750"
+    file_mode: "0640"
+    risky_apply_requires_token: true
+    token_policy:
+      redacted: true
+      input_hash_bound: true
+      expires_after: 24h
+      single_use: true
+    redaction:
+      secrets: hidden
+      ssh_keys: fingerprint_only
+      emails:
+        terminal: masked
+        root_json: retained
+      sensitive_manifests:
+        terminal: path_limited
+        root_json: full_paths
+  reconcile:
+    model: staged_state_machine
+    resume_partial_transitions: true
+    rollback: manual_or_explicit_only
+  backups:
+    users_yml:
+      root: /var/backups/slurm-single-node/users
+      retention: 90d
+    users_state_yml:
+      root: /var/backups/slurm-single-node/users
+      retention: 90d
+  gpu_verification:
+    run_after_boot: true
+    run_after_apply: true
+    health_gate: true
+    on_failure: cpu_only_recovery
+    recovery:
+      type: temporary_overlay
+      running_gpu_jobs: drain_or_cancel_with_warning
+      pending_gpu_jobs: hold
+      gpu_gres: remove_from_overlay
+      cpu_jobs: keep_available_where_safe
+    checks:
+      - gres_conf
+      - device_files
+      - nvml_ordering
+      - cuda_ordering
+      - status_wrapper_mapping
+      - topology_affinity_if_pinned
+      - login_gpu_denial
+      - slurm_gpu_job_access
+
+overrides: {}

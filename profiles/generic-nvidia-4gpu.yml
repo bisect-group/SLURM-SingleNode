@@ -1,0 +1,8 @@
+schema_version: 1
+profile: generic-nvidia-4gpu
+extends: generic-gpu
+
+hardware:
+  gpus: 4
+
+overrides: {}

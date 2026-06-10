@@ -1,0 +1,68 @@
+schema_version: 1
+policies:
+  data-cache-no-scratch:
+    requires:
+      scratch: false
+    injection:
+      login_shells: true
+      slurm_jobs: true
+      mode: default_only
+      slurm_job_temp_override: none
+    ttl: none
+    roots:
+      persistent_cache: /data/$USER/cache
+      persistent_cache_fallback: /home/$USER/.cache/persistent
+      home_config: /home/$USER/.config
+    env:
+      persistent:
+        HF_HUB_CACHE: /data/$USER/cache/huggingface/hub
+        HF_DATASETS_CACHE: /data/$USER/cache/huggingface/datasets
+        HF_ASSETS_CACHE: /data/$USER/cache/huggingface/assets
+        HF_XET_CACHE: /data/$USER/cache/huggingface/xet
+        WANDB_DIR: /data/$USER/wandb
+      home_config:
+        HF_HOME: /home/$USER/.config/huggingface
+        WANDB_CONFIG_DIR: /home/$USER/.config/wandb
+
+  broad-dev:
+    requires:
+      scratch: true
+    injection:
+      login_shells: true
+      slurm_jobs: true
+      mode: default_only
+      slurm_job_temp_override: per_job_scratch
+    ttl: inherit_scratch
+    roots:
+      scratch_cache: /scratch/$USER/cache
+      persistent_cache: /data/$USER/cache
+      persistent_cache_fallback: /home/$USER/.cache/persistent
+      home_config: /home/$USER/.config
+      scratch_tmp: /scratch/$USER/tmp
+    env:
+      scratch:
+        XDG_CACHE_HOME: /scratch/$USER/cache/xdg
+        PIP_CACHE_DIR: /scratch/$USER/cache/pip
+        UV_CACHE_DIR: /scratch/$USER/cache/uv
+        CONDA_PKGS_DIRS: /scratch/$USER/cache/conda/pkgs
+        PIXI_CACHE_DIR: /scratch/$USER/cache/pixi
+        RATTLER_CACHE_DIR: /scratch/$USER/cache/rattler
+        TRITON_CACHE_DIR: /scratch/$USER/cache/triton
+        NUMBA_CACHE_DIR: /scratch/$USER/cache/numba
+        TORCH_HOME: /scratch/$USER/cache/torch
+        WANDB_CACHE_DIR: /scratch/$USER/cache/wandb
+        WANDB_DATA_DIR: /scratch/$USER/cache/wandb-data
+        WANDB_ARTIFACT_DIR: /scratch/$USER/cache/wandb-artifacts
+        TMPDIR: /scratch/$USER/tmp
+        TMP: /scratch/$USER/tmp
+        TEMP: /scratch/$USER/tmp
+        JUPYTER_RUNTIME_DIR: /scratch/$USER/cache/jupyter/runtime
+      persistent:
+        HF_HUB_CACHE: /data/$USER/cache/huggingface/hub
+        HF_DATASETS_CACHE: /data/$USER/cache/huggingface/datasets
+        HF_ASSETS_CACHE: /data/$USER/cache/huggingface/assets
+        HF_XET_CACHE: /data/$USER/cache/huggingface/xet
+        WANDB_DIR: /data/$USER/wandb
+      home_config:
+        HF_HOME: /home/$USER/.config/huggingface
+        WANDB_CONFIG_DIR: /home/$USER/.config/wandb

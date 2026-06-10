@@ -1,0 +1,170 @@
+schema_version: 1
+policies:
+  data-no-scratch-dev:
+    paths:
+      home: /home
+      data: /data
+      scratch: null
+      archive: /data/_archive
+    durability:
+      data: persistent_local
+      archive: local_only_dev
+      active_data_backup: external_site_admin_responsibility
+      nondurable_ack_required: false
+    quotas:
+      home: 100GB
+      data: 500GB
+      scratch: null
+      fail_if_unavailable: false
+      data_scratch_capacity_isolation: not_applicable
+      same_pool_allowed_with_project_quotas: false
+    scratch_cleanup:
+      enabled: false
+    job_scratch:
+      implementation: disabled
+      required_for_jobs: false
+      root: null
+    inactive_archive:
+      requires_archive_root: true
+      service_identity: root_slurm_admin
+      slurm_account: slurm-admin
+      qos: archive-admin
+      preemptible: false
+      outside_user_limits: true
+      monitored_by: ssn-archive-status
+      user_account_until_success: locked
+      removal_requires_backup_success: false
+      removal_override: explicit_admin_token
+      backup_hook:
+        required_for_durability: false
+        missing_hook_action: warn_local_only
+        local_only_override: not_required_for_dev
+      slurm_unavailable: block_transition
+      external_backup_required_for_durability: false
+      state_substates:
+        - archive_pending
+        - archive_running
+        - archived_local_only
+        - backup_failed
+        - backup_complete
+        - removal_ready
+        - tombstoned
+      compression: 7zz-mx9
+      apply_requires_plan_token: true
+      prune_manifest: true
+      symlinks: remove_link_only
+      delete_fixed_paths:
+        - .cache
+        - .conda/pkgs
+        - .conda/envs
+        - .pixi/cache
+        - .pixi/envs
+        - .local/share/Trash
+      recursive_marker_rules:
+        python_venv:
+          marker_file: pyvenv.cfg
+        conda_env:
+          marker_file: conda-meta/history
+      report_only_names:
+        - node_modules
+        - target
+        - build
+        - dist
+
+  standard-three-area:
+    paths:
+      home: /home
+      data: /data
+      scratch: /scratch
+      archive: /data/_archive
+    durability:
+      data: persistent_not_durable_on_raid0
+      archive: requires_external_backup_or_replication
+      active_data_backup: external_site_admin_responsibility
+      nondurable_ack_required: true
+    quotas:
+      home: 100GB
+      data: 500GB
+      scratch: 1TB
+      fail_if_unavailable: true
+      data_scratch_capacity_isolation: required
+      same_pool_allowed_with_project_quotas: true
+    scratch_cleanup:
+      age: 30d
+      implementation: systemd-tmpfiles
+      report: true
+      exclude_job_scratch: true
+      exclude_active_jobs: true
+    job_scratch:
+      implementation: prolog_epilog
+      required_for_jobs: true
+      unhealthy_action: block_jobs
+      runtime_failure:
+        affected_job: fail_with_reason
+        mark_scratch_unhealthy: true
+        block_new_jobs: true
+        fallback_temp: false
+        avoid_node_drain_where_slurm_permits: true
+      preflight_checks:
+        - mount_present
+        - writable
+        - free_space
+        - quota_support
+        - job_root_safe
+      env_var: SLURM_TMPDIR
+      task_prolog_exports:
+        - SLURM_TMPDIR
+        - TMPDIR
+        - TMP
+        - TEMP
+      root: /scratch/jobs
+      create_with: root_prolog
+      export_with: task_prolog
+      cleanup_with: root_epilog
+      job_container_tmpfs: optional_future
+    inactive_archive:
+      requires_archive_root: true
+      service_identity: root_slurm_admin
+      slurm_account: slurm-admin
+      qos: archive-admin
+      preemptible: false
+      outside_user_limits: true
+      monitored_by: ssn-archive-status
+      user_account_until_success: locked
+      removal_requires_backup_success: true
+      removal_override: explicit_admin_token
+      backup_hook:
+        required_for_durability: true
+        missing_hook_action: fail_transition
+        local_only_override: reviewed_token
+      slurm_unavailable: block_transition
+      external_backup_required_for_durability: true
+      state_substates:
+        - archive_pending
+        - archive_running
+        - archived_local_only
+        - backup_failed
+        - backup_complete
+        - removal_ready
+        - tombstoned
+      compression: 7zz-mx9
+      apply_requires_plan_token: true
+      prune_manifest: true
+      symlinks: remove_link_only
+      delete_fixed_paths:
+        - .cache
+        - .conda/pkgs
+        - .conda/envs
+        - .pixi/cache
+        - .pixi/envs
+        - .local/share/Trash
+      recursive_marker_rules:
+        python_venv:
+          marker_file: pyvenv.cfg
+        conda_env:
+          marker_file: conda-meta/history
+      report_only_names:
+        - node_modules
+        - target
+        - build
+        - dist

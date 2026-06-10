@@ -1,0 +1,91 @@
+schema_version: 1
+profile: cpu-dev-local
+
+identity:
+  cluster_name: ssn-dev
+  node_name: bisect-login0
+  command_prefix: ssn
+  group_prefix: ssn
+  default_partition: compute
+
+admins:
+  users:
+    - root
+  groups:
+    - slurm_admins
+
+services:
+  munge:
+    key_mode: generate_if_absent
+    auto_rotate: false
+    backup: local_protected
+    validate_permissions: true
+    require_service_healthy: true
+
+hardware:
+  discovered_at: "2026-06-10"
+  gpus: 0
+  gpu_vendor: none
+  cpus_total: 20
+  cpus_allocatable: 18
+  memory_total: 126193MB
+  memory_allocatable: 122097MB
+  reserved_cpus: 2
+  reserved_memory: 4GB
+  memory_defaults:
+    def_mem_per_cpu: 4GB
+    max_mem_per_cpu: 32GB
+
+policies:
+  slurm_core: strict-cons-tres
+  tiers: starter-cpu-dev
+  storage: data-no-scratch-dev
+  cache: data-cache-no-scratch
+  modules: tools-miniconda
+  login: constrained
+
+operations:
+  capability_checks:
+    ubuntu: "24.04_or_26.04_with_required_features"
+    slurm: apt_package_with_cons_tres_cgroup_v2_lua
+    database: mariadb_supported
+    gpu: not_required
+  plan_artifacts:
+    root: /var/lib/slurm-single-node/plans
+    retention: 90d
+    owner: root
+    group: slurm_admins
+    directory_mode: "0750"
+    file_mode: "0640"
+    risky_apply_requires_token: true
+    token_policy:
+      redacted: true
+      input_hash_bound: true
+      expires_after: 24h
+      single_use: true
+    redaction:
+      secrets: hidden
+      ssh_keys: fingerprint_only
+      emails:
+        terminal: masked
+        root_json: retained
+      sensitive_manifests:
+        terminal: path_limited
+        root_json: full_paths
+  reconcile:
+    model: staged_state_machine
+    resume_partial_transitions: true
+    rollback: manual_or_explicit_only
+  backups:
+    users_yml:
+      root: /var/backups/slurm-single-node/users
+      retention: 90d
+    users_state_yml:
+      root: /var/backups/slurm-single-node/users
+      retention: 90d
+  gpu_verification:
+    run_after_boot: false
+    run_after_apply: false
+    health_gate: false
+
+overrides: {}

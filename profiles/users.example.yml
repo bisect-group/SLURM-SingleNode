@@ -1,0 +1,17 @@
+schema_version: 1
+
+groups:
+  example-lab:
+    description: "Example project group"
+
+users:
+  ssntest:
+    status: active
+    tier: standard
+    full_name: "SSN Test User"
+    email: null
+    uid: null
+    gid: null
+    groups:
+      - example-lab
+    ssh_keys: {}

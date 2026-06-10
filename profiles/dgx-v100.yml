@@ -1,0 +1,49 @@
+schema_version: 1
+profile: dgx-v100
+extends: generic-gpu
+
+identity:
+  cluster_name: tesla
+  node_name: rbcdsaidgx
+  command_prefix: ssn
+  group_prefix: ssn
+  default_partition: gpu
+  compatibility_aliases:
+    - tesla
+
+hardware:
+  discovered_at: "2026-05-01"
+  gpus: 8
+  gpu_vendor: nvidia
+  gpu_type: v100
+  gpu_modes:
+    mig: fail_closed
+    mps: fail_closed
+    shared_gpu: fail_closed
+  gpu_affinity:
+    mode: reviewed
+    render_gres_cores: reviewed_only
+    cores:
+      "0": 0-19
+      "1": 0-19
+      "2": 0-19
+      "3": 0-19
+      "4": 20-39
+      "5": 20-39
+      "6": 20-39
+      "7": 20-39
+  cpus_total: 80
+  cpus_allocatable: 78
+  memory_total: 500000MB
+  memory_allocatable: 495904MB
+  reserved_cpus: 2
+  reserved_memory: 4GB
+  memory_defaults:
+    def_mem_per_cpu: 4GB
+    max_mem_per_cpu: 64GB
+
+overrides:
+  policies:
+    tiers: starter-dgx-v100
+    storage: standard-three-area
+    cache: broad-dev

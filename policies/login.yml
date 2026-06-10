@@ -1,0 +1,24 @@
+schema_version: 1
+policies:
+  constrained:
+    cgroup: v2
+    non_admin_limits:
+      scope: dedicated_non_admin_login_slice
+      cpus: 2
+      memory: 4GB
+      tasks: 128
+      io_weight: low
+      applies_to_slurm_jobs: false
+      slurm_job_cgroups_owned_by_slurm: true
+    admins_exempt: true
+    remote_ides: allowed_limited
+    gpu_outside_slurm:
+      direct_access: deny
+      enforcement: systemd_cgroup_v2_devices
+      applies_to: dedicated_non_admin_login_scopes
+      slurm_jobs_receive_allocated_devices: true
+      fail_closed_if_unavailable: true
+      friendly_path_wrappers: true
+      status_wrapper: ssn-gpu-status
+      status_collector: root_service_snapshot
+      refresh: 10s

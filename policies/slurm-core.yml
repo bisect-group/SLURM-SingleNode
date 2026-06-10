@@ -1,0 +1,38 @@
+schema_version: 1
+policies:
+  strict-cons-tres:
+    select:
+      type: select/cons_tres
+      parameters: CR_CPU_Memory
+      consumable:
+        cpu: true
+        memory: true
+        gres: true
+    task_plugin:
+      cgroup_v2: true
+      constrain_cores: true
+      constrain_ram: true
+      constrain_devices: true
+    accounting:
+      storage_tres:
+        - cpu
+        - mem
+        - gres/gpu
+      gpu_tres_when_available: true
+    memory:
+      default_mode: explicit_profile_values
+      def_mem_per_cpu: REVIEW_REQUIRED
+      max_mem_per_cpu: REVIEW_REQUIRED
+      reserve_base: allocatable_after_reserve
+      tier_max_percent_enforced: true
+      render_qos_max_tres_mem: true
+    submit_filter:
+      plugin: job_submit.lua
+      mode: validate_explicit_requests_only
+      reject:
+        - over_tier_cpu_gpu_ram_walltime
+        - unsafe_gpu_syntax
+        - no_requeue_for_preemptible_tiers
+      disallow_slow_io: true
+      disallow_runtime_state_checks: true
+      final_enforcement: slurm_qos_tres_cgroups

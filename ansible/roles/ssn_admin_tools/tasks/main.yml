@@ -1,0 +1,94 @@
+---
+- name: Ensure local command directories exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - /usr/local/bin
+    - /usr/local/sbin
+
+- name: Install ssn Python package
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../ssn"
+    dest: /usr/local/lib/slurm-single-node/
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install ssn command wrappers
+  ansible.builtin.template:
+    src: ssn-wrapper.j2
+    dest: "/usr/local/sbin/{{ item }}"
+    owner: root
+    group: "{{ ssn.derived.admin_group }}"
+    mode: "0750"
+  loop:
+    - ssn-install
+    - ssn-discover
+    - ssn-render
+    - ssn-apply
+    - ssn-sync-users
+    - ssn-verify
+    - ssn-archive-status
+
+- name: Install user-facing GPU status wrapper
+  ansible.builtin.template:
+    src: ssn-wrapper.j2
+    dest: /usr/local/bin/ssn-gpu-status
+    owner: root
+    group: root
+    mode: "0755"
+  vars:
+    item: ssn-gpu-status
+
+- name: Install optional Tesla compatibility aliases
+  ansible.builtin.file:
+    src: "/usr/local/sbin/{{ item.ssn }}"
+    dest: "/usr/local/sbin/{{ item.alias }}"
+    state: link
+  loop:
+    - { ssn: ssn-sync-users, alias: tesla-sync-users }
+    - { ssn: ssn-verify, alias: tesla-verify }
+    - { ssn: ssn-archive-status, alias: tesla-archive-status }
+  when: "'tesla' in (ssn.identity.compatibility_aliases | default([]))"
+
+- name: Deploy MOTD
+  ansible.builtin.copy:
+    dest: /etc/motd
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      Slurm Single-Node: {{ ssn.profile }}
+      Cluster: {{ ssn.identity.cluster_name }}
+      Partition: {{ ssn.identity.default_partition }}
+      Submit jobs with sbatch. Direct compute on login is prohibited by policy.
+
+- name: Create systemd override dirs for Slurm daemons
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ item }}.service.d"
+    state: directory
+    mode: "0755"
+  loop:
+    - slurmctld
+    - slurmd
+    - slurmdbd
+
+- name: Add restart policy for Slurm daemons
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ item }}.service.d/restart.conf"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Service]
+      Restart=on-failure
+      RestartSec=10s
+  loop:
+    - slurmctld
+    - slurmd
+    - slurmdbd
+  notify: Reload systemd

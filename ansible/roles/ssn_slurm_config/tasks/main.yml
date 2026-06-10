@@ -1,0 +1,167 @@
+---
+- name: Deploy slurm.conf
+  ansible.builtin.template:
+    src: slurm.conf.j2
+    dest: "{{ ssn.derived.slurm_conf_dir }}/slurm.conf"
+    owner: slurm
+    group: slurm
+    mode: "0644"
+  notify:
+    - Restart slurmctld
+    - Restart slurmd
+
+- name: Deploy cgroup.conf
+  ansible.builtin.template:
+    src: cgroup.conf.j2
+    dest: "{{ ssn.derived.slurm_conf_dir }}/cgroup.conf"
+    owner: slurm
+    group: slurm
+    mode: "0644"
+  notify: Restart slurmd
+
+- name: Deploy gres.conf for GPU profiles
+  ansible.builtin.template:
+    src: gres.conf.j2
+    dest: "{{ ssn.derived.slurm_conf_dir }}/gres.conf"
+    owner: slurm
+    group: slurm
+    mode: "0644"
+  notify: Restart slurmd
+  when: ssn.derived.has_gpus | bool
+
+- name: Check for stale gres.conf on CPU-only profiles
+  ansible.builtin.stat:
+    path: "{{ ssn.derived.slurm_conf_dir }}/gres.conf"
+  register: ssn_stale_gres_conf
+  when: not ssn.derived.has_gpus | bool
+
+- name: Report stale gres.conf on CPU-only profiles
+  ansible.builtin.debug:
+    msg: "CPU-only profile will ignore existing {{ ssn.derived.slurm_conf_dir }}/gres.conf; no files are deleted by this installer."
+  when:
+    - not ssn.derived.has_gpus | bool
+    - ssn_stale_gres_conf.stat.exists | default(false)
+
+- name: Deploy job_submit.lua
+  ansible.builtin.template:
+    src: job_submit.lua.j2
+    dest: "{{ ssn.derived.slurm_conf_dir }}/job_submit.lua"
+    owner: slurm
+    group: slurm
+    mode: "0644"
+  notify: Restart slurmctld
+
+- name: Register Slurm cluster
+  ansible.builtin.command: >
+    sacctmgr -i add cluster {{ ssn.identity.cluster_name }}
+  register: ssn_sacctmgr_cluster
+  changed_when:
+    - ssn_sacctmgr_cluster.rc == 0
+    - "'already exists' not in (ssn_sacctmgr_cluster.stdout | default(''))"
+    - "'Already existing' not in (ssn_sacctmgr_cluster.stdout | default(''))"
+  failed_when:
+    - ssn_sacctmgr_cluster.rc != 0
+    - "'already exists' not in (ssn_sacctmgr_cluster.stdout | default(''))"
+    - "'already exists' not in (ssn_sacctmgr_cluster.stderr | default(''))"
+    - "'Already existing' not in (ssn_sacctmgr_cluster.stdout | default(''))"
+    - "'Already existing' not in (ssn_sacctmgr_cluster.stderr | default(''))"
+
+- name: Flush Slurm config handlers
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable and start slurmctld
+  ansible.builtin.systemd:
+    name: slurmctld
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Enable and start slurmd
+  ansible.builtin.systemd:
+    name: slurmd
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Wait for sinfo
+  ansible.builtin.command: sinfo
+  register: ssn_sinfo
+  retries: 10
+  delay: 5
+  until: ssn_sinfo.rc == 0
+  changed_when: false
+
+- name: Add default Slurm account
+  ansible.builtin.command: >
+    sacctmgr -i add account {{ ssn.derived.slurm_account }}
+    Description="Slurm Single-Node default account"
+    Organization={{ ssn.identity.cluster_name }}
+  register: ssn_default_account
+  changed_when:
+    - ssn_default_account.rc == 0
+    - "'already exists' not in (ssn_default_account.stdout | default(''))"
+    - "'Already existing' not in (ssn_default_account.stdout | default(''))"
+    - "'Nothing new added' not in (ssn_default_account.stdout | default(''))"
+  failed_when:
+    - ssn_default_account.rc != 0
+    - "'already exists' not in (ssn_default_account.stdout | default(''))"
+    - "'already exists' not in (ssn_default_account.stderr | default(''))"
+    - "'Already existing' not in (ssn_default_account.stdout | default(''))"
+    - "'Already existing' not in (ssn_default_account.stderr | default(''))"
+    - "'Nothing new added' not in (ssn_default_account.stdout | default(''))"
+
+- name: Add tier QoS entries
+  ansible.builtin.command: >
+    sacctmgr -i add qos {{ item.qos }}
+    Priority={{ item.preempt_rank }}
+    MaxTRESPerJob=cpu={{ item.max_cpus_per_job }},mem={{ item.max_memory_mb }}M{% if item.max_gpus_per_job is not none %},gres/gpu={{ item.max_gpus_per_job }}{% endif %}
+    MaxJobsPerUser={{ item.max_running_jobs }}
+    MaxSubmitJobsPerUser={{ item.max_submitted_jobs }}
+    GraceTime={{ ssn.resolved_policies.tiers.preemption.grace_time | regex_replace('s$', '') }}
+    Flags=DenyOnLimit
+  loop: "{{ ssn.derived.rendered_tiers }}"
+  register: ssn_qos_add
+  changed_when:
+    - ssn_qos_add.rc == 0
+    - "'already exists' not in (ssn_qos_add.stdout | default(''))"
+    - "'Already existing' not in (ssn_qos_add.stdout | default(''))"
+    - "'Nothing new added' not in (ssn_qos_add.stdout | default(''))"
+  failed_when:
+    - ssn_qos_add.rc != 0
+    - "'already exists' not in (ssn_qos_add.stdout | default(''))"
+    - "'already exists' not in (ssn_qos_add.stderr | default(''))"
+    - "'Already existing' not in (ssn_qos_add.stdout | default(''))"
+    - "'Already existing' not in (ssn_qos_add.stderr | default(''))"
+    - "'Nothing new added' not in (ssn_qos_add.stdout | default(''))"
+
+- name: Update tier QoS limits
+  ansible.builtin.command: >
+    sacctmgr -i modify qos {{ item.qos }} set
+    Priority={{ item.preempt_rank }}
+    MaxTRESPerJob=cpu={{ item.max_cpus_per_job }},mem={{ item.max_memory_mb }}M{% if item.max_gpus_per_job is not none %},gres/gpu={{ item.max_gpus_per_job }}{% endif %}
+    MaxJobsPerUser={{ item.max_running_jobs }}
+    MaxSubmitJobsPerUser={{ item.max_submitted_jobs }}
+    GraceTime={{ ssn.resolved_policies.tiers.preemption.grace_time | regex_replace('s$', '') }}
+    Flags=DenyOnLimit
+  loop: "{{ ssn.derived.rendered_tiers }}"
+  changed_when: false
+
+- name: Allow tier QoS entries on default account
+  ansible.builtin.command: >
+    sacctmgr -i modify account {{ ssn.derived.slurm_account }} set
+    QOS={{ ssn.derived.rendered_tiers | map(attribute='qos') | join(',') }}
+  changed_when: false
+
+- name: Update QOS preemption relationships
+  ansible.builtin.command: >
+    sacctmgr -i modify qos {{ item.qos }} set Preempt={{ item.preempts | join(',') }}
+  loop: "{{ ssn.derived.rendered_tiers }}"
+  when: item.preempts | length > 0
+  changed_when: false
+
+- name: Clear QOS preemption relationships for base tiers
+  ansible.builtin.command: >
+    sacctmgr -i modify qos {{ item.qos }} set Preempt=
+  loop: "{{ ssn.derived.rendered_tiers }}"
+  when: item.preempts | length == 0
+  changed_when: false

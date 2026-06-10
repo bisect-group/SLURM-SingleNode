@@ -1,0 +1,76 @@
+---
+- name: Ensure MariaDB is enabled and started
+  ansible.builtin.systemd:
+    name: mariadb
+    enabled: true
+    state: started
+
+- name: Check slurmdbd database password file
+  ansible.builtin.stat:
+    path: "{{ ssn.derived.db_password_file }}"
+  register: ssn_db_password_file
+
+- name: Generate slurmdbd database password
+  ansible.builtin.shell: |
+    umask 077
+    tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32 > {{ ssn.derived.db_password_file }}
+    chown slurm:slurm {{ ssn.derived.db_password_file }}
+    chmod 0400 {{ ssn.derived.db_password_file }}
+  when: not ssn_db_password_file.stat.exists
+  no_log: true
+
+- name: Read slurmdbd database password
+  ansible.builtin.slurp:
+    src: "{{ ssn.derived.db_password_file }}"
+  register: ssn_dbpw_b64
+  no_log: true
+
+- name: Set slurmdbd database password fact
+  ansible.builtin.set_fact:
+    ssn_slurmdbd_db_password: "{{ ssn_dbpw_b64.content | b64decode | trim }}"
+  no_log: true
+
+- name: Create Slurm accounting database
+  ansible.builtin.command: >
+    mysql --protocol=socket -uroot -e
+    "CREATE DATABASE IF NOT EXISTS {{ ssn.derived.db_name }}
+     CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+  changed_when: false
+
+- name: Create Slurm accounting database user
+  ansible.builtin.command: >
+    mysql --protocol=socket -uroot -e
+    "CREATE USER IF NOT EXISTS '{{ ssn.derived.db_user }}'@'localhost'
+     IDENTIFIED BY '{{ ssn_slurmdbd_db_password }}';
+     ALTER USER '{{ ssn.derived.db_user }}'@'localhost'
+     IDENTIFIED BY '{{ ssn_slurmdbd_db_password }}';
+     GRANT ALL PRIVILEGES ON {{ ssn.derived.db_name }}.*
+     TO '{{ ssn.derived.db_user }}'@'localhost';
+     FLUSH PRIVILEGES;"
+  no_log: true
+  changed_when: true
+
+- name: Deploy slurmdbd.conf
+  ansible.builtin.template:
+    src: slurmdbd.conf.j2
+    dest: "{{ ssn.derived.slurm_conf_dir }}/slurmdbd.conf"
+    owner: slurm
+    group: slurm
+    mode: "0600"
+  notify: Restart slurmdbd
+
+- name: Flush slurmdbd handler
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable and start slurmdbd
+  ansible.builtin.systemd:
+    name: slurmdbd
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Wait for slurmdbd
+  ansible.builtin.wait_for:
+    port: "{{ ssn.derived.slurmdbd_port }}"
+    host: 127.0.0.1
+    timeout: 30

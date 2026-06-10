@@ -1,0 +1,47 @@
+---
+- name: Verify configured storage paths
+  ansible.builtin.stat:
+    path: "{{ item.value }}"
+  loop: "{{ ssn.derived.paths | dict2items }}"
+  when: item.value is not none
+  register: ssn_storage_paths
+
+- name: Fail when required storage path is missing
+  ansible.builtin.assert:
+    that: item.stat.exists
+    fail_msg: "Configured storage path {{ item.item.key }}={{ item.item.value }} is missing."
+  loop: "{{ ssn_storage_paths.results | default([]) }}"
+  when:
+    - ssn.resolved_policies.storage.quotas.fail_if_unavailable | default(false) | bool
+    - item.item.value is not none
+
+- name: Ensure data and archive roots exist when configured
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: "{{ ssn.derived.admin_group }}"
+    mode: "0750"
+  loop:
+    - "{{ ssn.derived.paths.data | default(None) }}"
+    - "{{ ssn.derived.paths.archive | default(None) }}"
+  when: item is not none
+
+- name: Ensure scratch roots exist only when scratch policy is enabled
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "1777"
+  loop:
+    - "{{ ssn.derived.paths.scratch | default(None) }}"
+    - "{{ ssn.resolved_policies.storage.job_scratch.root | default(None) }}"
+  when:
+    - item is not none
+    - ssn.resolved_policies.storage.job_scratch.required_for_jobs | default(false) | bool
+
+- name: Report scratch disabled
+  ansible.builtin.debug:
+    msg: "Scratch is disabled for profile {{ ssn.profile }}."
+  when: ssn.derived.paths.scratch | default(None) is none

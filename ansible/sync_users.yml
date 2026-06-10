@@ -1,0 +1,43 @@
+---
+- name: Slurm Single-Node - reconcile users.yml
+  hosts: single_node
+  become: true
+  gather_facts: false
+
+  vars:
+    ssn_users_file: /etc/slurm-single-node/users.yml
+    ssn_state_file: /var/lib/slurm-single-node/users-state.yml
+    ssn_sync_apply: false
+    ssn_single_user: ""
+
+  tasks:
+    - name: Ensure ssn tools are installed
+      ansible.builtin.import_role:
+        name: ssn_admin_tools
+
+    - name: Run ssn-sync-users dry plan
+      ansible.builtin.command: >
+        /usr/local/sbin/ssn-sync-users
+        --profile {{ ssn.profile }}
+        --users {{ ssn_users_file }}
+        --state {{ ssn_state_file }}
+        {% if ssn_single_user | length > 0 %}--user {{ ssn_single_user }}{% endif %}
+      register: ssn_users_plan
+      changed_when: false
+      check_mode: false
+
+    - name: Show user plan
+      ansible.builtin.debug:
+        msg: "{{ ssn_users_plan.stdout_lines }}"
+
+    - name: Apply user changes
+      ansible.builtin.command: >
+        /usr/local/sbin/ssn-sync-users
+        --profile {{ ssn.profile }}
+        --users {{ ssn_users_file }}
+        --state {{ ssn_state_file }}
+        {% if ssn_single_user | length > 0 %}--user {{ ssn_single_user }}{% endif %}
+        --apply
+      when:
+        - ssn_sync_apply | bool
+        - not ansible_check_mode

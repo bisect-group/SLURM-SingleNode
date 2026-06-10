@@ -1,0 +1,6 @@
+#!/usr/bin/env sh
+{% if item == 'ssn-install' %}
+PYTHONPATH=/usr/local/lib/slurm-single-node exec python3 -m ssn.install "$@"
+{% else %}
+PYTHONPATH=/usr/local/lib/slurm-single-node exec python3 -m ssn.cli {{ item | regex_replace('^ssn-', '') }} "$@"
+{% endif %}

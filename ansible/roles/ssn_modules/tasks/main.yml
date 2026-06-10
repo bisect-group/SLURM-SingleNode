@@ -1,0 +1,22 @@
+---
+- name: Install Lmod when enabled
+  ansible.builtin.apt:
+    name: lmod
+    state: present
+  when: ssn.resolved_policies.modules.lmod | bool
+
+- name: Create shared software roots
+  ansible.builtin.file:
+    path: "{{ item.value }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop: "{{ ssn.resolved_policies.modules.roots | dict2items }}"
+
+- name: Report shared environment base
+  ansible.builtin.debug:
+    msg:
+      - "Shared env base type: {{ ssn.resolved_policies.modules.shared_env_base.type }}"
+      - "Root: {{ ssn.resolved_policies.modules.shared_env_base.root }}"
+      - "Installation/update is admin-run; this role creates roots but does not update environments blindly."

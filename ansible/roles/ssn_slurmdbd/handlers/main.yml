@@ -1,0 +1,6 @@
+---
+- name: Restart slurmdbd
+  ansible.builtin.systemd:
+    name: slurmdbd
+    state: restarted
+    daemon_reload: true

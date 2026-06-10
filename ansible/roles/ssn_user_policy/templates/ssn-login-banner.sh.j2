@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Managed by Slurm Single-Node.
+
+case "$-" in
+  *i*) ;;
+  *) return 0 2>/dev/null || exit 0 ;;
+esac
+
+if ! id -nG 2>/dev/null | tr ' ' '\n' | grep -qx "{{ ssn.derived.umbrella_group }}"; then
+    return 0 2>/dev/null || exit 0
+fi
+
+echo
+echo "Slurm Single-Node: submit compute with sbatch or srun."
+echo "Partition: {{ ssn.identity.default_partition }}"
+echo "Tier groups: {% for tier in ssn.derived.rendered_tiers %}{{ tier.group }}{% if not loop.last %}, {% endif %}{% endfor %}"
+echo "Direct compute on login is prohibited by policy and technically constrained."
+echo

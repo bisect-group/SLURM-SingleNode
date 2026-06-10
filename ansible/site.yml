@@ -1,0 +1,84 @@
+---
+- name: Slurm Single-Node - full setup
+  hosts: single_node
+  become: true
+  gather_facts: true
+
+  pre_tasks:
+    - name: Assert resolved ssn config was supplied
+      ansible.builtin.assert:
+        that:
+          - ssn is defined
+          - ssn.schema_version == 1
+          - ssn.derived is defined
+        fail_msg: "Run ssn-render or ssn-apply so Ansible receives @ansible-vars.json."
+
+    - name: Verify Ubuntu target
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == "Ubuntu"
+          - ansible_distribution_major_version | int >= 24
+        fail_msg: "Primary support is Ubuntu 24.04/26.04."
+
+    - name: Verify cgroup v2
+      ansible.builtin.command: stat -fc %T /sys/fs/cgroup
+      register: ssn_cgroup_fs
+      changed_when: false
+      check_mode: false
+
+    - name: Assert cgroup v2
+      ansible.builtin.assert:
+        that: ssn_cgroup_fs.stdout == "cgroup2fs"
+        fail_msg: "cgroup v2 is required for v1."
+
+    - name: Verify GPU profile has nvidia-smi
+      ansible.builtin.command: nvidia-smi --query-gpu=index --format=csv,noheader
+      register: ssn_nvidia_smi
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when: ssn.derived.has_gpus | bool
+
+    - name: Assert reviewed GPU count
+      ansible.builtin.assert:
+        that:
+          - ssn_nvidia_smi.rc == 0
+          - ssn_nvidia_smi.stdout_lines | length == ssn.hardware.gpus | int
+        fail_msg: "NVIDIA GPU profile selected, but nvidia-smi did not match the reviewed GPU count."
+      when: ssn.derived.has_gpus | bool
+
+  roles:
+    - role: ssn_base
+      tags: [base]
+    - role: ssn_storage
+      tags: [storage]
+    - role: ssn_modules
+      tags: [modules]
+    - role: ssn_slurmdbd
+      tags: [dbd]
+    - role: ssn_slurm_config
+      tags: [slurm]
+    - role: ssn_user_policy
+      tags: [users, policy]
+    - role: ssn_admin_tools
+      tags: [tools]
+
+  post_tasks:
+    - name: Final sinfo
+      ansible.builtin.command: sinfo
+      register: ssn_sinfo_final
+      changed_when: false
+      failed_when: false
+
+    - name: Final QoS
+      ansible.builtin.command: sacctmgr -nP show qos format=name,priority,maxtresperjob,maxjobsperuser,maxsubmitjobsperuser
+      register: ssn_qos_final
+      changed_when: false
+      failed_when: false
+
+    - name: Print final state
+      ansible.builtin.debug:
+        msg:
+          - "Profile: {{ ssn.profile }}"
+          - "sinfo: {{ ssn_sinfo_final.stdout_lines | default([]) }}"
+          - "qos: {{ ssn_qos_final.stdout_lines | default([]) }}"

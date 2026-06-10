@@ -1,0 +1,61 @@
+---
+- name: Slurm Single-Node - read-only verification
+  hosts: single_node
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Verify munge
+      ansible.builtin.command: systemctl is-active munge
+      register: ssn_check_munge
+      changed_when: false
+      failed_when: ssn_check_munge.stdout != "active"
+
+    - name: Verify MariaDB
+      ansible.builtin.command: systemctl is-active mariadb
+      register: ssn_check_mariadb
+      changed_when: false
+      failed_when: ssn_check_mariadb.stdout != "active"
+
+    - name: Verify slurmdbd
+      ansible.builtin.command: systemctl is-active slurmdbd
+      register: ssn_check_slurmdbd
+      changed_when: false
+      failed_when: ssn_check_slurmdbd.stdout != "active"
+
+    - name: Verify slurmctld
+      ansible.builtin.command: systemctl is-active slurmctld
+      register: ssn_check_slurmctld
+      changed_when: false
+      failed_when: ssn_check_slurmctld.stdout != "active"
+
+    - name: Verify slurmd
+      ansible.builtin.command: systemctl is-active slurmd
+      register: ssn_check_slurmd
+      changed_when: false
+      failed_when: ssn_check_slurmd.stdout != "active"
+
+    - name: Verify sinfo
+      ansible.builtin.command:
+        argv:
+          - sinfo
+          - -o
+          - "%N %P %t %G"
+      register: ssn_check_sinfo
+      changed_when: false
+
+    - name: Verify cgroup v2
+      ansible.builtin.command: stat -fc %T /sys/fs/cgroup
+      register: ssn_check_cgroup
+      changed_when: false
+      failed_when: ssn_check_cgroup.stdout != "cgroup2fs"
+
+    - name: Show summary
+      ansible.builtin.debug:
+        msg:
+          - "munge={{ ssn_check_munge.stdout }}"
+          - "mariadb={{ ssn_check_mariadb.stdout }}"
+          - "slurmdbd={{ ssn_check_slurmdbd.stdout }}"
+          - "slurmctld={{ ssn_check_slurmctld.stdout }}"
+          - "slurmd={{ ssn_check_slurmd.stdout }}"
+          - "sinfo={{ ssn_check_sinfo.stdout_lines }}"

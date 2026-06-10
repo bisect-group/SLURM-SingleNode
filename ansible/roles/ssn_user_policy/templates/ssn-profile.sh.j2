@@ -1,0 +1,26 @@
+# Managed by Slurm Single-Node.
+
+alias sq='squeue -u "$USER" -o "%-10i %-20j %-8T %-12l %-12L %R"'
+alias sqa='squeue -o "%-10i %-15u %-20j %-8T %-12l %-12L %R"'
+alias stier='{{ ssn.identity.command_prefix }}-tier'
+
+{% for section in ['persistent', 'home_config'] %}
+{% for key, value in ssn.resolved_policies.cache.env.get(section, {}).items() %}
+{% set shell_default = '${' ~ key ~ ':-}' %}
+if [ -z "{{ shell_default }}" ]; then
+    export {{ key }}="{{ value }}"
+fi
+{% endfor %}
+{% endfor %}
+{% if ssn.resolved_policies.cache.env.get('scratch') %}
+{% for key, value in ssn.resolved_policies.cache.env.get('scratch', {}).items() %}
+{% set shell_default = '${' ~ key ~ ':-}' %}
+if [ -z "{{ shell_default }}" ]; then
+    export {{ key }}="{{ value }}"
+fi
+{% endfor %}
+{% endif %}
+
+if [ -z "${SLURM_JOB_ID:-}" ]; then
+    export SSN_LOGIN_SESSION=1
+fi

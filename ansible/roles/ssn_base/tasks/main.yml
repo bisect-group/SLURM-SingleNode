@@ -1,0 +1,129 @@
+---
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Install core Slurm dependencies
+  ansible.builtin.apt:
+    name:
+      - slurm-wlm
+      - slurmd
+      - slurmctld
+      - slurmdbd
+      - slurm-wlm-doc
+      - munge
+      - libmunge2
+      - mariadb-server
+      - mariadb-client
+      - hwloc
+      - numactl
+      - cgroup-tools
+      - quota
+      - python3
+      - python3-apt
+      - python3-yaml
+      - acl
+      - lua5.3
+      - liblua5.3-dev
+      - 7zip
+    state: present
+
+- name: Install GPU login adoption package only for GPU profiles
+  ansible.builtin.apt:
+    name: libpam-slurm-adopt
+    state: present
+  when: ssn.derived.has_gpus | bool
+
+- name: Ensure slurm group exists
+  ansible.builtin.group:
+    name: slurm
+    system: true
+    state: present
+
+- name: Ensure slurm user exists
+  ansible.builtin.user:
+    name: slurm
+    group: slurm
+    system: true
+    shell: /usr/sbin/nologin
+    home: /var/lib/slurm
+    create_home: false
+    state: present
+
+- name: Ensure admin groups exist
+  ansible.builtin.group:
+    name: "{{ item }}"
+    state: present
+  loop: "{{ ssn.admins.groups }}"
+
+- name: Add admin users to admin groups
+  ansible.builtin.user:
+    name: "{{ item.0 }}"
+    groups: "{{ item.1 }}"
+    append: true
+  loop: "{{ ssn.admins.users | product(ssn.admins.groups) | list }}"
+  when: not ansible_check_mode
+
+- name: Create Slurm directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: slurm
+    group: slurm
+    mode: "0755"
+  loop:
+    - "{{ ssn.derived.slurm_conf_dir }}"
+    - "{{ ssn.derived.slurm_log_dir }}"
+    - "{{ ssn.derived.slurm_spool_dir }}"
+    - "{{ ssn.derived.slurm_spool_dir }}/slurmctld"
+    - "{{ ssn.derived.slurm_spool_dir }}/slurmd"
+    - "{{ ssn.derived.slurm_pid_dir }}"
+
+- name: Create ssn config and state directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: "{{ item.group | default(ssn.derived.admin_group) }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: /etc/slurm-single-node, mode: "0750" }
+    - { path: /var/lib/slurm-single-node, mode: "0750" }
+    - { path: /var/lib/slurm-single-node/plans, mode: "0750" }
+    - { path: /var/backups/slurm-single-node/users, mode: "0750" }
+    - { path: /usr/local/lib/slurm-single-node, mode: "0755", group: root }
+
+- name: Persist resolved audit config
+  ansible.builtin.copy:
+    content: "{{ {'ssn': ssn} | to_nice_yaml(indent=2, sort_keys=false) }}"
+    dest: /etc/slurm-single-node/config.yml
+    owner: root
+    group: "{{ ssn.derived.admin_group }}"
+    mode: "0640"
+
+- name: Generate munge key if absent
+  ansible.builtin.command:
+    cmd: dd if=/dev/urandom bs=1 count=1024 of=/etc/munge/munge.key
+    creates: /etc/munge/munge.key
+
+- name: Set munge key permissions
+  ansible.builtin.file:
+    path: /etc/munge/munge.key
+    owner: munge
+    group: munge
+    mode: "0400"
+
+- name: Enable and start munge
+  ansible.builtin.systemd:
+    name: munge
+    enabled: true
+    state: started
+
+- name: Verify munge
+  ansible.builtin.shell: |
+    set -o pipefail
+    munge -n | unmunge
+  register: ssn_munge_test
+  changed_when: false
+  check_mode: false

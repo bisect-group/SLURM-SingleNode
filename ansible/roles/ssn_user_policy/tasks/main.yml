@@ -1,0 +1,41 @@
+---
+- name: Create umbrella Slurm user group
+  ansible.builtin.group:
+    name: "{{ ssn.derived.umbrella_group }}"
+    state: present
+
+- name: Create per-tier policy groups
+  ansible.builtin.group:
+    name: "{{ item.group }}"
+    state: present
+  loop: "{{ ssn.derived.rendered_tiers }}"
+
+- name: Install conservative limits for managed users
+  ansible.builtin.copy:
+    dest: /etc/security/limits.d/slurm-single-node.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by Slurm Single-Node.
+      # Hard CPU/RAM login capping is handled in a later tested systemd/PAM pass.
+      @{{ ssn.derived.umbrella_group }} soft nproc {{ ssn.resolved_policies.login.non_admin_limits.tasks }}
+      @{{ ssn.derived.umbrella_group }} hard nproc {{ ssn.resolved_policies.login.non_admin_limits.tasks }}
+      @{{ ssn.derived.umbrella_group }} soft nofile 65536
+      @{{ ssn.derived.umbrella_group }} hard nofile 65536
+
+- name: Deploy Slurm Single-Node shell defaults
+  ansible.builtin.template:
+    src: ssn-profile.sh.j2
+    dest: /etc/profile.d/slurm-single-node.sh
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Deploy tier login banner
+  ansible.builtin.template:
+    src: ssn-login-banner.sh.j2
+    dest: /etc/profile.d/zz-slurm-single-node-banner.sh
+    owner: root
+    group: root
+    mode: "0644"

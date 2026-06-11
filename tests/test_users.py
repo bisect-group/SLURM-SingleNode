@@ -50,6 +50,53 @@ class UserTests(unittest.TestCase):
         self.assertTrue(any(action.action == "create_unix_user" for action in actions))
         self.assertTrue(any(action.action == "ensure_slurm_association" for action in actions))
 
+    def test_gpu_profile_active_user_gets_scratch_dir_action(self) -> None:
+        resolved = resolve_profile("gpu-bisect-quadro-p620", ROOT)
+        users_doc = {
+            "schema_version": 1,
+            "groups": {},
+            "users": {
+                "ssntest": {
+                    "status": "active",
+                    "tier": "standard",
+                    "groups": [],
+                    "ssh_keys": None,
+                }
+            },
+        }
+        actions = plan_user_sync(users_doc, {"schema_version": 1, "users": {}}, resolved)
+        self.assertTrue(any(action.action == "ensure_scratch_dir" for action in actions))
+
+    def test_inactive_reactivation_requires_original_identity(self) -> None:
+        resolved = resolve_profile("cpu-dev-local", ROOT)
+        users_doc = {
+            "schema_version": 1,
+            "groups": {},
+            "users": {
+                "ssntest": {
+                    "status": "active",
+                    "tier": "standard",
+                    "groups": [],
+                    "ssh_keys": None,
+                    "uid": 2001,
+                    "gid": 2001,
+                }
+            },
+        }
+        state_doc = {
+            "schema_version": 1,
+            "users": {
+                "ssntest": {
+                    "managed": True,
+                    "status": "inactive",
+                    "original_uid": 2000,
+                    "original_gid": 2000,
+                }
+            },
+        }
+        actions = plan_user_sync(users_doc, state_doc, resolved)
+        self.assertTrue(any(action.action == "validation_error" for action in actions))
+
 
 if __name__ == "__main__":
     unittest.main()

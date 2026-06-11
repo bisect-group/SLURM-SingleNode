@@ -128,6 +128,11 @@ def plan_user_sync(
     for username, user in sorted(users.items()):
         if single_user and username != single_user:
             continue
+        previous_state = managed_state.get(username) or {}
+        id_error = _reactivation_identity_error(username, user, previous_state)
+        if id_error:
+            actions.append(UserAction(username, "validation_error", id_error, risky=True))
+            continue
         status = user["status"]
         exists = _user_exists(username)
         if status == "active":
@@ -141,6 +146,8 @@ def plan_user_sync(
             else:
                 actions.append(UserAction(username, "leave_authorized_keys_unmanaged", "ssh_keys omitted or null"))
             actions.append(UserAction(username, "ensure_data_dir", _data_dir(resolved, username)))
+            if (resolved["derived"].get("paths") or {}).get("scratch"):
+                actions.append(UserAction(username, "ensure_scratch_dir", _scratch_dir(resolved, username)))
             actions.append(UserAction(username, "ensure_slurm_association", user["tier"]))
         elif status == "suspended":
             if exists:
@@ -150,6 +157,34 @@ def plan_user_sync(
         elif status == "inactive":
             actions.append(UserAction(username, "inactive_state_machine", "archive lifecycle required", risky=True))
     return actions
+
+
+def _reactivation_identity_error(username: str, user: dict[str, Any], previous_state: dict[str, Any]) -> str | None:
+    original_uid = previous_state.get("original_uid")
+    original_gid = previous_state.get("original_gid")
+    if original_uid is None or original_gid is None:
+        return None
+    if previous_state.get("status") != "inactive" and previous_state.get("archive_state") != "tombstoned":
+        return None
+    if user.get("status") != "active":
+        return None
+    if user.get("uid") is None or user.get("gid") is None:
+        return "reactivating inactive user requires explicit original uid/gid"
+    if int(user["uid"]) != int(original_uid) or int(user["gid"]) != int(original_gid):
+        return f"reactivation must reuse original uid/gid {original_uid}/{original_gid}"
+    try:
+        entry = pwd.getpwuid(int(original_uid))
+        if entry.pw_name != username:
+            return f"original uid {original_uid} is already used by {entry.pw_name}"
+    except KeyError:
+        pass
+    try:
+        group = grp.getgrgid(int(original_gid))
+        if group.gr_name != username:
+            return f"original gid {original_gid} is already used by {group.gr_name}"
+    except KeyError:
+        pass
+    return None
 
 
 def discover_users(uid_min: int = 1000, uid_max: int = 60000, excludes: set[str] | None = None) -> dict[str, Any]:
@@ -288,16 +323,25 @@ def action_dicts(actions: list[UserAction]) -> list[dict[str, Any]]:
     return [asdict(action) for action in actions]
 
 
-def apply_user_actions(actions: list[UserAction], users_doc: dict[str, Any], resolved: dict[str, Any]) -> None:
+def apply_user_actions(
+    actions: list[UserAction],
+    users_doc: dict[str, Any],
+    resolved: dict[str, Any],
+    *,
+    state_doc: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if os.geteuid() != 0:
         raise PermissionError("user sync apply must run as root")
     users = users_doc.get("users") or {}
+    state_doc = state_doc or {"schema_version": 1, "users": {}}
+    state_doc.setdefault("schema_version", 1)
+    state_doc.setdefault("users", {})
     for action in actions:
         if action.action == "validation_error":
             raise ValueError(f"{action.username}: {action.detail}")
         user = users.get(action.username, {})
         if action.action == "create_unix_user":
-            _run(["useradd", "-m", "-s", "/bin/bash", "-U", action.username])
+            _create_unix_user(action.username, user)
         elif action.action == "ensure_unlocked":
             _run(["usermod", "-U", "-e", "", action.username], check=False)
         elif action.action == "lock_unix_account":
@@ -306,6 +350,8 @@ def apply_user_actions(actions: list[UserAction], users_doc: dict[str, Any], res
             _write_authorized_keys(action.username, user.get("ssh_keys") or {})
         elif action.action == "ensure_data_dir":
             _ensure_data_dir(resolved, action.username)
+        elif action.action == "ensure_scratch_dir":
+            _ensure_scratch_dir(resolved, action.username)
         elif action.action == "ensure_slurm_association":
             _ensure_slurm_association(action.username, user.get("tier"), resolved)
         elif action.action == "disable_slurm_association":
@@ -314,6 +360,10 @@ def apply_user_actions(actions: list[UserAction], users_doc: dict[str, Any], res
             _run(["scancel", "-u", action.username], check=False)
         elif action.action in {"ensure_primary_group", "ensure_project_group", "ensure_tier_group", "ensure_umbrella_group"}:
             _ensure_group_membership(action.username, action.detail)
+        elif action.action == "inactive_state_machine":
+            raise ValueError(f"{action.username}: inactive lifecycle is dry-plan only in this implementation pass")
+        _update_state_for_user(state_doc, action.username, users.get(action.username), resolved)
+    return state_doc
 
 
 def _validate_ssh_keys(username: str, ssh_keys: Any) -> list[str]:
@@ -392,6 +442,13 @@ def _data_dir(resolved: dict[str, Any], username: str) -> str:
     return f"{data_root}/{username}"
 
 
+def _scratch_dir(resolved: dict[str, Any], username: str) -> str:
+    scratch_root = resolved["derived"]["paths"].get("scratch")
+    if not scratch_root:
+        return "scratch path disabled"
+    return f"{scratch_root}/{username}"
+
+
 def _valid_username(username: str) -> bool:
     if not username or len(username) > 32:
         return False
@@ -409,6 +466,28 @@ def _user_exists(username: str) -> bool:
 
 def _run(cmd: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, text=True, capture_output=True, check=check)
+
+
+def _create_unix_user(username: str, user: dict[str, Any]) -> None:
+    cmd = ["useradd", "-m", "-s", "/bin/bash"]
+    gid = user.get("gid")
+    if gid is not None:
+        try:
+            group_name = grp.getgrgid(int(gid)).gr_name
+        except KeyError:
+            _run(["groupadd", "-g", str(gid), username])
+            group_name = username
+        cmd.extend(["-g", group_name])
+    else:
+        cmd.append("-U")
+    uid = user.get("uid")
+    if uid is not None:
+        cmd.extend(["-u", str(uid)])
+    full_name = user.get("full_name")
+    if full_name:
+        cmd.extend(["-c", str(full_name)])
+    cmd.append(username)
+    _run(cmd)
 
 
 def _write_authorized_keys(username: str, ssh_keys: dict[str, Any]) -> None:
@@ -431,6 +510,19 @@ def _ensure_data_dir(resolved: dict[str, Any], username: str) -> None:
     path = Path(data_root) / username
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chown(path, entry.pw_uid, entry.pw_gid)
+
+
+def _ensure_scratch_dir(resolved: dict[str, Any], username: str) -> None:
+    scratch_root = resolved["derived"]["paths"].get("scratch")
+    if not scratch_root:
+        return
+    entry = pwd.getpwnam(username)
+    for relative in ("", "cache", "tmp"):
+        path = Path(scratch_root) / username
+        if relative:
+            path = path / relative
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chown(path, entry.pw_uid, entry.pw_gid)
 
 
 def _ensure_slurm_association(username: str, tier_name: str, resolved: dict[str, Any]) -> None:
@@ -485,3 +577,29 @@ def _ensure_group_membership(username: str, group_name: str) -> None:
     except KeyError:
         _run(["groupadd", group_name])
     _run(["usermod", "-aG", group_name, username])
+
+
+def _update_state_for_user(
+    state_doc: dict[str, Any],
+    username: str,
+    user: dict[str, Any] | None,
+    resolved: dict[str, Any],
+) -> None:
+    if not user or not _user_exists(username):
+        return
+    entry = pwd.getpwnam(username)
+    state_users = state_doc.setdefault("users", {})
+    previous = state_users.get(username) or {}
+    state_users[username] = {
+        **previous,
+        "managed": True,
+        "status": user.get("status"),
+        "tier": user.get("tier"),
+        "uid": entry.pw_uid,
+        "gid": entry.pw_gid,
+        "original_uid": previous.get("original_uid", entry.pw_uid),
+        "original_gid": previous.get("original_gid", entry.pw_gid),
+        "data_dir": _data_dir(resolved, username),
+        "scratch_dir": _scratch_dir(resolved, username),
+        "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }

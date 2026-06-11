@@ -11,6 +11,24 @@ local tier_limits = {
 {% endfor %}
 }
 
+{% if ssn.resolved_policies.storage.job_scratch.required_for_jobs | default(false) | bool %}
+local scratch_unhealthy_marker = "/run/slurm-single-node/scratch-unhealthy"
+{% else %}
+local scratch_unhealthy_marker = nil
+{% endif %}
+
+local function path_exists(path)
+  if path == nil then
+    return false
+  end
+  local handle = io.open(path, "r")
+  if handle ~= nil then
+    io.close(handle)
+    return true
+  end
+  return false
+end
+
 local function requested_gpus(job_desc)
   local count = 0
   local fields = {job_desc.tres_per_job, job_desc.tres_per_node, job_desc.gres}
@@ -53,6 +71,10 @@ local function reject(message)
 end
 
 function slurm_job_submit(job_desc, part_list, submit_uid)
+  if path_exists(scratch_unhealthy_marker) then
+    return reject("Slurm single-node: scratch is currently unhealthy; new scratch-dependent jobs are blocked.")
+  end
+
   local qos = job_desc.qos
   if qos == nil or qos == "" then
     return slurm.SUCCESS

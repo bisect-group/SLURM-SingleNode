@@ -6,6 +6,7 @@ import grp
 import hashlib
 import os
 import pwd
+import stat
 import shlex
 import shutil
 import subprocess
@@ -244,21 +245,30 @@ def plan_user_sync(
             if not exists:
                 actions.append(UserAction(username, "create_unix_user", "active user missing"))
             else:
-                actions.append(UserAction(username, "ensure_unlocked", "active login allowed"))
-            actions.extend(_group_actions(username, user, resolved))
+                if _account_needs_unlock(username):
+                    actions.append(UserAction(username, "ensure_unlocked", "active login allowed"))
+            actions.extend(_group_actions(username, user, users_doc, state_doc, resolved))
             if user.get("ssh_keys") is not None:
-                actions.append(UserAction(username, "sync_authorized_keys", _key_plan_detail(user["ssh_keys"])))
-            else:
-                actions.append(UserAction(username, "leave_authorized_keys_unmanaged", "ssh_keys omitted or null"))
-            actions.append(UserAction(username, "ensure_data_dir", _data_dir(resolved, username)))
+                if not exists or not _authorized_keys_match(username, user["ssh_keys"]):
+                    actions.append(UserAction(username, "sync_authorized_keys", _key_plan_detail(user["ssh_keys"])))
+            if not exists or not _user_data_dir_matches(resolved, username):
+                actions.append(UserAction(username, "ensure_data_dir", _data_dir(resolved, username)))
             if (resolved["derived"].get("paths") or {}).get("scratch"):
-                actions.append(UserAction(username, "ensure_scratch_dir", _scratch_dir(resolved, username)))
-            actions.append(UserAction(username, "ensure_slurm_association", user["tier"]))
+                if not exists or not _user_scratch_dirs_match(resolved, username):
+                    actions.append(UserAction(username, "ensure_scratch_dir", _scratch_dir(resolved, username)))
+            if not exists or not _slurm_association_matches(username, user["tier"], resolved):
+                actions.append(UserAction(username, "ensure_slurm_association", user["tier"]))
+            if exists and not _state_entry_matches(username, user, previous_state, resolved):
+                actions.append(UserAction(username, "update_state", "record managed state"))
         elif status == "suspended":
-            if exists:
+            if exists and _account_needs_lock(username):
                 actions.append(UserAction(username, "lock_unix_account", "suspended", risky=True))
-            actions.append(UserAction(username, "disable_slurm_association", "suspended", risky=True))
-            actions.append(UserAction(username, "kill_jobs", "pending/running jobs killed immediately", risky=True))
+            if _slurm_association_exists(username, resolved):
+                actions.append(UserAction(username, "disable_slurm_association", "suspended", risky=True))
+            if _user_has_slurm_jobs(username):
+                actions.append(UserAction(username, "kill_jobs", "pending/running jobs killed immediately", risky=True))
+            if exists and not _state_entry_matches(username, user, previous_state, resolved):
+                actions.append(UserAction(username, "update_state", "record managed state"))
         elif status == "inactive":
             actions.append(UserAction(username, "inactive_state_machine", "archive lifecycle required", risky=True))
     return actions
@@ -480,6 +490,8 @@ def apply_user_actions(
             _run(["scancel", "-u", action.username], check=False)
         elif action.action == "reconcile_managed_groups":
             _reconcile_managed_groups(action.username, user, users_doc, resolved, state_doc)
+        elif action.action == "update_state":
+            pass
         elif action.action == "inactive_state_machine":
             raise ValueError(f"{action.username}: inactive lifecycle is dry-plan only in this implementation pass")
         _update_state_for_user(state_doc, action.username, users.get(action.username), resolved)
@@ -587,14 +599,22 @@ def _validate_local_identity_conflicts(
     return errors
 
 
-def _group_actions(username: str, user: dict[str, Any], resolved: dict[str, Any]) -> list[UserAction]:
+def _group_actions(
+    username: str,
+    user: dict[str, Any],
+    users_doc: dict[str, Any],
+    state_doc: dict[str, Any],
+    resolved: dict[str, Any],
+) -> list[UserAction]:
     derived = resolved["derived"]
     tier = next(t for t in derived["rendered_tiers"] if t["name"] == user["tier"])
     desired = [derived["umbrella_group"], tier["group"], *(user.get("groups") or [])]
-    return [
-        UserAction(username, "ensure_private_primary_group", username),
-        UserAction(username, "reconcile_managed_groups", ",".join(desired)),
-    ]
+    actions = []
+    if not _private_primary_group_matches(username):
+        actions.append(UserAction(username, "ensure_private_primary_group", username))
+    if not _managed_groups_match(username, user, users_doc, resolved, state_doc):
+        actions.append(UserAction(username, "reconcile_managed_groups", ",".join(desired)))
+    return actions
 
 
 def _key_plan_detail(ssh_keys: dict[str, Any]) -> str:
@@ -642,6 +662,54 @@ def _user_exists(username: str) -> bool:
         return True
     except KeyError:
         return False
+
+
+def _account_needs_unlock(username: str) -> bool:
+    return _account_expired(username)
+
+
+def _account_needs_lock(username: str) -> bool:
+    status = _passwd_status(username)
+    if status and len(status) > 1 and status[1] not in {"L", "LK"}:
+        return True
+    return not _account_expired(username)
+
+
+def _passwd_status(username: str) -> list[str] | None:
+    result = _run(["passwd", "-S", username], check=False)
+    if result.returncode != 0:
+        return None
+    return result.stdout.split()
+
+
+def _account_expired(username: str) -> bool:
+    result = _run(["chage", "-l", username], check=False)
+    if result.returncode != 0:
+        return False
+    for line in result.stdout.splitlines():
+        if not line.lower().startswith("account expires"):
+            continue
+        value = line.partition(":")[2].strip().lower()
+        return value not in {"never", ""}
+    return False
+
+
+def _authorized_keys_match(username: str, ssh_keys: dict[str, Any]) -> bool:
+    try:
+        entry = pwd.getpwnam(username)
+    except KeyError:
+        return False
+    path = Path(entry.pw_dir) / ".ssh" / "authorized_keys"
+    desired = "\n".join(render_authorized_key(key) for key in ssh_keys.values()) + ("\n" if ssh_keys else "")
+    try:
+        existing = path.read_text()
+        path_stat = path.stat()
+    except OSError:
+        return False
+    if existing != desired:
+        return False
+    mode = stat.S_IMODE(path_stat.st_mode)
+    return path_stat.st_uid == entry.pw_uid and path_stat.st_gid == entry.pw_gid and mode == 0o600
 
 
 def _run(cmd: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -704,7 +772,9 @@ def _ensure_data_dir(resolved: dict[str, Any], username: str) -> None:
         return
     entry = pwd.getpwnam(username)
     path = Path(data_root) / username
+    _refuse_unsafe_user_dir(path)
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.chmod(0o700)
     os.chown(path, entry.pw_uid, entry.pw_gid)
 
 
@@ -717,8 +787,17 @@ def _ensure_scratch_dir(resolved: dict[str, Any], username: str) -> None:
         path = Path(scratch_root) / username
         if relative:
             path = path / relative
+        _refuse_unsafe_user_dir(path)
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.chmod(0o700)
         os.chown(path, entry.pw_uid, entry.pw_gid)
+
+
+def _refuse_unsafe_user_dir(path: Path) -> None:
+    if path.is_symlink():
+        raise ValueError(f"refusing to manage symlink path {path}")
+    if path.exists() and not path.is_dir():
+        raise ValueError(f"refusing to manage non-directory path {path}")
 
 
 def _ensure_slurm_association(username: str, tier_name: str, resolved: dict[str, Any]) -> None:
@@ -833,6 +912,144 @@ def _current_supplementary_groups(username: str) -> set[str]:
         if username in group.gr_mem:
             groups.add(group.gr_name)
     return groups
+
+
+def _private_primary_group_matches(username: str) -> bool:
+    try:
+        entry = pwd.getpwnam(username)
+        group = grp.getgrnam(username)
+    except KeyError:
+        return False
+    return entry.pw_gid == group.gr_gid
+
+
+def _managed_groups_match(
+    username: str,
+    user: dict[str, Any],
+    users_doc: dict[str, Any],
+    resolved: dict[str, Any],
+    state_doc: dict[str, Any],
+) -> bool:
+    if not _user_exists(username):
+        return False
+    desired = set(_desired_managed_groups(user, resolved))
+    managed_universe = set(desired)
+    managed_universe.update(_all_policy_groups(users_doc, resolved))
+    previous = (state_doc.get("users") or {}).get(username) or {}
+    managed_universe.update(previous.get("managed_groups") or [])
+    current = _current_supplementary_groups(username)
+    return desired.issubset(current) and not ((current & managed_universe) - desired)
+
+
+def _user_data_dir_matches(resolved: dict[str, Any], username: str) -> bool:
+    data_root = resolved["derived"]["paths"].get("data")
+    if not data_root:
+        return True
+    return _owned_private_dir_matches(Path(data_root) / username, username)
+
+
+def _user_scratch_dirs_match(resolved: dict[str, Any], username: str) -> bool:
+    scratch_root = resolved["derived"]["paths"].get("scratch")
+    if not scratch_root:
+        return True
+    return all(
+        _owned_private_dir_matches(Path(scratch_root) / username / relative, username)
+        for relative in ("", "cache", "tmp")
+    )
+
+
+def _owned_private_dir_matches(path: Path, username: str) -> bool:
+    try:
+        entry = pwd.getpwnam(username)
+        path_stat = path.lstat()
+    except (KeyError, OSError):
+        return False
+    if stat.S_ISLNK(path_stat.st_mode) or not stat.S_ISDIR(path_stat.st_mode):
+        return False
+    mode = stat.S_IMODE(path_stat.st_mode)
+    return path_stat.st_uid == entry.pw_uid and path_stat.st_gid == entry.pw_gid and mode == 0o700
+
+
+def _slurm_association_matches(username: str, tier_name: str, resolved: dict[str, Any]) -> bool:
+    assoc = _slurm_user_association(username, resolved)
+    if not assoc:
+        return False
+    tier = next(t for t in resolved["derived"]["rendered_tiers"] if t["name"] == tier_name)
+    allowed = set(_allowed_qos_for_tier(tier_name, resolved).split(","))
+    qos_values = set(filter(None, (assoc.get("qos") or "").split(",")))
+    return (
+        assoc.get("default_account") == resolved["derived"]["slurm_account"]
+        and assoc.get("default_qos") == tier["qos"]
+        and allowed.issubset(qos_values)
+    )
+
+
+def _slurm_association_exists(username: str, resolved: dict[str, Any]) -> bool:
+    return _slurm_user_association(username, resolved) is not None
+
+
+def _slurm_user_association(username: str, resolved: dict[str, Any]) -> dict[str, str] | None:
+    if shutil.which("sacctmgr") is None:
+        return None
+    account = resolved["derived"]["slurm_account"]
+    result = _run(
+        [
+            "sacctmgr",
+            "-nP",
+            "show",
+            "assoc",
+            f"user={username}",
+            f"account={account}",
+            "format=User,Account,DefaultQOS,QOS",
+        ],
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        parts = line.strip().split("|")
+        if len(parts) < 4 or parts[0] != username:
+            continue
+        assoc = {
+            "user": parts[0],
+            "default_account": parts[1],
+            "default_qos": parts[2],
+            "qos": parts[3],
+        }
+        if assoc["default_account"] == account:
+            return assoc
+    return None
+
+
+def _user_has_slurm_jobs(username: str) -> bool:
+    if shutil.which("squeue") is None:
+        return False
+    result = _run(["squeue", "-h", "-u", username, "-o", "%i"], check=False)
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
+def _state_entry_matches(
+    username: str,
+    user: dict[str, Any],
+    previous: dict[str, Any],
+    resolved: dict[str, Any],
+) -> bool:
+    if not previous.get("managed"):
+        return False
+    try:
+        entry = pwd.getpwnam(username)
+    except KeyError:
+        return False
+    expected = {
+        "status": user.get("status"),
+        "tier": user.get("tier"),
+        "uid": entry.pw_uid,
+        "gid": entry.pw_gid,
+        "data_dir": _data_dir(resolved, username),
+        "scratch_dir": _scratch_dir(resolved, username),
+        "managed_groups": _desired_managed_groups(user, resolved),
+    }
+    return all(previous.get(key) == value for key, value in expected.items())
 
 
 def _update_state_for_user(

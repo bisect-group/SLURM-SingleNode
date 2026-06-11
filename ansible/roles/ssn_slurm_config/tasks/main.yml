@@ -62,7 +62,9 @@
     - "{{ ssn.derived.slurm_conf_dir }}/prolog.d"
     - "{{ ssn.derived.slurm_conf_dir }}/epilog.d"
     - "{{ ssn.derived.slurm_conf_dir }}/task-prolog.d"
-  when: ssn.resolved_policies.storage.job_scratch.implementation | default('disabled') == 'prolog_epilog'
+  when: >
+    ssn.resolved_policies.storage.job_scratch.implementation | default('disabled') == 'prolog_epilog'
+    or ssn.resolved_policies.cache.injection.slurm_jobs | default(false) | bool
 
 - name: Deploy job scratch prolog
   ansible.builtin.template:
@@ -86,7 +88,9 @@
   notify:
     - Restart slurmctld
     - Restart slurmd
-  when: ssn.resolved_policies.storage.job_scratch.implementation | default('disabled') == 'prolog_epilog'
+  when: >
+    ssn.resolved_policies.storage.job_scratch.implementation | default('disabled') == 'prolog_epilog'
+    or ssn.resolved_policies.cache.injection.slurm_jobs | default(false) | bool
 
 - name: Deploy job scratch task prolog
   ansible.builtin.template:

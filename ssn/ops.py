@@ -315,6 +315,7 @@ def token_input_hash(report: dict[str, Any], risk: str) -> str:
         "command": report.get("command"),
         "profile": report.get("profile"),
         "config_hash": report.get("config_hash"),
+        "operation_hash": report.get("operation_hash"),
         "risk": risk,
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()

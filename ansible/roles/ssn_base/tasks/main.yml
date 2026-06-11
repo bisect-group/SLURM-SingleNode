@@ -94,6 +94,23 @@
     - { path: /var/backups/slurm-single-node/users, mode: "0750" }
     - { path: /usr/local/lib/slurm-single-node, mode: "0755", group: root }
 
+- name: Create runtime directory for SSN health markers
+  ansible.builtin.file:
+    path: /run/slurm-single-node
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install tmpfiles rule for SSN runtime directory
+  ansible.builtin.copy:
+    dest: /etc/tmpfiles.d/slurm-single-node.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      d /run/slurm-single-node 0755 root root -
+
 - name: Persist resolved audit config
   ansible.builtin.copy:
     content: "{{ {'ssn': ssn} | to_nice_yaml(indent=2, sort_keys=false) }}"

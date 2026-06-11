@@ -28,6 +28,8 @@ JobSubmitPlugins=lua
 {% if ssn.resolved_policies.storage.job_scratch.implementation | default('disabled') == 'prolog_epilog' %}
 Prolog=/etc/slurm/prolog.d/ssn-job-scratch
 Epilog=/etc/slurm/epilog.d/ssn-job-scratch
+{% endif %}
+{% if ssn.resolved_policies.storage.job_scratch.implementation | default('disabled') == 'prolog_epilog' or ssn.resolved_policies.cache.injection.slurm_jobs | default(false) | bool %}
 TaskProlog=/etc/slurm/task-prolog.d/ssn-job-env
 {% endif %}
 SchedulerType=sched/backfill

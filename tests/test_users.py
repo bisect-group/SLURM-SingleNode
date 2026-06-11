@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from ssn.config import resolve_profile
 from ssn.users import _allowed_qos_for_tier, parse_authorized_key, plan_user_sync, validate_state, validate_users
@@ -114,6 +115,86 @@ class UserTests(unittest.TestCase):
         self.assertTrue(any(action.action == "create_unix_user" for action in actions))
         self.assertTrue(any(action.action == "reconcile_managed_groups" for action in actions))
         self.assertTrue(any(action.action == "ensure_slurm_association" for action in actions))
+
+    def test_plan_active_user_is_noop_when_current_state_matches(self) -> None:
+        resolved = resolve_profile("gpu-bisect-quadro-p620", ROOT)
+        users_doc = {
+            "schema_version": 1,
+            "groups": {"lab": {"description": "Lab"}},
+            "users": {
+                "ssntest": {
+                    "status": "active",
+                    "tier": "standard",
+                    "groups": ["lab"],
+                    "ssh_keys": {},
+                }
+            },
+        }
+        state_doc = {"schema_version": 1, "users": {"ssntest": {"managed": True}}}
+        with (
+            mock.patch("ssn.users._user_exists", return_value=True),
+            mock.patch("ssn.users._account_needs_unlock", return_value=False),
+            mock.patch("ssn.users._private_primary_group_matches", return_value=True),
+            mock.patch("ssn.users._managed_groups_match", return_value=True),
+            mock.patch("ssn.users._authorized_keys_match", return_value=True),
+            mock.patch("ssn.users._user_data_dir_matches", return_value=True),
+            mock.patch("ssn.users._user_scratch_dirs_match", return_value=True),
+            mock.patch("ssn.users._slurm_association_matches", return_value=True),
+            mock.patch("ssn.users._state_entry_matches", return_value=True),
+        ):
+            actions = plan_user_sync(users_doc, state_doc, resolved)
+        self.assertEqual(actions, [])
+
+    def test_plan_active_user_detects_only_authorized_key_drift(self) -> None:
+        resolved = resolve_profile("cpu-dev-local", ROOT)
+        users_doc = {
+            "schema_version": 1,
+            "groups": {},
+            "users": {
+                "ssntest": {
+                    "status": "active",
+                    "tier": "standard",
+                    "groups": [],
+                    "ssh_keys": {},
+                }
+            },
+        }
+        with (
+            mock.patch("ssn.users._user_exists", return_value=True),
+            mock.patch("ssn.users._account_needs_unlock", return_value=False),
+            mock.patch("ssn.users._private_primary_group_matches", return_value=True),
+            mock.patch("ssn.users._managed_groups_match", return_value=True),
+            mock.patch("ssn.users._authorized_keys_match", return_value=False),
+            mock.patch("ssn.users._user_data_dir_matches", return_value=True),
+            mock.patch("ssn.users._slurm_association_matches", return_value=True),
+            mock.patch("ssn.users._state_entry_matches", return_value=True),
+        ):
+            actions = plan_user_sync(users_doc, {"schema_version": 1, "users": {"ssntest": {"managed": True}}}, resolved)
+        self.assertEqual([action.action for action in actions], ["sync_authorized_keys"])
+
+    def test_plan_suspended_user_is_noop_when_already_disabled(self) -> None:
+        resolved = resolve_profile("cpu-dev-local", ROOT)
+        users_doc = {
+            "schema_version": 1,
+            "groups": {},
+            "users": {
+                "ssntest": {
+                    "status": "suspended",
+                    "tier": "standard",
+                    "groups": [],
+                    "ssh_keys": None,
+                }
+            },
+        }
+        with (
+            mock.patch("ssn.users._user_exists", return_value=True),
+            mock.patch("ssn.users._account_needs_lock", return_value=False),
+            mock.patch("ssn.users._slurm_association_exists", return_value=False),
+            mock.patch("ssn.users._user_has_slurm_jobs", return_value=False),
+            mock.patch("ssn.users._state_entry_matches", return_value=True),
+        ):
+            actions = plan_user_sync(users_doc, {"schema_version": 1, "users": {"ssntest": {"managed": True}}}, resolved)
+        self.assertEqual(actions, [])
 
     def test_gpu_profile_active_user_gets_scratch_dir_action(self) -> None:
         resolved = resolve_profile("gpu-bisect-quadro-p620", ROOT)

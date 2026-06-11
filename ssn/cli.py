@@ -25,6 +25,15 @@ from .ops import (
     wait_for_no_active_jobs,
     write_protected_json,
 )
+from .storage import (
+    DEFAULT_FIXTURE_PREFIX,
+    apply_fixture_quotas,
+    apply_fixture_scratch_cleanup,
+    quota_capability_report,
+    scratch_cleanup_report,
+    scratch_health_report,
+    write_scratch_health_state,
+)
 from .units import duration_to_seconds
 from .users import (
     action_dicts,
@@ -58,6 +67,7 @@ def main(argv: list[str] | None = None, prog: str | None = None) -> int:
         "ssn-gpu-status": gpu_status_cmd,
         "ssn-archive-status": archive_status_cmd,
         "ssn-scratch-cleanup": scratch_cleanup_cmd,
+        "ssn-scratch-health": scratch_health_cmd,
         "ssn-plan-token": plan_token_cmd,
     }
     if invoked in direct:
@@ -73,6 +83,7 @@ def main(argv: list[str] | None = None, prog: str | None = None) -> int:
     sub.add_parser("gpu-status")
     sub.add_parser("archive-status")
     sub.add_parser("scratch-cleanup")
+    sub.add_parser("scratch-health")
     sub.add_parser("plan-token")
     ns, rest = parser.parse_known_args(argv)
     return {
@@ -84,6 +95,7 @@ def main(argv: list[str] | None = None, prog: str | None = None) -> int:
         "gpu-status": gpu_status_cmd,
         "archive-status": archive_status_cmd,
         "scratch-cleanup": scratch_cleanup_cmd,
+        "scratch-health": scratch_health_cmd,
         "plan-token": plan_token_cmd,
     }[ns.command](rest)
 
@@ -348,6 +360,13 @@ def sync_users_cmd(argv: list[str]) -> int:
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--backup-root", default="/var/backups/slurm-single-node/users")
     parser.add_argument("--retention-days", type=int, default=90)
+    parser.add_argument("--quota-report", action="store_true", help="report quota capability for fixture users")
+    parser.add_argument(
+        "--apply-fixture-quotas",
+        action="store_true",
+        help="apply quotas only for users matching --quota-fixture-prefix when quotas are already active",
+    )
+    parser.add_argument("--quota-fixture-prefix", default=DEFAULT_FIXTURE_PREFIX)
     args = parser.parse_args(argv)
 
     root = repo_root(args.repo)
@@ -364,7 +383,8 @@ def sync_users_cmd(argv: list[str]) -> int:
             print(f"ERROR: {error}", file=sys.stderr)
         return 2
     actions = plan_user_sync(users_doc, state_doc, resolved, single_user=args.user)
-    if args.json and not args.apply:
+    quota_requested = args.quota_report or args.apply_fixture_quotas
+    if args.json and not args.apply and not quota_requested:
         print(json.dumps({"actions": action_dicts(actions)}, indent=2, sort_keys=True))
     elif not args.json:
         if not actions:
@@ -398,6 +418,29 @@ def sync_users_cmd(argv: list[str]) -> int:
                 "Backup retention report-only: "
                 f"{retention['candidate_count']} item(s) older than {args.retention_days} days under {args.backup_root}"
             )
+    if args.quota_report or args.apply_fixture_quotas:
+        try:
+            quota = (
+                apply_fixture_quotas(users_doc, resolved, fixture_prefix=args.quota_fixture_prefix)
+                if args.apply_fixture_quotas
+                else quota_capability_report(users_doc, resolved, fixture_prefix=args.quota_fixture_prefix)
+            )
+        except Exception as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+        if args.json:
+            print(json.dumps({"quota": quota}, indent=2, sort_keys=True))
+        else:
+            print(
+                f"Quota {quota['mode']}: fixtures={len(quota.get('fixture_users', []))} "
+                f"mounts={','.join(sorted(quota.get('mounts', {}))) or 'none'}"
+            )
+            for action in quota.get("actions", []):
+                print(
+                    f"QUOTA {action.get('user', '-'):20s} "
+                    f"{action.get('mount', '-'):8s} {action.get('status')} "
+                    f"{action.get('reason') or action.get('path') or ''}"
+                )
     return 0
 
 
@@ -437,14 +480,55 @@ def archive_status_cmd(argv: list[str]) -> int:
     return 0
 
 
+def scratch_health_cmd(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="ssn-scratch-health")
+    parser.add_argument("--profile", default="cpu-dev-local")
+    parser.add_argument("--repo", default=None)
+    parser.add_argument("--users", default=DEFAULT_USERS)
+    parser.add_argument("--state", default=DEFAULT_STATE)
+    parser.add_argument("--report", default="/run/slurm-single-node/scratch-health.json")
+    parser.add_argument("--marker", default="/run/slurm-single-node/scratch-unhealthy")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+
+    root = repo_root(args.repo)
+    try:
+        resolved = resolve_profile(args.profile, root)
+        users_doc = load_users(args.users)
+        state_doc = load_state(args.state)
+        errors = [*validate_state(state_doc), *validate_users(users_doc, resolved, state_doc=state_doc)]
+        if errors:
+            raise ValueError("; ".join(errors))
+        report = scratch_health_report(users_doc, resolved)
+        write_scratch_health_state(report, report_path=args.report, marker_path=args.marker)
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        status = "healthy" if report.get("healthy") else "unhealthy"
+        print(f"Scratch health: {status}")
+        print(f"Report: {args.report}")
+        print(f"Marker: {args.marker}")
+        for check in report.get("checks", []):
+            print(f"{check['status']:4s} {check['name']}: {check['detail']}")
+    return 0 if report.get("healthy") else 1
+
+
 def scratch_cleanup_cmd(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="ssn-scratch-cleanup")
+    parser.add_argument("--profile", default=None)
+    parser.add_argument("--repo", default=None)
     parser.add_argument("--root", default="/scratch")
     parser.add_argument("--jobs-root", default="/scratch/jobs")
     parser.add_argument("--age-days", type=int, default=30)
     parser.add_argument("--report", default="/var/log/slurm/scratch-cleanup.json")
     parser.add_argument("--apply", action="store_true", help="delete eligible paths")
     parser.add_argument("--yes-delete", action="store_true", help="required with --apply")
+    parser.add_argument("--plan-token", default=None, help="reviewed token required with --apply")
+    parser.add_argument("--token-store", default="/var/lib/slurm-single-node/plan-tokens")
+    parser.add_argument("--fixture-prefix", default=DEFAULT_FIXTURE_PREFIX)
     args = parser.parse_args(argv)
 
     root = Path(args.root).resolve()
@@ -458,46 +542,50 @@ def scratch_cleanup_cmd(argv: list[str]) -> int:
     if args.apply and not args.yes_delete:
         print("ERROR: --apply requires --yes-delete", file=sys.stderr)
         return 2
+    if args.apply and not args.plan_token:
+        print("ERROR: --apply requires --plan-token", file=sys.stderr)
+        return 2
     if not root.exists():
         print("Scratch root is absent; nothing to report.")
         return 0
-
-    cutoff = dt.datetime.now(dt.timezone.utc).timestamp() - args.age_days * 86400
-    candidates = []
-    for child in sorted(root.iterdir()):
-        if child == jobs_root:
-            continue
-        if child.is_symlink():
-            continue
-        try:
-            stat = child.stat()
-        except OSError:
-            continue
-        if stat.st_mtime > cutoff:
-            continue
-        candidates.append({
-            "path": str(child),
-            "mtime": dt.datetime.fromtimestamp(stat.st_mtime, dt.timezone.utc).isoformat(),
-            "type": "directory" if child.is_dir() else "file",
-        })
-
-    report = {
-        "schema_version": 1,
-        "mode": "apply" if args.apply else "report_only",
-        "root": str(root),
-        "jobs_root_excluded": str(jobs_root),
-        "age_days": args.age_days,
-        "candidate_count": len(candidates),
-        "candidates": candidates,
-    }
     report_path = Path(args.report)
+    if args.apply:
+        try:
+            report = json.loads(report_path.read_text())
+            validate_plan_token(
+                args.plan_token,
+                report,
+                risk="fixture_scratch_cleanup",
+                store_root=args.token_store,
+            )
+            applied = apply_fixture_scratch_cleanup(report, fixture_prefix=args.fixture_prefix)
+            report_path.write_text(json.dumps(applied, indent=2, sort_keys=True) + "\n")
+        except Exception as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+        print(f"Scratch cleanup applied from reviewed report: {report_path}")
+        for item in applied.get("deletion_results", []):
+            print(f"CLEANUP {item['status']:8s} {item['path']} {item.get('reason', '')}")
+        return 0
+
+    resolved = None
+    if args.profile:
+        try:
+            resolved = resolve_profile(args.profile, repo_root(args.repo))
+        except Exception as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+    report = scratch_cleanup_report(
+        root=root,
+        jobs_root=jobs_root,
+        age_days=args.age_days,
+        profile=args.profile,
+        resolved=resolved,
+    )
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     print(f"Scratch cleanup report written: {report_path}")
-    print(f"Eligible top-level scratch paths: {len(candidates)}")
-    if args.apply:
-        print("Deletion mode is intentionally not implemented in v1; report only.")
-        return 2
+    print(f"Eligible top-level scratch paths: {report['candidate_count']}")
     return 0
 
 

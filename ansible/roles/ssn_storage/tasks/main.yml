@@ -85,7 +85,7 @@
 
       [Service]
       Type=oneshot
-      ExecStart=/usr/local/sbin/ssn-scratch-cleanup --root {{ ssn.derived.paths.scratch }} --jobs-root {{ ssn.resolved_policies.storage.job_scratch.root }} --age-days {{ ssn.resolved_policies.storage.scratch_cleanup.age | regex_replace('d$', '') }} --report {{ ssn.derived.slurm_log_dir }}/scratch-cleanup.json
+      ExecStart=/usr/local/sbin/ssn-scratch-cleanup --profile {{ ssn.profile }} --root {{ ssn.derived.paths.scratch }} --jobs-root {{ ssn.resolved_policies.storage.job_scratch.root }} --age-days {{ ssn.resolved_policies.storage.scratch_cleanup.age | regex_replace('d$', '') }} --report {{ ssn.derived.slurm_log_dir }}/scratch-cleanup.json
   when:
     - ssn.resolved_policies.storage.scratch_cleanup.implementation | default('disabled') == 'systemd-tmpfiles'
     - ssn.derived.paths.scratch | default(None) is not none

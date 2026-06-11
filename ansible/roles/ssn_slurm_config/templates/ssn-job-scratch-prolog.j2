@@ -3,9 +3,24 @@
 set -euo pipefail
 
 root="{{ ssn.resolved_policies.storage.job_scratch.root }}"
+marker="/run/slurm-single-node/scratch-unhealthy"
 job_id="${SLURM_JOB_ID:-}"
 job_user="${SLURM_JOB_USER:-}"
 job_uid="${SLURM_JOB_UID:-}"
+
+mark_unhealthy() {
+    rc="$?"
+    if [ "$rc" -ne 0 ]; then
+        mkdir -p /run/slurm-single-node
+        {
+            printf 'scratch prolog failed at %s\n' "$(date -Is)"
+            printf 'job_id=%s user=%s uid=%s root=%s rc=%s\n' "$job_id" "$job_user" "$job_uid" "$root" "$rc"
+        } > "$marker"
+        chmod 0644 "$marker"
+    fi
+    exit "$rc"
+}
+trap mark_unhealthy EXIT
 
 case "$root" in
     /scratch/jobs) ;;
@@ -21,6 +36,11 @@ if [ -z "$job_user" ] && [ -z "$job_uid" ]; then
     exit 1
 fi
 
+if [ -e "$marker" ]; then
+    echo "SSN scratch is marked unhealthy; run ssn-scratch-health after repair." >&2
+    exit 1
+fi
+
 mkdir -p "$root"
 chmod 1777 "$root"
 
@@ -33,4 +53,5 @@ else
     chown "$job_user" "$job_dir"
 fi
 
+trap - EXIT
 exit 0

@@ -4,6 +4,31 @@ set -euo pipefail
 
 root="{{ ssn.resolved_policies.storage.job_scratch.root }}"
 job_id="${SLURM_JOB_ID:-}"
+job_user="${SLURM_JOB_USER:-${USER:-}}"
+job_uid="${SLURM_JOB_UID:-}"
+
+if [ -z "$job_user" ] && [ -n "$job_uid" ]; then
+    job_user="$(id -nu "$job_uid" 2>/dev/null || true)"
+fi
+
+emit_default_template() {
+    key="$1"
+    template="$2"
+    current="${!key-}"
+    if [ -n "$current" ] || [ -z "$job_user" ]; then
+        return 0
+    fi
+    value="${template//\$USER/$job_user}"
+    printf 'export %s=%q\n' "$key" "$value"
+}
+
+{% if ssn.resolved_policies.cache.injection.slurm_jobs | default(false) | bool %}
+{% for section_name, section_env in (ssn.resolved_policies.cache.env | default({})).items() %}
+{% for key, value in section_env.items() %}
+emit_default_template "{{ key }}" '{{ value }}'
+{% endfor %}
+{% endfor %}
+{% endif %}
 
 case "$root" in
     /scratch/jobs) ;;

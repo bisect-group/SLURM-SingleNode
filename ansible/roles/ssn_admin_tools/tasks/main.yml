@@ -35,6 +35,7 @@
     - ssn-plan-token
     - ssn-archive-status
     - ssn-scratch-cleanup
+    - ssn-scratch-health
 
 - name: Install user-facing GPU status wrapper
   ansible.builtin.template:

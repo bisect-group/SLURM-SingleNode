@@ -12,8 +12,11 @@ scratch job temp, scratch cleanup reporting, accounting backup, managed fixture
 users, suspended-user blocking, queued-job apply refusal, risk token creation,
 forced apply with a reviewed token, token single-use rejection, check-mode apply
 over a queued fixture job, drained apply success, drain timeout safe resume,
-drained reinstall idempotence, and final CPU/GPU/scratch smoke tests were
-observed during live testing.
+drained reinstall idempotence, user-sync no-op idempotence, targeted fixture
+drift repair, quota capability reporting with unsupported fixture quota apply
+skip, Slurm `--export=NONE` cache/default environment injection, scratch
+health marker gating, fixture-only tokenized scratch cleanup deletion, and final
+CPU/GPU/scratch smoke tests were observed during live testing.
 
 Status buckets:
 
@@ -32,13 +35,14 @@ Quadro P620 host has passed live end-to-end install and Slurm smoke testing.
 The strongest implemented areas are the resolver/profile model, core Slurm
 configuration, accounting/QoS tiers, preemption wiring, single-command install,
 GPU GRES rendering, per-job scratch basics, accounting database backups, and
-active/suspended user sync for managed fixture users.
+active/suspended user sync for managed fixture users. User sync is now
+current-state-aware enough for the managed Quadro fixtures to produce a clean
+no-op dry-run after repair.
 
-The largest remaining gaps are general plan-token enforcement beyond queued-job
-risk, real quotas, hard login confinement, hard non-Slurm GPU denial,
-root/service GPU status snapshots, full GPU health gates and CPU-only recovery,
-inactive archive lifecycle, CUDA/module management, and production-grade user
-docs.
+The largest remaining gaps are production quota enforcement, hard login
+confinement, hard non-Slurm GPU denial, root/service GPU status snapshots, full
+GPU health gates and CPU-only recovery, inactive archive lifecycle,
+CUDA/module management, and production-grade user docs.
 
 ## Generalization Model
 
@@ -66,7 +70,7 @@ docs.
 | Dry run produces readable and JSON plan artifacts. | Installer dry-run renders/readably reports; live install/apply write protected JSON reports and summaries. `ssn-sync-users --json` outputs planned actions. | Implemented differently | `ssn/install.py`, `ssn/cli.py`, live Quadro reports | Make all dry-runs write protected machine-readable plan artifacts consistently. |
 | Plan artifacts live under `/var/lib/slurm-single-node/plans`, mode `0750/0640`, retained 90 days. | Install and apply reports plus rendered artifacts are written under protected per-run plan dirs; retention is report-only. Reports now include capability snapshots and drain phases when used. | Implemented partially | `ssn/install.py`, `ssn/cli.py`, live Quadro `install-20260611200316`, `apply-20260611195922`, `apply-20260611200037` | Implement actual retention pruning for old plan artifacts when deletion policy is approved. |
 | Redaction classes for secrets, keys, emails, manifests. | Central redaction helpers exist; install reports redact sensitive key names; SSH user plans show labels/fingerprints; DB secret Ansible tasks use `no_log`. Full manifest redaction is not implemented. | Implemented partially | `ssn/safety.py`, `ssn/users.py`, tests, live user dry-run | Extend redaction to future prune/archive manifests and all plan artifact writers. |
-| Risky operations require reviewed plan id/hash tokens. | Implemented for the queued-jobs risk on `ssn-install --force` and `ssn-apply --run --force`; tokens are config/input-hash-bound, expiring, stored hashed, and single-use. Live forced apply succeeded with a token and token reuse failed. Other risky workflows do not use tokens yet. | Implemented partially | `ssn/ops.py`, `ssn/install.py`, `ssn/cli.py`, `bin/ssn-plan-token`, `tests/test_ops.py`, live Quadro token tests | Reuse this token system for inactive pruning/archive, retention deletion, and other risky applies. |
+| Risky operations require reviewed plan id/hash tokens. | Implemented for queued-jobs risk on install/apply and for fixture-only scratch cleanup deletion. Tokens are config/input/operation-hash-bound where available, expiring, stored hashed, and single-use. Live forced apply, cleanup deletion, token reuse rejection, and operation-hash mismatch rejection passed. Other risky workflows do not use tokens yet. | Implemented partially | `ssn/ops.py`, `ssn/install.py`, `ssn/cli.py`, `ssn/storage.py`, `bin/ssn-plan-token`, `tests/test_ops.py`, live Quadro token tests | Reuse this token system for inactive pruning/archive, retention deletion, and broader cleanup applies. |
 | Persist resolved audit file at `/etc/slurm-single-node/config.yml`. | Implemented by base role. | Implemented correctly | `ansible/roles/ssn_base/tasks/main.yml` | None. |
 
 ## Target Scope
@@ -87,7 +91,7 @@ docs.
 | Decision / Requirement | Current Code State | Status Bucket | Evidence | Follow-up Needed |
 |---|---|---|---|---|
 | Default command prefix is `ssn-*`. | Implemented for repo and installed wrappers. | Implemented correctly | `bin/ssn-*`, `ansible/roles/ssn_admin_tools/tasks/main.yml` | Make prefix fully configurable for all wrappers if non-ssn prefix is needed. |
-| Core helper commands exist. | All listed commands exist, plus installer and scratch cleanup. | Implemented correctly | `bin/`, `ssn/cli.py` | `ssn-archive-status` is status-only until archive lifecycle exists. |
+| Core helper commands exist. | All listed commands exist, plus installer, scratch cleanup, and scratch health. | Implemented correctly | `bin/`, `ssn/cli.py` | `ssn-archive-status` is status-only until archive lifecycle exists. |
 | DGX may install `tesla-*` aliases. | Conditional alias install exists for selected tools. | Implemented correctly | `ssn_admin_tools` role | Expand aliases only after DGX parity review. |
 | Deployed user source is `/etc/slurm-single-node/users.yml`. | CLI default points there. | Implemented correctly | `ssn/cli.py` | Ensure installer creates example or empty file when desired. |
 
@@ -120,7 +124,7 @@ docs.
 | Back up `users.yml` and `users-state.yml` before writes. | CLI backs up both existing files before apply and reports 90-day retention candidates without deleting them. | Implemented partially | `ssn/cli.py`, `ssn/users.py`, live Quadro sync | Add approved retention pruning if desired. |
 | Top-level groups metadata only; user groups authoritative. | Validation rejects `groups.*.members`; apply reconciles SSN-managed supplementary groups and removes stale managed project/tier membership. | Implemented correctly | `ssn/users.py`, tests, live Quadro fixture groups | None for v1 managed users. |
 | Admin-exempt users in profile/site config. | Profiles define admins; Ansible creates admin group memberships. | Implemented partially | `profiles/*.yml`, `ssn_base` role | Wire admin exemptions into login confinement once implemented. |
-| User sync idempotence for managed fixtures. | Active/suspended fixture users remain functional after repeated install/sync rounds, but dry-run still reports reconciliation actions for existing fixtures instead of proving a fully empty no-op plan. | Implemented partially | live Quadro `ssn-sync-users --dry-run` output | Add state/current-system comparison so already-correct users/groups/keys/associations produce no planned changes. |
+| User sync idempotence for managed fixtures. | Active/suspended fixture users now compare current Unix lock/expiry state, groups, authorized keys, data/scratch directories, Slurm associations, and state file values before planning. Live dry-run is a clean no-op after apply; a deliberate fixture key drift planned only `sync_authorized_keys` and repaired cleanly. | Implemented correctly | `ssn/users.py`, `tests/test_users.py`, live Quadro sync and drift repair | Broaden the same current-state comparison UX for non-fixture adoption and future inactive lifecycle states. |
 | Staged state-machine reconciliation and resumable repair. | Basic state file update, backups, and validation pre-scan exist; no true staged/resumable state machine. | Yet to be implemented | `ssn/users.py` | Implement resumable user/group/Slurm/archive reconciliation. |
 | Tier templates and per-user overrides. | Tier templates exist. Override validation detects overlapping active fields, but overrides are not applied to associations/limits. | Implemented partially | `policies/tiers.yml`, `ssn/users.py` | Implement override resolution, expiry reconcile, and enforcement. |
 | Suspended lifecycle blocks login/Slurm and kills jobs. | Apply locks the Unix account, removes the default Slurm association, and runs `scancel`; live test killed a pending fixture job and blocked new submissions. PAM/login denial is basic account lock only. | Implemented differently | `ssn/users.py`, live Quadro suspended fixture | Add complete PAM/login denial validation and decide whether association removal is the final Slurm-disable mechanism. |
@@ -175,13 +179,13 @@ docs.
 | Optional `/home`, `/data`, `/scratch` per profile. | Implemented policies for no-scratch and three-area layouts. | Implemented correctly | `policies/storage.yml`, profiles | None. |
 | `/home` persistent path. | Installer allows `/home` to be a directory on `/` for the test host. | Implemented differently | `ssn/install.py` | Document this as an allowed dev/test compromise. |
 | RAID0 `/data` persistent but not durable, external backup required. | Policy records it; enforcement/acknowledgment is not active. | Yet to be implemented | `policies/storage.yml` | Add validation requiring site acknowledgment for nondurable data. |
-| Admins provision filesystems; automation verifies mounts. | Installer/verify checks `/data` and `/scratch` mounts for scratch profiles. | Implemented correctly | `ssn/install.py`, `ssn/cli.py`, storage role | Add filesystem type/free-space/quota checks. |
-| Quota-managed home/data/scratch and quota capability validation. | Quota values are policy-only; no quota enforcement. | Yet to be implemented | `policies/storage.yml` | Implement quota detection and enforcement. |
+| Admins provision filesystems; automation verifies mounts. | Installer/verify checks `/data` and `/scratch` mounts for scratch profiles; quota capability reporting now records command and active user-quota availability for `/data` and `/scratch`. | Implemented correctly | `ssn/install.py`, `ssn/cli.py`, `ssn/storage.py`, storage role | Add deeper filesystem type/free-space thresholds if needed. |
+| Quota-managed home/data/scratch and quota capability validation. | Quota capability detection exists, and `ssn-sync-users --apply-fixture-quotas` can apply limits only for `ssn-test-*` users when user quotas are already active. Live Quadro had no active user quotas, so fixture quota apply skipped without remounting or editing `/etc/fstab`. Production quota enforcement is not implemented. | Implemented partially | `ssn/storage.py`, `ssn/cli.py`, `tests/test_storage.py`, live Quadro quota report/apply skip | Implement production quota enablement/enforcement after explicit mount/quota policy signoff. |
 | `/data` and `/scratch` capacity isolation. | Policy-only. | Yet to be implemented | `policies/storage.yml` | Validate separate filesystems/LVs/project quotas. |
 | Create `/data/$USER`, `/scratch/$USER/cache`, `/scratch/$USER/tmp`. | User sync apply creates data and scratch user directories. | Implemented correctly | `ssn/users.py` | Add quota assignment and ownership repair checks. |
-| Per-job scratch via root Prolog/Epilog and TaskProlog exports temp vars. | Implemented and live-tested. | Implemented correctly | prolog/epilog/task-prolog templates, live job output | Add runtime failure health-state logic. |
-| Scratch-required profiles block jobs until scratch healthy. | Installer/Ansible preflight checks mount and writeability; no persistent unhealthy marker/gate exists. | Implemented partially | `ssn/install.py`, storage role | Add scratch health state and submit/apply gating. |
-| Scratch cleanup deletes eligible aged files, excluding job scratch. | Report-only timer and command exist; deletion intentionally not implemented. | Implemented differently | `ssn-scratch-cleanup`, storage role | Add reviewed deletion mode when ready. |
+| Per-job scratch via root Prolog/Epilog and TaskProlog exports temp vars. | Implemented and live-tested. Prolog now marks scratch unhealthy on failure where practical. | Implemented correctly | prolog/epilog/task-prolog templates, live job output | Keep adding failure-mode coverage. |
+| Scratch-required profiles block jobs until scratch healthy. | `ssn-scratch-health` writes a health report and `/run/slurm-single-node/scratch-unhealthy` marker; `job_submit.lua` rejects new scratch-dependent jobs while the marker exists. Live chmod drift of `/scratch/ssn-test-standard/tmp` produced an unhealthy marker, blocked submission, then restored cleanly. | Implemented correctly | `ssn/storage.py`, `ssn/cli.py`, `job_submit.lua.j2`, live Quadro scratch health test | Add apply/install integration for automatic health checks before service changes if desired. |
+| Scratch cleanup deletes eligible aged files, excluding job scratch. | Production cleanup remains report-only. Fixture-only deletion is implemented for reviewed tokenized reports containing top-level `/scratch/ssn-test-*` candidates; live deletion removed only `/scratch/ssn-test-cleanup-live`, and token reuse/mismatch failed. | Implemented differently | `ssn/storage.py`, `ssn-scratch-cleanup`, live Quadro cleanup token test | Add production deletion mode only after broader cleanup policy signoff. |
 
 ## Cache Policy
 
@@ -189,8 +193,8 @@ docs.
 |---|---|---|---|---|
 | Broad-dev cache requires scratch. | Resolver validates scratch requirement. | Implemented correctly | `ssn/config.py`, `policies/cache.yml` | None. |
 | Core scratch/persistent/home cache env map. | Policy contains locked env map. | Implemented correctly | `policies/cache.yml` | None. |
-| Inject cache defaults into login shells and Slurm jobs. | `/etc/profile.d` injects shell defaults. Slurm batch inheritance works if environment is exported from login, but there is no dedicated Slurm-wide env injection. | Implemented partially | `ssn-profile.sh.j2` | Add Slurm job default injection independent of login shell provenance. |
-| User-provided values override managed defaults. | Shell template only exports when variable is empty. | Implemented correctly | `ssn-profile.sh.j2` | Confirm behavior under non-login `sbatch`. |
+| Inject cache defaults into login shells and Slurm jobs. | `/etc/profile.d` injects shell defaults, and TaskProlog now emits Slurm job defaults independently of login-shell inheritance. Live `sbatch --export=NONE` received scratch, persistent, and home-config defaults. | Implemented correctly | `ssn-profile.sh.j2`, `ssn-job-env-task-prolog.j2`, live Quadro env job | Add more framework-specific env checks if needed. |
+| User-provided values override managed defaults. | Shell and TaskProlog templates only export managed defaults when variables are empty. | Implemented correctly | `ssn-profile.sh.j2`, `ssn-job-env-task-prolog.j2` | Add a live explicit-env override test later. |
 | TaskProlog overrides job temp vars to per-job scratch. | Implemented. | Implemented correctly | `ssn-job-env-task-prolog.j2` | None. |
 | No default Matplotlib env override. | No `MPLCONFIGDIR` in cache policy. | Implemented correctly | `policies/cache.yml` | None. |
 
@@ -234,8 +238,8 @@ docs.
 | Profile binding shape with services, admins, operations. | Profiles match the broad shape. | Implemented correctly | `profiles/*.yml` | Add strict schema and migrations. |
 | `policies/slurm-core.yml` shape. | Policy exists and drives render. | Implemented correctly | `policies/slurm-core.yml`, templates | Add validation for unsupported fields. |
 | `policies/tiers.yml` shape. | Policy exists and drives QoS/rendered tiers. | Implemented correctly | `policies/tiers.yml`, `ssn/config.py` | Add tests for all tier variants. |
-| `policies/storage.yml` shape. | Policy exists; only directory/scratch basics are active. | Implemented partially | `policies/storage.yml`, storage role | Implement quotas/archive/cleanup apply. |
-| `policies/cache.yml` shape. | Policy exists and is partially injected. | Implemented partially | `policies/cache.yml`, `ssn-profile.sh.j2` | Add Slurm-independent job env defaults. |
+| `policies/storage.yml` shape. | Policy exists; directory creation, per-job scratch, scratch health marker gating, quota capability reporting, and fixture-only cleanup apply are active. Archive, production quota enforcement, and production cleanup deletion remain incomplete. | Implemented partially | `policies/storage.yml`, `ssn/storage.py`, storage role | Implement archive workflows and production quota/cleanup enforcement after policy signoff. |
+| `policies/cache.yml` shape. | Policy exists and is injected into login shells and Slurm jobs as defaults. | Implemented correctly | `policies/cache.yml`, `ssn-profile.sh.j2`, `ssn-job-env-task-prolog.j2`, live `--export=NONE` job | Add profile-specific cache extensions only when needed. |
 | `policies/modules.yml` shape. | Policy exists; roots only. | Implemented partially | `policies/modules.yml`, modules role | Implement module/CUDA behavior. |
 | `policies/login.yml` shape. | Policy exists; only conservative limits/banner are active. | Implemented partially | `policies/login.yml`, user policy role | Implement systemd/PAM/cgroup enforcement. |
 
@@ -257,8 +261,8 @@ docs.
 | Live apply refuses changes while jobs are running unless force/drain. | `ssn-install` and `ssn-apply --run` refuse when `squeue` has queued jobs unless `--force --plan-token` is supplied, or `--drain` successfully drains the node and waits for active jobs to clear. `--check` remains allowed without a token. | Implemented correctly | `ssn/install.py`, `ssn/cli.py`, `ssn/ops.py`, live Quadro queued-job refusal, force token, drain success, drain timeout, and drained install tests | Add a richer drain/hold workflow only if future multi-node or recovery needs demand it. |
 | Resumable apply/sync workflows. | Partial user state update exists; install reports phases. Not truly resumable. | Yet to be implemented | `ssn/install.py`, `ssn/users.py` | Add staged reconciliation and repair plans. |
 | GPU verification tests include login denial and Slurm GPU access. | Slurm GPU job access live-tested. Login denial not implemented/tested. | Yet to be implemented | live Quadro smoke, no denial role | Add full GPU verification suite. |
-| Scratch-unhealthy, archive, hook, tombstone tests. | Scratch happy path and per-job cleanup were live-tested; unhealthy/archive/tombstone tests absent. | Yet to be implemented | tests, live notes | Add targeted integration tests. |
-| Static tests. | Unit tests, compileall, shell syntax, render checks, `git diff --check`, and remote static tests pass. Schema tests now include missing required fields, wrong primitive/container types, invalid policy domains, invalid `REVIEW_REQUIRED` placement, capability gates, and drain wait timeout behavior. | Implemented correctly | `tests/`, live session notes | Add CI entrypoint when repo is ready. |
+| Scratch-unhealthy, archive, hook, tombstone tests. | Scratch happy path, per-job cleanup, and unhealthy marker/job rejection were live-tested. Archive, hook, and tombstone tests remain absent. | Implemented partially | `ssn/storage.py`, live Quadro scratch health test | Add archive/hook/tombstone integration tests with inactive lifecycle. |
+| Static tests. | Unit tests, compileall, shell syntax, render checks, `git diff --check`, and remote static tests pass. Tests now include schema validation, capability gates, drain wait timeout behavior, user-sync idempotence, quota report safety, scratch health, cleanup operation hashes, and fixture cleanup safety. | Implemented correctly | `tests/`, live session notes | Add CI entrypoint when repo is ready. |
 
 ## Implemented Extra
 
@@ -270,6 +274,9 @@ docs.
 | Single-command installer smoke-user association setup. | Installer can create/update smoke user Slurm association for tests. | `ssn/install.py` | Keep; make clear it is test/smoke behavior. |
 | Automated install smoke rejection tests. | Installer tests over CPU, over GPU, and `--no-requeue`. | `ssn/install.py`, live Quadro notes | Expand to RAM/walltime/preemption. |
 | `ssn-scratch-cleanup` report-only command. | Added with service/timer integration. | `ssn/cli.py`, `bin/ssn-scratch-cleanup` | Convert to reviewed deletion mode later. |
+| `ssn-scratch-health` command. | Added for scratch health reports and unhealthy marker management; live tests verified healthy, unhealthy, submission block, and recovery paths. | `ssn/storage.py`, `bin/ssn-scratch-health`, live Quadro scratch health test | Keep; extend to install/apply preflight if desired. |
+| Fixture-only scratch cleanup deletion. | Reviewed tokenized reports can delete only top-level `/scratch/ssn-test-*` candidates; live test deleted a fixture path and rejected token reuse/mismatch. | `ssn/storage.py`, `ssn-scratch-cleanup`, live Quadro cleanup test | Keep scoped to fixtures until production deletion is explicitly approved. |
+| Fixture quota apply skip path. | `ssn-sync-users --apply-fixture-quotas` reports skipped fixture quotas when user quotas are not already active, without remounting or editing `/etc/fstab`. | `ssn/storage.py`, live Quadro quota report | Keep; production quota enforcement remains future work. |
 | Managed fixture users on Quadro. | `ssn-test-standard`, `ssn-test-priority`, and `ssn-test-suspended` remain on the test host for repeat sync/idempotence tests. | live Quadro users.yml/state | Keep as disposable test fixtures; do not treat as production users. |
 | Report-only retention helpers. | Plan and user-backup retention candidates are reported without deleting files. | `ssn/safety.py`, `ssn/install.py`, `ssn/cli.py` | Convert to approved deletion only after policy signoff. |
 | `ssn-plan-token` risk-token helper. | Added as an admin command for creating reviewed, short-lived tokens from install/apply reports. | `bin/ssn-plan-token`, `ssn/ops.py`, `ssn/cli.py`, live Quadro token test | Extend beyond queued-job risk as future risky workflows are implemented. |
@@ -280,7 +287,7 @@ docs.
 ### Priority 1: Safety And Correctness Gates
 
 - Extend the queued-job token pattern to all future risky operations, especially
-  inactive pruning/archive and retention deletion.
+  inactive pruning/archive and production retention deletion.
 - Deepen capability gates for Slurm submit-plugin support, MariaDB access
   modes, Lua plugin compatibility, NVML/CUDA ordering, MIG/MPS/shared GPU
   detection, and package/runtime compatibility.
@@ -290,15 +297,15 @@ docs.
 
 ### Priority 2: User And Storage Foundations
 
-- Broaden user sync adoption UX and conflict validation beyond the current v1
-  foundation.
-- Make user-sync dry-runs truly idempotent by comparing desired state with the
-  current Unix/group/SSH/Slurm state before planning actions.
-- Implement quota detection and quota assignment for `/home`, `/data`, and
-  `/scratch`.
-- Implement Slurm-independent cache/default env injection for jobs.
-- Turn scratch cleanup from report-only into reviewed deletion mode.
-- Add scratch health state so scratch-dependent jobs are blocked when unhealthy.
+- Broaden user sync adoption UX and conflict validation beyond the current
+  managed-fixture foundation.
+- Implement production quota enablement/enforcement for `/home`, `/data`, and
+  `/scratch` after mount/quota policy signoff.
+- Decide whether `/data` nondurable-storage acknowledgment should become an
+  install/apply gate.
+- Turn scratch cleanup from fixture-only reviewed deletion into a production
+  reviewed deletion mode, if approved.
+- Add install/apply preflight integration for scratch health checks if desired.
 
 ### Priority 3: Login And GPU Isolation
 

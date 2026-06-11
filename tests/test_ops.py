@@ -74,6 +74,28 @@ class PlanTokenTests(unittest.TestCase):
                     mark_used=False,
                 )
 
+    def test_plan_token_is_bound_to_operation_hash_when_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plan = self._write_report(root, command="scratch-cleanup", risk="fixture_scratch_cleanup", operation_hash="one")
+            store = root / "tokens"
+            token, _ = create_plan_token(
+                plan,
+                risk="fixture_scratch_cleanup",
+                reason="unit test",
+                store_root=store,
+            )
+            report = json.loads(plan.read_text())
+            report["operation_hash"] = "two"
+            with self.assertRaisesRegex(ValueError, "not bound"):
+                validate_plan_token(
+                    token,
+                    report,
+                    risk="fixture_scratch_cleanup",
+                    store_root=store,
+                    mark_used=False,
+                )
+
     def test_plan_token_expiry_is_enforced(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

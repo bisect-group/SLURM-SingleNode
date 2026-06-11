@@ -25,6 +25,11 @@ ProctrackType=proctrack/cgroup
 TaskPlugin=task/cgroup,task/affinity
 
 JobSubmitPlugins=lua
+{% if ssn.resolved_policies.storage.job_scratch.implementation | default('disabled') == 'prolog_epilog' %}
+Prolog=/etc/slurm/prolog.d/ssn-job-scratch
+Epilog=/etc/slurm/epilog.d/ssn-job-scratch
+TaskProlog=/etc/slurm/task-prolog.d/ssn-job-env
+{% endif %}
 SchedulerType=sched/backfill
 SelectType={{ ssn.resolved_policies.slurm_core.select.type }}
 SelectTypeParameters={{ ssn.resolved_policies.slurm_core.select.parameters }}
@@ -64,7 +69,7 @@ MaxArraySize=1000
 
 {% if ssn.derived.has_gpus %}
 GresTypes=gpu
-NodeName={{ ssn.identity.node_name }} CPUs={{ ssn.derived.cpus_allocatable }} RealMemory={{ ssn.derived.memory_allocatable_mb }} Gres=gpu:{{ ssn.hardware.gpu_type }}:{{ ssn.hardware.gpus }} State=UNKNOWN
+NodeName={{ ssn.identity.node_name }} CPUs={{ ssn.derived.cpus_allocatable }} RealMemory={{ ssn.derived.memory_allocatable_mb }} Gres=gpu{% if ssn.hardware.gpu_type %}:{{ ssn.hardware.gpu_type }}{% endif %}:{{ ssn.hardware.gpus }} State=UNKNOWN
 {% else %}
 NodeName={{ ssn.identity.node_name }} CPUs={{ ssn.derived.cpus_allocatable }} RealMemory={{ ssn.derived.memory_allocatable_mb }} State=UNKNOWN
 {% endif %}

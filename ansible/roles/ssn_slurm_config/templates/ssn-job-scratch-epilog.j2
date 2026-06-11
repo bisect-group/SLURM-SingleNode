@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Managed by Slurm Single-Node.
+set -euo pipefail
+
+root="{{ ssn.resolved_policies.storage.job_scratch.root }}"
+job_id="${SLURM_JOB_ID:-}"
+
+case "$root" in
+    /scratch/jobs) ;;
+    *) echo "SSN refusing unsafe job scratch root: $root" >&2; exit 1 ;;
+esac
+
+case "$job_id" in
+    ''|*[!0-9_]* ) echo "SSN refusing unsafe job id for scratch: $job_id" >&2; exit 1 ;;
+esac
+
+job_dir="$root/$job_id"
+case "$job_dir" in
+    "$root"/*) ;;
+    *) echo "SSN refusing unsafe job scratch path: $job_dir" >&2; exit 1 ;;
+esac
+
+if [ -d "$job_dir" ] && [ ! -L "$job_dir" ]; then
+    rm -rf --one-file-system "$job_dir"
+fi
+
+exit 0

@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Managed by Slurm Single-Node.
+set -euo pipefail
+
+root="{{ ssn.resolved_policies.storage.job_scratch.root }}"
+job_id="${SLURM_JOB_ID:-}"
+
+case "$root" in
+    /scratch/jobs) ;;
+    *) exit 0 ;;
+esac
+
+case "$job_id" in
+    ''|*[!0-9_]* ) exit 0 ;;
+esac
+
+job_dir="$root/$job_id"
+if [ -d "$job_dir" ] && [ ! -L "$job_dir" ]; then
+    echo "export SLURM_TMPDIR=$job_dir"
+    echo "export TMPDIR=$job_dir"
+    echo "export TMP=$job_dir"
+    echo "export TEMP=$job_dir"
+fi

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import os
 import shutil
 import subprocess
@@ -64,64 +65,93 @@ class Installer:
         self.stamp = dt.datetime.now().strftime("%Y%m%d%H%M%S")
         self.log_file = self._log_path()
         self.log_file.parent.mkdir(parents=True, exist_ok=True)
+        self.report: dict[str, Any] = {
+            "schema_version": 1,
+            "install_id": f"install-{self.stamp}",
+            "profile": args.profile,
+            "repo": str(self.root),
+            "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "phases": [],
+            "status": "running",
+            "log_file": str(self.log_file),
+        }
+        self.report_file: Path | None = None
 
     def run(self) -> int:
-        self._reexec_with_sudo_if_needed()
-        self._banner()
-        resolved = self._phase_preflight()
-        packages = self._select_packages(resolved)
-        missing_packages = [pkg for pkg in packages if not self._package_installed(pkg)]
+        try:
+            self._reexec_with_sudo_if_needed()
+            self._banner()
+            self.report_file = self._render_dir().parent / "install-report.json"
+            resolved = self._phase_preflight()
+            packages = self._select_packages(resolved)
+            missing_packages = [pkg for pkg in packages if not self._package_installed(pkg)]
+            self._record_phase("preflight", "ok", {"missing_packages": missing_packages})
 
-        if missing_packages:
-            self._prompt(
-                "Install missing OS packages with apt: "
-                + ", ".join(missing_packages)
-            )
+            if missing_packages:
+                self._prompt(
+                    "Install missing OS packages with apt: "
+                    + ", ".join(missing_packages)
+                )
+                if not self.args.dry_run:
+                    self._run(["apt-get", "update"])
+                    self._run(["apt-get", "install", "-y", *missing_packages])
+            else:
+                self._log("All required OS packages already appear installed.")
+
+            output_dir = self._render_dir()
+            self._log(f"Rendering profile artifacts into {output_dir}")
+            resolved = render_profile(self.args.profile, output_dir, self.root)
+            self._log(summary_text(resolved).rstrip())
+            self._log(f"Config hash: {config_hash(resolved)}")
+            self.report["config_hash"] = config_hash(resolved)
+            self.report["rendered_dir"] = str(output_dir)
+            self._record_phase("render", "ok", {"output_dir": str(output_dir)})
+            self._write_report()
+
+            self._backup_existing_managed_files()
+            self._prompt_for_missing_directories(resolved)
+
+            ansible_cmd = [
+                "ansible-playbook",
+                "-i",
+                str(self.root / "ansible" / "inventories" / "local.ini"),
+                str(self.root / "ansible" / "site.yml"),
+                "-e",
+                f"@{output_dir / 'ansible-vars.json'}",
+            ]
+            self._run_ansible_syntax_check(output_dir)
+            if self.args.check:
+                ansible_cmd.append("--check")
+            self._log("Ansible command: " + " ".join(ansible_cmd))
             if not self.args.dry_run:
-                self._run(["apt-get", "update"])
-                self._run(["apt-get", "install", "-y", *missing_packages])
-        else:
-            self._log("All required OS packages already appear installed.")
+                self._run(ansible_cmd)
+                self._record_phase("apply", "ok", {})
 
-        output_dir = self._render_dir()
-        self._log(f"Rendering profile artifacts into {output_dir}")
-        if not self.args.dry_run:
-            resolved = render_profile(self.args.profile, output_dir, self.root)
-        else:
-            resolved = render_profile(self.args.profile, output_dir, self.root)
-        self._log(summary_text(resolved).rstrip())
-        self._log(f"Config hash: {config_hash(resolved)}")
+            if self.args.dry_run:
+                self._log("Dry run completed; skipping Ansible apply and smoke tests.")
+            elif self.args.check:
+                self._log("Check mode completed; skipping smoke tests.")
+            elif not self.args.skip_smoke:
+                self._phase_verify_and_smoke(resolved, output_dir)
+                self._record_phase("verify", "ok", {})
 
-        self._backup_existing_managed_files()
-        self._prompt_for_missing_directories(resolved)
-
-        ansible_cmd = [
-            "ansible-playbook",
-            "-i",
-            str(self.root / "ansible" / "inventories" / "local.ini"),
-            str(self.root / "ansible" / "site.yml"),
-            "-e",
-            f"@{output_dir / 'ansible-vars.json'}",
-        ]
-        if self.args.check:
-            ansible_cmd.append("--check")
-        self._log("Ansible command: " + " ".join(ansible_cmd))
-        if not self.args.dry_run:
-            self._run(ansible_cmd)
-
-        if self.args.dry_run:
-            self._log("Dry run completed; skipping Ansible apply and smoke tests.")
-        elif self.args.check:
-            self._log("Check mode completed; skipping smoke tests.")
-        elif not self.args.skip_smoke:
-            self._phase_verify_and_smoke(resolved, output_dir)
-
-        self._log(f"Install log: {self.log_file}")
-        self._log(
-            "Retry command: sudo ./bin/ssn-install "
-            f"--profile {self.args.profile}"
-        )
-        return 0
+            self.report["status"] = "ok"
+            self.report["finished_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+            self._write_report()
+            self._log(f"Install log: {self.log_file}")
+            if self.report_file:
+                self._log(f"Install report: {self.report_file}")
+            self._log(
+                "Retry command: sudo ./bin/ssn-install "
+                f"--profile {self.args.profile}"
+            )
+            return 0
+        except Exception as exc:
+            self.report["status"] = "failed"
+            self.report["error"] = str(exc)
+            self.report["finished_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+            self._write_report()
+            raise
 
     def _phase_preflight(self) -> dict[str, Any]:
         self._log("== preflight ==")
@@ -150,6 +180,7 @@ class Installer:
         else:
             self._log("CPU-only profile selected; no GPU GRES/TRES will be rendered.")
         self._validate_profile_matches_host(resolved)
+        self._validate_required_mounts(resolved)
         return resolved
 
     def _validate_profile_matches_host(self, resolved: dict[str, Any]) -> None:
@@ -176,6 +207,37 @@ class Installer:
                 f"profile memory values exceed host memory: profile total={profile_mem}MB, "
                 f"allocatable={alloc_mem}MB, host={actual_mem}MB"
             )
+        if resolved["derived"]["has_gpus"]:
+            expected = int(resolved["hardware"]["gpus"])
+            gpu_lines = self._command_stdout([
+                "nvidia-smi",
+                "--query-gpu=index,name,uuid",
+                "--format=csv,noheader",
+            ])
+            if gpu_lines is None:
+                raise RuntimeError("GPU profile selected, but nvidia-smi is unavailable or failing")
+            actual = len([line for line in gpu_lines.splitlines() if line.strip()])
+            if actual != expected:
+                raise RuntimeError(f"profile GPU count={expected} does not match nvidia-smi count={actual}")
+            for index in range(expected):
+                device = Path(f"/dev/nvidia{index}")
+                if not device.exists():
+                    raise RuntimeError(f"profile expects GPU device {device}, but it is missing")
+
+    def _validate_required_mounts(self, resolved: dict[str, Any]) -> None:
+        storage = resolved["resolved_policies"]["storage"]
+        paths = resolved["derived"].get("paths") or {}
+        require_mounts = bool(storage.get("quotas", {}).get("fail_if_unavailable"))
+        require_mounts = require_mounts or bool(storage.get("job_scratch", {}).get("required_for_jobs"))
+        if not require_mounts:
+            return
+        missing = []
+        for key in ("data", "scratch"):
+            path = paths.get(key)
+            if path and not self._findmnt(path):
+                missing.append(f"{key}={path}")
+        if missing:
+            raise RuntimeError("profile requires mounted storage paths, but these are not mounted: " + ", ".join(missing))
 
     def _select_packages(self, resolved: dict[str, Any]) -> list[str]:
         packages = [*BOOTSTRAP_PACKAGES, *RUNTIME_PACKAGES]
@@ -247,6 +309,9 @@ class Installer:
         ]
         self._run(verify_cmd)
         self._run(["sinfo", "-o", "%N %P %t %G"])
+        if resolved["derived"]["has_gpus"]:
+            self._run(["scontrol", "show", "node", resolved["identity"]["node_name"]], check=False)
+            self._run(["nvidia-smi", "--query-gpu=index,name,uuid", "--format=csv,noheader"])
         self._run(["sacctmgr", "-nP", "show", "qos", "format=name,priority,maxtresperjob,maxjobsperuser,maxsubmitjobsperuser"])
         self._run_smoke_jobs(resolved)
 
@@ -335,18 +400,21 @@ class Installer:
             ],
             "over-tier CPU request",
         )
-        self._expect_submit_failure(
-            smoke_user,
-            [
-                "sbatch",
-                "--parsable",
-                f"--qos={tier['qos']}",
-                "--gres=gpu:1",
-                "--time=00:02:00",
-                "--wrap=true",
-            ],
-            "GPU request on CPU-only profile",
-        )
+        if resolved["derived"]["has_gpus"]:
+            self._run_gpu_smoke(smoke_user, tier, smoke_dir)
+        else:
+            self._expect_submit_failure(
+                smoke_user,
+                [
+                    "sbatch",
+                    "--parsable",
+                    f"--qos={tier['qos']}",
+                    "--gres=gpu:1",
+                    "--time=00:02:00",
+                    "--wrap=true",
+                ],
+                "GPU request on CPU-only profile",
+            )
         self._expect_submit_failure(
             smoke_user,
             [
@@ -358,6 +426,35 @@ class Installer:
                 "--wrap=true",
             ],
             "--no-requeue request",
+        )
+
+    def _run_gpu_smoke(self, smoke_user: str, tier: dict[str, Any], smoke_dir: Path) -> None:
+        submit = [
+            "sbatch",
+            "--parsable",
+            f"--qos={tier['qos']}",
+            "--gres=gpu:1",
+            "--cpus-per-task=1",
+            "--mem=128M",
+            "--time=00:02:00",
+            f"--output={smoke_dir}/gpu-%j.out",
+            "--wrap=nvidia-smi --query-gpu=index,name --format=csv,noheader",
+        ]
+        job = self._run_as_user(smoke_user, submit).strip().splitlines()[-1]
+        job_id = job.split(";")[0]
+        self._log(f"GPU smoke job submitted as {smoke_user}: {job_id}")
+        self._wait_for_job_done(job_id)
+        self._expect_submit_failure(
+            smoke_user,
+            [
+                "sbatch",
+                "--parsable",
+                f"--qos={tier['qos']}",
+                "--gres=gpu:2",
+                "--time=00:02:00",
+                "--wrap=true",
+            ],
+            "over-GPU request",
         )
 
     def _wait_for_job_done(self, job_id: str) -> None:
@@ -417,6 +514,22 @@ class Installer:
             raise RuntimeError(f"command failed with rc={rc}: {' '.join(cmd)}")
         return "".join(output_parts)
 
+    def _run_ansible_syntax_check(self, output_dir: Path) -> None:
+        if shutil.which("ansible-playbook") is None:
+            self._log("ansible-playbook is not installed yet; skipping syntax check before bootstrap apply.")
+            return
+        cmd = [
+            "ansible-playbook",
+            "-i",
+            str(self.root / "ansible" / "inventories" / "local.ini"),
+            str(self.root / "ansible" / "site.yml"),
+            "-e",
+            f"@{output_dir / 'ansible-vars.json'}",
+            "--syntax-check",
+        ]
+        self._run(cmd)
+        self._record_phase("ansible_syntax", "ok", {})
+
     def _prompt(self, message: str) -> None:
         if self.args.yes:
             self._log(f"AUTO-YES: {message}")
@@ -471,6 +584,20 @@ class Installer:
         with self.log_file.open("a") as handle:
             handle.write(text)
 
+    def _record_phase(self, name: str, status: str, detail: dict[str, Any]) -> None:
+        self.report["phases"].append({
+            "name": name,
+            "status": status,
+            "detail": detail,
+            "time": dt.datetime.now(dt.timezone.utc).isoformat(),
+        })
+
+    def _write_report(self) -> None:
+        if self.report_file is None:
+            return
+        self.report_file.parent.mkdir(parents=True, exist_ok=True)
+        self.report_file.write_text(json.dumps(self.report, indent=2, sort_keys=True) + "\n")
+
     def _package_installed(self, package: str) -> bool:
         return subprocess.run(
             ["dpkg-query", "-W", "-f=${Status}", package],
@@ -498,6 +625,9 @@ class Installer:
     def _systemctl(self, action: str, service: str) -> str:
         out = self._command_stdout(["systemctl", action, service])
         return out or "unknown"
+
+    def _findmnt(self, path: str) -> str | None:
+        return self._command_stdout(["findmnt", "-no", "TARGET,SOURCE,FSTYPE,OPTIONS", path])
 
     def _os_pretty_name(self) -> str:
         path = Path("/etc/os-release")

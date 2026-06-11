@@ -50,6 +50,10 @@ class RepoPaths:
 
 
 def repo_root(start: str | Path | None = None) -> Path:
+    if start is None and os.environ.get("SSN_REPO"):
+        candidate = Path(os.environ["SSN_REPO"]).resolve()
+        if (candidate / "profiles").exists() and (candidate / "policies").exists():
+            return candidate
     current = Path(start or os.getcwd()).resolve()
     for candidate in (current, *current.parents):
         if (candidate / "docs" / "decisions.md").exists() and (candidate / "tesla-scheduler-v2").exists():
@@ -118,7 +122,7 @@ def resolve_profile(
     if missing and not allow_review_required:
         joined = "\n  - ".join(missing)
         raise ValueError(f"profile contains REVIEW_REQUIRED values:\n  - {joined}")
-    derive(resolved)
+    derive(resolved, allow_review_required=allow_review_required)
     validate_resolved(resolved, allow_review_required=allow_review_required)
     return resolved
 
@@ -145,7 +149,7 @@ def apply_profile_defaults_to_policies(resolved: dict[str, Any]) -> None:
             slurm_memory[key] = memory_defaults[key]
 
 
-def derive(resolved: dict[str, Any]) -> None:
+def derive(resolved: dict[str, Any], *, allow_review_required: bool = False) -> None:
     identity = resolved["identity"]
     hardware = resolved["hardware"]
     policies = resolved["resolved_policies"]
@@ -156,9 +160,9 @@ def derive(resolved: dict[str, Any]) -> None:
     preemption = tiers_policy["preemption"]
     has_gpus = int(hardware.get("gpus") or 0) > 0 if hardware.get("gpus") != REVIEW_REQUIRED else True
 
-    cpus_allocatable = int(hardware["cpus_allocatable"])
-    memory_allocatable_mb = memory_to_mb(hardware["memory_allocatable"])
-    memory_total_mb = memory_to_mb(hardware["memory_total"])
+    cpus_allocatable = _reviewable_int(hardware["cpus_allocatable"], allow_review_required)
+    memory_allocatable_mb = _reviewable_memory_mb(hardware["memory_allocatable"], allow_review_required)
+    memory_total_mb = _reviewable_memory_mb(hardware["memory_total"], allow_review_required)
     default_time = _first_tier_value(tiers_policy, "default_walltime")
     max_time = max(duration_to_seconds(t["max_walltime"]) for t in tiers_policy["tiers"].values())
     qos_prefix = identity.get("group_prefix", "ssn")
@@ -167,14 +171,14 @@ def derive(resolved: dict[str, Any]) -> None:
     for name, tier in tiers_policy["tiers"].items():
         max_gpus = tier.get("max_gpus_per_job")
         if max_gpus == "all":
-            max_gpus = int(hardware.get("gpus") or 0)
+            max_gpus = _reviewable_int(hardware.get("gpus") or 0, allow_review_required)
         mem_mb = int(memory_allocatable_mb * int(tier["memory_percent"]) / 100)
         rendered_tiers.append(
             {
                 "name": name,
                 "qos": f"{qos_prefix}-{name}",
                 "group": f"{qos_prefix}-tier-{name}",
-                "max_cpus_per_job": int(tier["max_cpus_per_job"]),
+                "max_cpus_per_job": _reviewable_int(tier["max_cpus_per_job"], allow_review_required),
                 "max_gpus_per_job": None if max_gpus is None else int(max_gpus),
                 "max_running_jobs": int(tier["max_running_jobs"]),
                 "max_submitted_jobs": int(tier["max_submitted_jobs"]),
@@ -199,14 +203,17 @@ def derive(resolved: dict[str, Any]) -> None:
     if has_gpus:
         gpu_type = hardware["gpu_type"]
         affinity = hardware.get("gpu_affinity", {}).get("cores")
-        for gpu_index in range(int(hardware["gpus"])):
+        for gpu_index in range(_reviewable_int(hardware["gpus"], allow_review_required)):
             entry: dict[str, Any] = {
                 "name": "gpu",
-                "type": gpu_type,
                 "file": f"/dev/nvidia{gpu_index}",
             }
+            if gpu_type:
+                entry["type"] = gpu_type
             if isinstance(affinity, dict):
-                entry["cores"] = str(affinity.get(str(gpu_index), affinity.get(gpu_index, "")))
+                cores = affinity.get(str(gpu_index), affinity.get(gpu_index, ""))
+                if cores:
+                    entry["cores"] = str(cores)
             gres_entries.append(entry)
 
     resolved["derived"] = {
@@ -232,8 +239,8 @@ def derive(resolved: dict[str, Any]) -> None:
         "db_password_file": "/etc/slurm/slurmdbd-mysql.password",
         "db_host": "localhost",
         "slurmdbd_port": 6819,
-        "def_mem_per_cpu_mb": memory_to_mb(hardware["memory_defaults"]["def_mem_per_cpu"]),
-        "max_mem_per_cpu_mb": memory_to_mb(hardware["memory_defaults"]["max_mem_per_cpu"]),
+        "def_mem_per_cpu_mb": _reviewable_memory_mb(hardware["memory_defaults"]["def_mem_per_cpu"], allow_review_required),
+        "max_mem_per_cpu_mb": _reviewable_memory_mb(hardware["memory_defaults"]["max_mem_per_cpu"], allow_review_required),
         "priority": {
             "decay_half_life": fairshare["priority_decay_half_life"],
             "weight_fairshare": int(fairshare["priority_weight_fairshare"]),
@@ -268,6 +275,13 @@ def validate_resolved(resolved: dict[str, Any], *, allow_review_required: bool =
                 f"tier {tier['name']} max_cpus_per_job={tier['max_cpus_per_job']} "
                 f"exceeds allocatable CPUs={cpus_allocatable}"
             )
+        if resolved["derived"]["has_gpus"] and tier.get("max_gpus_per_job") is not None:
+            gpus = int(resolved["hardware"]["gpus"])
+            if int(tier["max_gpus_per_job"]) > gpus:
+                raise ValueError(
+                    f"tier {tier['name']} max_gpus_per_job={tier['max_gpus_per_job']} "
+                    f"exceeds configured GPUs={gpus}"
+                )
 
 
 def find_review_required(value: Any, path: str = "$") -> list[str]:
@@ -351,3 +365,15 @@ def _first_tier_value(tiers_policy: dict[str, Any], field: str) -> Any:
         return tiers_policy["tiers"][default][field]
     first = next(iter(tiers_policy["tiers"].values()))
     return first[field]
+
+
+def _reviewable_int(value: Any, allow_review_required: bool) -> int:
+    if value == REVIEW_REQUIRED and allow_review_required:
+        return 0
+    return int(value)
+
+
+def _reviewable_memory_mb(value: Any, allow_review_required: bool) -> int:
+    if value == REVIEW_REQUIRED and allow_review_required:
+        return 0
+    return memory_to_mb(value)

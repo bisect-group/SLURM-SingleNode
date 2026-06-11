@@ -51,6 +51,55 @@
     mode: "0644"
   notify: Restart slurmctld
 
+- name: Ensure Slurm prolog directories exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ ssn.derived.slurm_conf_dir }}/prolog.d"
+    - "{{ ssn.derived.slurm_conf_dir }}/epilog.d"
+    - "{{ ssn.derived.slurm_conf_dir }}/task-prolog.d"
+  when: ssn.resolved_policies.storage.job_scratch.implementation | default('disabled') == 'prolog_epilog'
+
+- name: Deploy job scratch prolog
+  ansible.builtin.template:
+    src: ssn-job-scratch-prolog.j2
+    dest: "{{ ssn.derived.slurm_conf_dir }}/prolog.d/ssn-job-scratch"
+    owner: root
+    group: root
+    mode: "0755"
+  notify:
+    - Restart slurmctld
+    - Restart slurmd
+  when: ssn.resolved_policies.storage.job_scratch.implementation | default('disabled') == 'prolog_epilog'
+
+- name: Deploy job scratch epilog
+  ansible.builtin.template:
+    src: ssn-job-scratch-epilog.j2
+    dest: "{{ ssn.derived.slurm_conf_dir }}/epilog.d/ssn-job-scratch"
+    owner: root
+    group: root
+    mode: "0755"
+  notify:
+    - Restart slurmctld
+    - Restart slurmd
+  when: ssn.resolved_policies.storage.job_scratch.implementation | default('disabled') == 'prolog_epilog'
+
+- name: Deploy job scratch task prolog
+  ansible.builtin.template:
+    src: ssn-job-env-task-prolog.j2
+    dest: "{{ ssn.derived.slurm_conf_dir }}/task-prolog.d/ssn-job-env"
+    owner: root
+    group: root
+    mode: "0755"
+  notify:
+    - Restart slurmctld
+    - Restart slurmd
+  when: ssn.resolved_policies.storage.job_scratch.implementation | default('disabled') == 'prolog_epilog'
+
 - name: Register Slurm cluster
   ansible.builtin.command: >
     sacctmgr -i add cluster {{ ssn.identity.cluster_name }}

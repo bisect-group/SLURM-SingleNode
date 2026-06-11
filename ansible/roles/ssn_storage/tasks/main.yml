@@ -14,18 +14,25 @@
   when:
     - ssn.resolved_policies.storage.quotas.fail_if_unavailable | default(false) | bool
     - item.item.value is not none
+    - item.item.key != "archive"
 
-- name: Ensure data and archive roots exist when configured
+- name: Ensure data root exists when configured
   ansible.builtin.file:
-    path: "{{ item }}"
+    path: "{{ ssn.derived.paths.data }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: ssn.derived.paths.data | default(None) is not none
+
+- name: Ensure archive root exists when configured
+  ansible.builtin.file:
+    path: "{{ ssn.derived.paths.archive }}"
     state: directory
     owner: root
     group: "{{ ssn.derived.admin_group }}"
     mode: "0750"
-  loop:
-    - "{{ ssn.derived.paths.data | default(None) }}"
-    - "{{ ssn.derived.paths.archive | default(None) }}"
-  when: item is not none
+  when: ssn.derived.paths.archive | default(None) is not none
 
 - name: Ensure scratch roots exist only when scratch policy is enabled
   ansible.builtin.file:
@@ -40,6 +47,78 @@
   when:
     - item is not none
     - ssn.resolved_policies.storage.job_scratch.required_for_jobs | default(false) | bool
+
+- name: Verify scratch root is a mount when required for jobs
+  ansible.builtin.command:
+    argv:
+      - findmnt
+      - -no
+      - TARGET
+      - "{{ ssn.derived.paths.scratch }}"
+  register: ssn_scratch_findmnt
+  changed_when: false
+  failed_when: ssn_scratch_findmnt.rc != 0
+  when:
+    - ssn.derived.paths.scratch | default(None) is not none
+    - ssn.resolved_policies.storage.job_scratch.required_for_jobs | default(false) | bool
+
+- name: Verify scratch root is writable
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/test
+      - -w
+      - "{{ ssn.derived.paths.scratch }}"
+  changed_when: false
+  when:
+    - ssn.derived.paths.scratch | default(None) is not none
+    - ssn.resolved_policies.storage.job_scratch.required_for_jobs | default(false) | bool
+
+- name: Install scratch cleanup report service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/ssn-scratch-cleanup.service
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Slurm Single-Node scratch cleanup report
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/ssn-scratch-cleanup --root {{ ssn.derived.paths.scratch }} --jobs-root {{ ssn.resolved_policies.storage.job_scratch.root }} --age-days {{ ssn.resolved_policies.storage.scratch_cleanup.age | regex_replace('d$', '') }} --report {{ ssn.derived.slurm_log_dir }}/scratch-cleanup.json
+  when:
+    - ssn.resolved_policies.storage.scratch_cleanup.implementation | default('disabled') == 'systemd-tmpfiles'
+    - ssn.derived.paths.scratch | default(None) is not none
+
+- name: Install scratch cleanup report timer
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/ssn-scratch-cleanup.timer
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Run Slurm Single-Node scratch cleanup report weekly
+
+      [Timer]
+      OnCalendar=weekly
+      Persistent=true
+
+      [Install]
+      WantedBy=timers.target
+  when:
+    - ssn.resolved_policies.storage.scratch_cleanup.implementation | default('disabled') == 'systemd-tmpfiles'
+    - ssn.derived.paths.scratch | default(None) is not none
+
+- name: Enable scratch cleanup report timer
+  ansible.builtin.systemd:
+    name: ssn-scratch-cleanup.timer
+    enabled: true
+    state: started
+    daemon_reload: true
+  when:
+    - ssn.resolved_policies.storage.scratch_cleanup.implementation | default('disabled') == 'systemd-tmpfiles'
+    - ssn.derived.paths.scratch | default(None) is not none
 
 - name: Report scratch disabled
   ansible.builtin.debug:

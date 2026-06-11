@@ -32,6 +32,7 @@
     - ssn-apply
     - ssn-sync-users
     - ssn-verify
+    - ssn-plan-token
     - ssn-archive-status
     - ssn-scratch-cleanup
 

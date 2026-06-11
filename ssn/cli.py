@@ -12,14 +12,17 @@ from pathlib import Path
 from typing import Any
 
 from .config import config_hash, render_profile, repo_root, resolve_profile, summary_text
+from .ops import create_plan_token, queued_jobs, validate_feature_gates, validate_plan_token, write_protected_json
 from .users import (
     action_dicts,
     apply_user_actions,
     backup_file,
+    backup_retention_report,
     discover_users,
     load_state,
     load_users,
     plan_user_sync,
+    validate_state,
     validate_users,
     write_users,
 )
@@ -42,6 +45,7 @@ def main(argv: list[str] | None = None, prog: str | None = None) -> int:
         "ssn-gpu-status": gpu_status_cmd,
         "ssn-archive-status": archive_status_cmd,
         "ssn-scratch-cleanup": scratch_cleanup_cmd,
+        "ssn-plan-token": plan_token_cmd,
     }
     if invoked in direct:
         return direct[invoked](argv)
@@ -56,6 +60,7 @@ def main(argv: list[str] | None = None, prog: str | None = None) -> int:
     sub.add_parser("gpu-status")
     sub.add_parser("archive-status")
     sub.add_parser("scratch-cleanup")
+    sub.add_parser("plan-token")
     ns, rest = parser.parse_known_args(argv)
     return {
         "render": render_cmd,
@@ -66,6 +71,7 @@ def main(argv: list[str] | None = None, prog: str | None = None) -> int:
         "gpu-status": gpu_status_cmd,
         "archive-status": archive_status_cmd,
         "scratch-cleanup": scratch_cleanup_cmd,
+        "plan-token": plan_token_cmd,
     }[ns.command](rest)
 
 
@@ -143,15 +149,44 @@ def apply_cmd(argv: list[str]) -> int:
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--check", action="store_true", help="run ansible in check mode")
     parser.add_argument("--run", action="store_true", help="actually invoke ansible-playbook")
+    parser.add_argument("--force", action="store_true", help="allow service-changing apply while Slurm jobs are queued")
+    parser.add_argument("--plan-token", default=None, help="reviewed token required with --force over risky operations")
     args = parser.parse_args(argv)
 
     root = repo_root(args.repo)
-    output = Path(args.output_dir or root / "build" / "rendered" / args.profile)
+    stamp = dt.datetime.now().strftime("%Y%m%d%H%M%S")
+    apply_id = f"apply-{stamp}"
+    if args.output_dir:
+        output = Path(args.output_dir).resolve()
+        plan_dir = output.parent
+    elif args.run and os.geteuid() == 0:
+        plan_dir = Path("/var/lib/slurm-single-node/plans") / apply_id
+        output = plan_dir / "rendered"
+    elif args.run:
+        plan_dir = Path("/tmp") / apply_id
+        output = plan_dir / "rendered"
+    else:
+        plan_dir = root / "build" / "plans" / apply_id
+        output = root / "build" / "rendered" / args.profile
+    report_file = plan_dir / "apply-report.json"
+    report: dict[str, Any] = {
+        "schema_version": 1,
+        "command": "apply",
+        "apply_id": apply_id,
+        "profile": args.profile,
+        "repo": str(root),
+        "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "status": "running",
+        "phases": [],
+    }
     try:
         resolved = render_profile(args.profile, output, root)
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
+    report["config_hash"] = config_hash(resolved)
+    report["rendered_dir"] = str(output)
+    admin_group = resolved.get("derived", {}).get("admin_group", "slurm_admins")
     ansible_vars = output / "ansible-vars.json"
     cmd = [
         "ansible-playbook",
@@ -170,10 +205,77 @@ def apply_cmd(argv: list[str]) -> int:
     if not args.run:
         print("Dry planning only. Re-run with --run to invoke ansible-playbook.")
         return 0
-    if shutil.which("ansible-playbook") is None:
-        print("ERROR: ansible-playbook is not installed.", file=sys.stderr)
+    try:
+        if shutil.which("ansible-playbook") is None:
+            raise RuntimeError("ansible-playbook is not installed")
+        if not args.check:
+            feature_errors = validate_feature_gates(resolved, mode="apply")
+            if feature_errors:
+                raise RuntimeError("feature gate failed: " + "; ".join(feature_errors))
+            report["phases"].append({"name": "feature_gates", "status": "ok", "time": dt.datetime.now(dt.timezone.utc).isoformat()})
+            jobs = queued_jobs()
+            if jobs:
+                report["blocked_jobs"] = jobs
+                report["risk"] = "queued_jobs"
+                if not args.force:
+                    raise RuntimeError(
+                        "refusing service-changing apply while Slurm has queued jobs; "
+                        "create a reviewed plan token, then re-run with --force --plan-token"
+                    )
+                if not args.plan_token:
+                    raise RuntimeError("queued jobs require --force plus --plan-token")
+                validate_plan_token(args.plan_token, report, risk="queued_jobs")
+                report["phases"].append({"name": "queued_job_token", "status": "ok", "time": dt.datetime.now(dt.timezone.utc).isoformat()})
+            else:
+                report["phases"].append({"name": "queued_job_gate", "status": "ok", "time": dt.datetime.now(dt.timezone.utc).isoformat()})
+        write_protected_json(report_file, report, group=admin_group)
+        rc = subprocess.call(cmd)
+        if rc != 0:
+            raise RuntimeError(f"ansible-playbook failed with rc={rc}")
+        report["status"] = "ok"
+        report["finished_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        write_protected_json(report_file, report, group=admin_group)
+        print(f"Apply report: {report_file}")
+        return 0
+    except Exception as exc:
+        report["status"] = "failed"
+        report["error"] = str(exc)
+        report["finished_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        write_protected_json(report_file, report, group=admin_group)
+        print(f"ERROR: {exc}", file=sys.stderr)
+        print(f"Apply report: {report_file}", file=sys.stderr)
         return 2
-    return subprocess.call(cmd)
+
+
+def plan_token_cmd(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="ssn-plan-token")
+    sub = parser.add_subparsers(dest="command", required=True)
+    create = sub.add_parser("create")
+    create.add_argument("--plan", required=True)
+    create.add_argument("--risk", required=True)
+    create.add_argument("--reason", required=True)
+    create.add_argument("--expires-hours", type=int, default=24)
+    create.add_argument("--store-root", default="/var/lib/slurm-single-node/plan-tokens")
+    args = parser.parse_args(argv)
+
+    if args.command == "create":
+        try:
+            token, record = create_plan_token(
+                args.plan,
+                risk=args.risk,
+                reason=args.reason,
+                store_root=args.store_root,
+                expires_hours=args.expires_hours,
+            )
+        except Exception as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+        print(token)
+        print(f"token_id={record['token_id']}")
+        print(f"risk={record['risk']}")
+        print(f"expires_at={record['expires_at']}")
+        return 0
+    return 2
 
 
 def sync_users_cmd(argv: list[str]) -> int:
@@ -186,6 +288,7 @@ def sync_users_cmd(argv: list[str]) -> int:
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--backup-root", default="/var/backups/slurm-single-node/users")
+    parser.add_argument("--retention-days", type=int, default=90)
     args = parser.parse_args(argv)
 
     root = repo_root(args.repo)
@@ -196,27 +299,46 @@ def sync_users_cmd(argv: list[str]) -> int:
         return 2
     users_doc = load_users(args.users)
     state_doc = load_state(args.state)
-    errors = validate_users(users_doc, resolved)
+    errors = [*validate_state(state_doc), *validate_users(users_doc, resolved, state_doc=state_doc)]
     if errors:
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)
         return 2
     actions = plan_user_sync(users_doc, state_doc, resolved, single_user=args.user)
-    if args.json:
+    if args.json and not args.apply:
         print(json.dumps({"actions": action_dicts(actions)}, indent=2, sort_keys=True))
-    else:
+    elif not args.json:
         if not actions:
             print("No user changes planned.")
         for action in actions:
             flag = "RISKY" if action.risky else "PLAN"
             print(f"{flag:5s} {action.username:20s} {action.action:28s} {action.detail}")
     if args.apply:
-        backup_file(args.users, args.backup_root)
-        backup_file(args.state, args.backup_root)
+        users_backup = backup_file(args.users, args.backup_root)
+        state_backup = backup_file(args.state, args.backup_root)
+        if not args.json:
+            if users_backup:
+                print(f"Backed up users.yml: {users_backup}")
+            if state_backup:
+                print(f"Backed up users-state.yml: {state_backup}")
         state_doc = apply_user_actions(actions, users_doc, resolved, state_doc=state_doc)
         state_path = Path(args.state)
         state_path.parent.mkdir(parents=True, exist_ok=True)
         state_path.write_text(dump_yaml(state_doc))
+        retention = backup_retention_report(args.backup_root, retention_days=args.retention_days)
+        if args.json:
+            print(
+                json.dumps(
+                    {"actions": action_dicts(actions), "backup_retention": retention},
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        else:
+            print(
+                "Backup retention report-only: "
+                f"{retention['candidate_count']} item(s) older than {args.retention_days} days under {args.backup_root}"
+            )
     return 0
 
 

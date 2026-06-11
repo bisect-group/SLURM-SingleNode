@@ -74,3 +74,81 @@
     port: "{{ ssn.derived.slurmdbd_port }}"
     host: 127.0.0.1
     timeout: 30
+
+- name: Ensure Slurm accounting backup directory exists
+  ansible.builtin.file:
+    path: /var/backups/slurm-single-node/accounting
+    state: directory
+    owner: root
+    group: "{{ ssn.derived.admin_group }}"
+    mode: "0750"
+
+- name: Install Slurm accounting dump script
+  ansible.builtin.copy:
+    dest: /usr/local/sbin/ssn-backup-slurmdb
+    owner: root
+    group: "{{ ssn.derived.admin_group }}"
+    mode: "0750"
+    content: |
+      #!/bin/sh
+      set -eu
+
+      DB_NAME="{{ ssn.derived.db_name }}"
+      BACKUP_DIR="/var/backups/slurm-single-node/accounting"
+      RETENTION_DAYS=30
+      DUMP_BIN="$(command -v mariadb-dump || command -v mysqldump || true)"
+
+      if [ -z "$DUMP_BIN" ]; then
+        echo "No mariadb-dump or mysqldump binary found" >&2
+        exit 1
+      fi
+
+      mkdir -p "$BACKUP_DIR"
+      chmod 0750 "$BACKUP_DIR"
+      stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+      tmp="$BACKUP_DIR/${DB_NAME}.${stamp}.sql.gz.tmp"
+      out="$BACKUP_DIR/${DB_NAME}.${stamp}.sql.gz"
+      umask 077
+      "$DUMP_BIN" --protocol=socket -uroot --single-transaction "$DB_NAME" | gzip -c > "$tmp"
+      mv "$tmp" "$out"
+      find "$BACKUP_DIR" -type f -name "${DB_NAME}.*.sql.gz" -mtime +"$RETENTION_DAYS" -print -delete
+
+- name: Install Slurm accounting backup service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/ssn-slurmdb-backup.service
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Slurm Single-Node accounting database backup
+      After=mariadb.service
+      Wants=mariadb.service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/ssn-backup-slurmdb
+
+- name: Install Slurm accounting backup timer
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/ssn-slurmdb-backup.timer
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Run Slurm Single-Node accounting database backup daily
+
+      [Timer]
+      OnCalendar=daily
+      Persistent=true
+
+      [Install]
+      WantedBy=timers.target
+
+- name: Enable Slurm accounting backup timer
+  ansible.builtin.systemd:
+    name: ssn-slurmdb-backup.timer
+    enabled: true
+    state: started
+    daemon_reload: true

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import grp
 import json
 import os
 import shutil
@@ -12,6 +13,8 @@ from pathlib import Path
 from typing import Any
 
 from .config import config_hash, render_profile, repo_root, resolve_profile, summary_text
+from .ops import queued_jobs, validate_feature_gates, validate_plan_token
+from .safety import redact_for_plan, retention_candidates
 
 
 BOOTSTRAP_PACKAGES = [
@@ -63,11 +66,14 @@ class Installer:
         self.args = args
         self.root = repo_root(args.repo)
         self.stamp = dt.datetime.now().strftime("%Y%m%d%H%M%S")
+        self.install_id = f"install-{self.stamp}"
         self.log_file = self._log_path()
         self.log_file.parent.mkdir(parents=True, exist_ok=True)
+        self.admin_group = "slurm_admins"
         self.report: dict[str, Any] = {
             "schema_version": 1,
-            "install_id": f"install-{self.stamp}",
+            "command": "install",
+            "install_id": self.install_id,
             "profile": args.profile,
             "repo": str(self.root),
             "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -81,8 +87,9 @@ class Installer:
         try:
             self._reexec_with_sudo_if_needed()
             self._banner()
-            self.report_file = self._render_dir().parent / "install-report.json"
+            self.report_file = self._plan_dir() / "install-report.json"
             resolved = self._phase_preflight()
+            self._record_plan_retention_report()
             packages = self._select_packages(resolved)
             missing_packages = [pkg for pkg in packages if not self._package_installed(pkg)]
             self._record_phase("preflight", "ok", {"missing_packages": missing_packages})
@@ -97,10 +104,12 @@ class Installer:
                     self._run(["apt-get", "install", "-y", *missing_packages])
             else:
                 self._log("All required OS packages already appear installed.")
+            self._validate_feature_gates(resolved)
 
             output_dir = self._render_dir()
             self._log(f"Rendering profile artifacts into {output_dir}")
             resolved = render_profile(self.args.profile, output_dir, self.root)
+            self._secure_plan_tree(resolved)
             self._log(summary_text(resolved).rstrip())
             self._log(f"Config hash: {config_hash(resolved)}")
             self.report["config_hash"] = config_hash(resolved)
@@ -138,6 +147,7 @@ class Installer:
             self.report["status"] = "ok"
             self.report["finished_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
             self._write_report()
+            self._write_report_summary()
             self._log(f"Install log: {self.log_file}")
             if self.report_file:
                 self._log(f"Install report: {self.report_file}")
@@ -151,22 +161,35 @@ class Installer:
             self.report["error"] = str(exc)
             self.report["finished_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
             self._write_report()
+            self._write_report_summary()
             raise
 
     def _phase_preflight(self) -> dict[str, Any]:
         self._log("== preflight ==")
         resolved = resolve_profile(self.args.profile, self.root)
+        self._secure_plan_tree(resolved)
+        self.report["config_hash"] = config_hash(resolved)
         self._log(summary_text(resolved).rstrip())
         self._log(f"Repo: {self.root}")
         self._log(f"User: euid={os.geteuid()} sudo_user={os.environ.get('SUDO_USER') or ''}")
-        self._log(f"OS: {self._os_pretty_name()}")
-        self._log(f"cgroup fs: {self._command_stdout(['stat', '-fc', '%T', '/sys/fs/cgroup'])}")
+        capabilities = self._collect_capabilities(resolved)
+        self.report["capabilities"] = capabilities
+        self._log(f"OS: {capabilities['os']['pretty_name']}")
+        self._log(f"Kernel: {capabilities['os']['kernel']}")
+        self._log(f"cgroup fs: {capabilities['cgroup_fs']}")
         if self._command_stdout(["stat", "-fc", "%T", "/sys/fs/cgroup"]) != "cgroup2fs":
             raise RuntimeError("cgroup v2 is required")
-        for path in ("/home", "/data", "/scratch"):
-            self._log(f"mount {path}: {self._command_stdout(['findmnt', '-no', 'TARGET,SOURCE,FSTYPE,OPTIONS', path]) or 'not mounted'}")
-        for command in ("ansible-playbook", "slurmd", "sacctmgr", "nvidia-smi"):
-            self._log(f"command {command}: {shutil.which(command) or 'missing'}")
+        for path, detail in capabilities["mounts"].items():
+            mount = detail.get("findmnt") or "not mounted"
+            free = detail.get("free_mb")
+            free_text = "" if free is None else f", free={free}MB"
+            self._log(f"mount {path}: {mount}{free_text}")
+        for command, command_path in capabilities["commands"].items():
+            self._log(f"command {command}: {command_path or 'missing'}")
+        for package, version in capabilities["packages"].items():
+            self._log(f"package {package}: {version or 'not installed'}")
+        for runtime, version in capabilities["runtime_versions"].items():
+            self._log(f"{runtime}: {version or 'unavailable'}")
         for service in SERVICE_NAMES:
             self._log(
                 f"service {service}: active={self._systemctl('is-active', service)} "
@@ -181,7 +204,91 @@ class Installer:
             self._log("CPU-only profile selected; no GPU GRES/TRES will be rendered.")
         self._validate_profile_matches_host(resolved)
         self._validate_required_mounts(resolved)
+        self._validate_no_jobs_before_apply()
         return resolved
+
+    def _collect_capabilities(self, resolved: dict[str, Any]) -> dict[str, Any]:
+        commands = {
+            command: shutil.which(command)
+            for command in ("ansible-playbook", "slurmd", "sacctmgr", "sinfo", "sbatch", "lua5.3", "nvidia-smi")
+        }
+        package_names = [
+            "slurm-wlm",
+            "slurmd",
+            "slurmctld",
+            "slurmdbd",
+            "mariadb-server",
+            "munge",
+            "lua5.3",
+            "liblua5.3-dev",
+        ]
+        mounts = {}
+        for path in dict.fromkeys(["/home", "/data", "/scratch", *[
+            str(value) for value in (resolved["derived"].get("paths") or {}).values() if value
+        ]]):
+            mounts[path] = {
+                "findmnt": self._findmnt(path),
+                "free_mb": self._free_mb(path),
+                "writable": os.access(path, os.W_OK) if Path(path).exists() else False,
+            }
+        capabilities = {
+            "os": {
+                "pretty_name": self._os_pretty_name(),
+                "kernel": self._command_stdout(["uname", "-r"]),
+            },
+            "cgroup_fs": self._command_stdout(["stat", "-fc", "%T", "/sys/fs/cgroup"]),
+            "commands": commands,
+            "packages": {name: self._package_version(name) for name in package_names},
+            "runtime_versions": {
+                "slurm": self._command_stdout(["sinfo", "--version"]),
+                "mariadb": self._command_stdout(["mariadb", "--version"]),
+                "lua": self._command_stdout(["lua5.3", "-v"]),
+                "nvidia_smi": self._command_stdout(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"]),
+            },
+            "mounts": mounts,
+        }
+        if resolved["derived"]["has_gpus"]:
+            capabilities["nvidia"] = {
+                "gpus": self._command_stdout([
+                    "nvidia-smi",
+                    "--query-gpu=index,name,uuid,pci.bus_id,memory.total",
+                    "--format=csv,noheader,nounits",
+                ])
+            }
+        return capabilities
+
+    def _validate_no_jobs_before_apply(self) -> None:
+        if self.args.dry_run or self.args.check:
+            return
+        if shutil.which("squeue") is None:
+            self._log("squeue is unavailable; running-job apply gate skipped on this not-yet-installed host.")
+            return
+        jobs = queued_jobs()
+        if not jobs:
+            self._log("Running-job apply gate: no queued Slurm jobs found.")
+            return
+        self.report["blocked_jobs"] = jobs
+        self.report["risk"] = "queued_jobs"
+        if self.args.force:
+            if not self.args.plan_token:
+                raise RuntimeError("queued jobs require --force plus --plan-token")
+            validate_plan_token(self.args.plan_token, self.report, risk="queued_jobs")
+            self._log("FORCE: queued-job apply gate authorized by reviewed plan token.")
+            return
+        preview = "; ".join(jobs[:5])
+        raise RuntimeError(
+            "refusing service-changing apply while Slurm has running/pending jobs: "
+            f"{preview}. Create a reviewed plan token, then re-run with --force --plan-token."
+        )
+
+    def _validate_feature_gates(self, resolved: dict[str, Any]) -> None:
+        if self.args.dry_run:
+            return
+        errors = validate_feature_gates(resolved, mode="install")
+        if errors:
+            raise RuntimeError("feature gate failed: " + "; ".join(errors))
+        self._record_phase("feature_gates", "ok", {"mode": "install"})
+        self._log("Feature gates passed for install.")
 
     def _validate_profile_matches_host(self, resolved: dict[str, Any]) -> None:
         host = self._command_stdout(["hostname"]) or ""
@@ -238,6 +345,22 @@ class Installer:
                 missing.append(f"{key}={path}")
         if missing:
             raise RuntimeError("profile requires mounted storage paths, but these are not mounted: " + ", ".join(missing))
+
+    def _record_plan_retention_report(self) -> None:
+        root = Path("/var/lib/slurm-single-node/plans")
+        candidates = retention_candidates(root, older_than_days=90)
+        detail = {
+            "root": str(root),
+            "retention_days": 90,
+            "mode": "report_only",
+            "candidate_count": len(candidates),
+            "candidates": candidates,
+        }
+        self.report["plan_retention"] = detail
+        self._record_phase("plan_retention", "ok", detail)
+        self._log(
+            f"Plan retention report-only: {len(candidates)} item(s) older than 90 days under {root}"
+        )
 
     def _select_packages(self, resolved: dict[str, Any]) -> list[str]:
         packages = [*BOOTSTRAP_PACKAGES, *RUNTIME_PACKAGES]
@@ -563,7 +686,14 @@ class Installer:
             return Path(self.args.output_dir).resolve()
         if self.args.dry_run:
             return Path("/tmp") / f"ssn-install-render-{self.args.profile}-{self.stamp}"
-        return Path("/var/lib/slurm-single-node/plans") / f"install-{self.stamp}" / "rendered"
+        return self._plan_dir() / "rendered"
+
+    def _plan_dir(self) -> Path:
+        if self.args.output_dir:
+            return Path(self.args.output_dir).resolve().parent
+        if self.args.dry_run or os.geteuid() != 0:
+            return Path("/tmp") / self.install_id
+        return Path("/var/lib/slurm-single-node/plans") / self.install_id
 
     def _log_path(self) -> Path:
         if os.geteuid() == 0:
@@ -596,7 +726,67 @@ class Installer:
         if self.report_file is None:
             return
         self.report_file.parent.mkdir(parents=True, exist_ok=True)
-        self.report_file.write_text(json.dumps(self.report, indent=2, sort_keys=True) + "\n")
+        self.report_file.write_text(json.dumps(redact_for_plan(self.report), indent=2, sort_keys=True) + "\n")
+        self._secure_file(self.report_file)
+
+    def _write_report_summary(self) -> None:
+        if self.report_file is None:
+            return
+        path = self.report_file.with_name("install-summary.txt")
+        lines = [
+            f"Install ID: {self.report.get('install_id')}",
+            f"Profile: {self.report.get('profile')}",
+            f"Status: {self.report.get('status')}",
+            f"Started: {self.report.get('started_at')}",
+            f"Finished: {self.report.get('finished_at', '')}",
+            f"Log: {self.report.get('log_file')}",
+            "Phases:",
+        ]
+        for phase in self.report.get("phases", []):
+            lines.append(f"  - {phase.get('name')}: {phase.get('status')} at {phase.get('time')}")
+        if self.report.get("error"):
+            lines.append(f"Error: {self.report['error']}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(lines) + "\n")
+        self._secure_file(path)
+
+    def _secure_plan_tree(self, resolved: dict[str, Any]) -> None:
+        plan_dir = self._plan_dir()
+        try:
+            plan_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return
+        group = resolved.get("derived", {}).get("admin_group", "slurm_admins")
+        self.admin_group = group
+        gid = self._group_gid(group)
+        for path in [plan_dir, *plan_dir.rglob("*")]:
+            try:
+                if os.geteuid() == 0 and gid is not None:
+                    os.chown(path, 0, gid, follow_symlinks=False)
+                if path.is_dir():
+                    path.chmod(0o750)
+                else:
+                    path.chmod(0o640)
+            except OSError:
+                continue
+
+    def _secure_file(self, path: Path) -> None:
+        try:
+            path.chmod(0o640)
+        except OSError:
+            return
+        try:
+            gid = self._group_gid(self.admin_group)
+            if os.geteuid() == 0 and gid is not None:
+                os.chown(path, 0, gid, follow_symlinks=False)
+        except OSError:
+            pass
+
+    def _group_gid(self, group_name: str) -> int | None:
+        try:
+            return grp.getgrnam(group_name).gr_gid
+        except KeyError:
+            return None
 
     def _package_installed(self, package: str) -> bool:
         return subprocess.run(
@@ -605,6 +795,10 @@ class Installer:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
         ).stdout.strip() == "install ok installed"
+
+    def _package_version(self, package: str) -> str | None:
+        out = self._command_stdout(["dpkg-query", "-W", "-f=${Version}", package])
+        return out or None
 
     def _path_exists(self, path: str | Path) -> bool:
         try:
@@ -649,9 +843,18 @@ class Installer:
 
     def _command_stdout(self, cmd: list[str]) -> str | None:
         try:
-            return subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL).strip()
+            return subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT).strip()
         except Exception:
             return None
+
+    def _free_mb(self, path: str) -> int | None:
+        try:
+            if not Path(path).exists():
+                return None
+            usage = shutil.disk_usage(path)
+        except OSError:
+            return None
+        return int(usage.free / 1024 / 1024)
 
     def _user_exists(self, username: str) -> bool:
         return self._pwd_entry(username) is not None
@@ -675,6 +878,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--check", action="store_true", help="run Ansible in check mode after bootstrap/render")
     parser.add_argument("--skip-smoke", action="store_true", help="skip post-apply sbatch smoke tests")
     parser.add_argument("--smoke-user", default=None, help="existing local user to use for sbatch smoke tests")
+    parser.add_argument("--force", action="store_true", help="allow service-changing apply while Slurm jobs are queued")
+    parser.add_argument("--plan-token", default=None, help="reviewed token required with --force over risky operations")
     args = parser.parse_args(argv)
     try:
         return Installer(args).run()

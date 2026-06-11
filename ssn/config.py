@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .schema import unknown_keys, validate_policy_file_schema, validate_profile_schema
 from .units import duration_to_seconds, memory_to_mb, normalize_duration
 from .yamlutil import dump_yaml, load_yaml
 
@@ -68,9 +69,12 @@ def load_profile(name: str, paths: RepoPaths) -> dict[str, Any]:
     data = load_yaml(path)
     if not isinstance(data, dict):
         raise ValueError(f"profile {name} must be a map")
-    unknown = set(data) - PROFILE_KEYS
+    unknown = unknown_keys(data, PROFILE_KEYS)
     if unknown:
         raise ValueError(f"profile {name} has unknown top-level keys: {sorted(unknown)}")
+    schema_errors = validate_profile_schema(name, data)
+    if schema_errors:
+        raise ValueError("\n".join(schema_errors))
     parent_name = data.get("extends")
     if parent_name:
         parent = load_profile(str(parent_name), paths)
@@ -87,6 +91,9 @@ def load_policy(domain: str, policy_name: str, paths: RepoPaths) -> dict[str, An
     data = load_yaml(paths.policies / file_name)
     if not isinstance(data, dict) or data.get("schema_version") != 1:
         raise ValueError(f"policy file {file_name} must use schema_version: 1")
+    schema_errors = validate_policy_file_schema(domain, data)
+    if schema_errors:
+        raise ValueError("\n".join(schema_errors))
     policies = data.get("policies")
     if not isinstance(policies, dict) or policy_name not in policies:
         raise ValueError(f"policy {policy_name!r} not found in {file_name}")
@@ -276,6 +283,8 @@ def validate_resolved(resolved: dict[str, Any], *, allow_review_required: bool =
                 f"exceeds allocatable CPUs={cpus_allocatable}"
             )
         if resolved["derived"]["has_gpus"] and tier.get("max_gpus_per_job") is not None:
+            if resolved["hardware"]["gpus"] == REVIEW_REQUIRED and allow_review_required:
+                continue
             gpus = int(resolved["hardware"]["gpus"])
             if int(tier["max_gpus_per_job"]) > gpus:
                 raise ValueError(

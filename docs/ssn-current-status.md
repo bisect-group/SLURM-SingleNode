@@ -1,0 +1,325 @@
+# SSN Current Implementation Status
+
+Audit date: 2026-06-11
+
+Source decision contract: `docs/decisions.md`
+
+Repo basis: current working tree under `/home/adhil/SLURM-SingleNode`.
+
+Live-test basis: Quadro P620 test server `bisect-node0` using profile
+`gpu-bisect-quadro-p620`; install, CPU smoke, GPU smoke, over-limit rejection,
+scratch job temp, scratch cleanup reporting, accounting backup, managed fixture
+users, suspended-user blocking, queued-job apply refusal, risk token creation,
+forced apply with a reviewed token, token single-use rejection, check-mode apply
+over a queued fixture job, and reinstall idempotence were observed during live
+testing.
+
+Status buckets:
+
+- **Implemented correctly**: matches the locked decision closely enough for v1.
+- **Implemented differently**: working behavior exists, but it differs from the
+  decision or is intentionally softened.
+- **Implemented extra**: useful behavior exists beyond the original decision.
+- **Yet to be implemented**: absent or only a partial foundation exists.
+
+## Executive Summary
+
+Core SSN is now real rather than just a plan. The generalized layout exists,
+profiles resolve, Ansible can apply a CPU/GPU single-node Slurm install, and the
+Quadro P620 host has passed live end-to-end install and Slurm smoke testing.
+
+The strongest implemented areas are the resolver/profile model, core Slurm
+configuration, accounting/QoS tiers, preemption wiring, single-command install,
+GPU GRES rendering, per-job scratch basics, accounting database backups, and
+active/suspended user sync for managed fixture users.
+
+The largest remaining gaps are type/required-field depth in schemas, general
+plan-token enforcement beyond queued-job risk, real quotas, hard login
+confinement, hard non-Slurm GPU denial, root/service GPU status snapshots, GPU
+health gates and CPU-only recovery, inactive archive lifecycle, CUDA/module
+management, and production-grade user docs.
+
+## Generalization Model
+
+| Decision / Requirement | Current Code State | Status Bucket | Evidence | Follow-up Needed |
+|---|---|---|---|---|
+| Use hardware/site profiles as the main generalization mechanism. | Profiles drive identity, hardware, policies, storage, and operations. | Implemented correctly | `profiles/*.yml`, `ssn/config.py` | Continue adding reviewed site profiles. |
+| Cover DGX/V100, generic NVIDIA GPU, and CPU-only servers. | `dgx-v100`, `generic-gpu`, `generic-nvidia-4gpu`, `cpu-dev-local`, and live test profiles exist. | Implemented correctly | `profiles/dgx-v100.yml`, `profiles/generic-gpu.yml`, `profiles/cpu-dev-local.yml` | Review DGX render parity against old Tesla deployment before production. |
+| CPU-only machine is the development/test target. | `cpu-dev-local` exists and resolves; live test work shifted to `bisect-node0` profiles. | Implemented correctly | `profiles/cpu-dev-local.yml`, tests | Local CPU live apply still optional if desired. |
+| First generic NVIDIA server is separate from CPU dev host. | Generic profile remains render-gated; Quadro profile was added for live testing. | Implemented correctly | `profiles/generic-nvidia-4gpu.yml`, `profiles/gpu-bisect-quadro-p620.yml` | Target production NVIDIA CPU caps still need hardware review. |
+| Reorganize moderately, preserving useful old Ansible ideas. | New tree exists while old Tesla tree remains. | Implemented correctly | `ansible/`, `ssn/`, `tesla-scheduler-v2/` | Eventually retire old tree after parity is proven. |
+| Preserve Tesla behavior as `dgx-v100` plus optional aliases. | DGX profile exists and Tesla aliases are conditionally installed. | Implemented correctly | `profiles/dgx-v100.yml`, `ansible/roles/ssn_admin_tools/tasks/main.yml` | Validate on actual DGX before claiming parity. |
+
+## Repository And Config Layout
+
+| Decision / Requirement | Current Code State | Status Bucket | Evidence | Follow-up Needed |
+|---|---|---|---|---|
+| Use `profiles/` and domain policy files under `policies/`. | Implemented. | Implemented correctly | `profiles/`, `policies/` | None for current structure. |
+| Profiles bind named policy files and local overrides. | Resolver loads selected policies and applies profile policy overrides. | Implemented correctly | `ssn/config.py` | Add stricter validation for override shapes. |
+| Hardware discovery generates draft data, not direct apply. | `ssn-discover` reports system and GPU details; it does not apply them. | Implemented correctly | `ssn/cli.py` | Add draft profile generation output when needed. |
+| Deep merge inheritance. | Implemented for profile inheritance and overrides. | Implemented correctly | `deep_merge` in `ssn/config.py` | Add schema annotations for list extension if ever needed. |
+| Human-readable units in YAML. | Memory and durations are normalized in resolver. | Implemented correctly | `ssn/units.py`, `ssn/config.py`, tests | Broaden unit tests for all authored units. |
+| Light-dependency Python resolver. | Implemented with stdlib plus PyYAML. | Implemented correctly | `ssn/config.py`, `ssn/yamlutil.py` | None. |
+| Strict validation before touching the system. | Resolver validates authored profiles, policy files, key profile/resource constraints, and host match/capabilities; user and state YAML have stricter schemas. The schemas reject unknown fields but remain type-light and do not require every field yet. | Implemented partially | `ssn/config.py`, `ssn/schema.py`, `ssn/install.py`, `ssn/users.py`, tests | Add required-field/type validation and schema migrations as new domains mature. |
+| Unknown fields fail validation. | Authored profile/policy/user/state unknown fields now fail validation; `x_*` keys are allowed as explicit local-extension escape hatches. | Implemented correctly | `ssn/schema.py`, `ssn/users.py`, `tests/test_schema.py`, `tests/test_users.py` | Keep schemas current as policy files grow. |
+| Dry run produces readable and JSON plan artifacts. | Installer dry-run renders/readably reports; live install/apply write protected JSON reports and summaries. `ssn-sync-users --json` outputs planned actions. | Implemented differently | `ssn/install.py`, `ssn/cli.py`, live Quadro reports | Make all dry-runs write protected machine-readable plan artifacts consistently. |
+| Plan artifacts live under `/var/lib/slurm-single-node/plans`, mode `0750/0640`, retained 90 days. | Install and apply reports plus rendered artifacts are written under protected per-run plan dirs; retention is report-only. | Implemented partially | `ssn/install.py`, `ssn/cli.py`, live Quadro `install-20260611153421` and `apply-20260611153546` | Implement actual retention pruning for old plan artifacts when deletion policy is approved. |
+| Redaction classes for secrets, keys, emails, manifests. | Central redaction helpers exist; install reports redact sensitive key names; SSH user plans show labels/fingerprints; DB secret Ansible tasks use `no_log`. Full manifest redaction is not implemented. | Implemented partially | `ssn/safety.py`, `ssn/users.py`, tests, live user dry-run | Extend redaction to future prune/archive manifests and all plan artifact writers. |
+| Risky operations require reviewed plan id/hash tokens. | Implemented for the queued-jobs risk on `ssn-install --force` and `ssn-apply --run --force`; tokens are config/input-hash-bound, expiring, stored hashed, and single-use. Other risky workflows do not use tokens yet. | Implemented partially | `ssn/ops.py`, `ssn/install.py`, `ssn/cli.py`, `bin/ssn-plan-token`, `tests/test_ops.py`, live Quadro token test | Reuse this token system for inactive pruning/archive, retention deletion, and other risky applies. |
+| Persist resolved audit file at `/etc/slurm-single-node/config.yml`. | Implemented by base role. | Implemented correctly | `ansible/roles/ssn_base/tasks/main.yml` | None. |
+
+## Target Scope
+
+| Decision / Requirement | Current Code State | Status Bucket | Evidence | Follow-up Needed |
+|---|---|---|---|---|
+| Ubuntu 24.04 and 26.04 primary, capability-gated. | Ansible asserts Ubuntu major version >= 24 and cgroup v2; installer/apply record command, package, runtime, mount, free-space, and NVIDIA capability details; feature gates fail on missing required commands, cgroup v2, storage mount/write checks, Slurm accounting access, and whole-GPU basics. | Implemented partially | `ansible/site.yml`, `ssn/install.py`, `ssn/ops.py`, live install/apply reports | Add deeper feature probes for Lua submit-plugin support, NVML/CUDA ordering, MIG/MPS, and package compatibility. |
+| Use Ubuntu apt packages. | Installer and Ansible use apt packages. | Implemented correctly | `ssn/install.py`, `ansible/roles/ssn_base/tasks/main.yml` | Add unattended-upgrade protection for Slurm packages. |
+| Target cgroup v2 only. | Installer and Ansible fail if cgroup fs is not `cgroup2fs`; Slurm cgroup config uses v2. | Implemented correctly | `ssn/install.py`, `ansible/site.yml`, `cgroup.conf.j2` | None. |
+| NVIDIA whole-GPU and CPU-only only; MIG/MPS/shared fail closed unless supported. | Profiles encode fail-closed modes and feature gates verify expected whole-GPU count/device files. MIG/MPS/shared mode detection is not implemented. | Implemented partially | `profiles/generic-gpu.yml`, `ssn/ops.py` | Add validation of MIG/MPS/shared modes during GPU verify. |
+| Validate driver, do not install it. | Installer/Ansible require `nvidia-smi` for GPU profiles; no driver install role. | Implemented correctly | `ssn/install.py`, `ansible/site.yml` | Add clearer driver/toolkit diagnostic output. |
+| GPU mapping verification as boot/apply health gate. | Basic GPU count, `/dev/nvidiaN`, and GRES node checks exist; full NVML/CUDA/status/topology gate does not. | Implemented partially | `ansible/verify.yml`, `ssn/ops.py`, `ssn/cli.py` | Implement full GPU verification and health-state handling. |
+| CPU-only recovery overlay on GPU verification failure. | Not implemented. | Yet to be implemented | No overlay/recovery code present | Add drain/hold/overlay workflow. |
+| Apptainer optional/off by default. | Policy marks off; roots are created. No install/config workflow. | Implemented partially | `policies/modules.yml`, `ssn_modules` role | Add optional Apptainer management if profile enables it. |
+
+## Commands And Compatibility
+
+| Decision / Requirement | Current Code State | Status Bucket | Evidence | Follow-up Needed |
+|---|---|---|---|---|
+| Default command prefix is `ssn-*`. | Implemented for repo and installed wrappers. | Implemented correctly | `bin/ssn-*`, `ansible/roles/ssn_admin_tools/tasks/main.yml` | Make prefix fully configurable for all wrappers if non-ssn prefix is needed. |
+| Core helper commands exist. | All listed commands exist, plus installer and scratch cleanup. | Implemented correctly | `bin/`, `ssn/cli.py` | `ssn-archive-status` is status-only until archive lifecycle exists. |
+| DGX may install `tesla-*` aliases. | Conditional alias install exists for selected tools. | Implemented correctly | `ssn_admin_tools` role | Expand aliases only after DGX parity review. |
+| Deployed user source is `/etc/slurm-single-node/users.yml`. | CLI default points there. | Implemented correctly | `ssn/cli.py` | Ensure installer creates example or empty file when desired. |
+
+## Accounting
+
+| Decision / Requirement | Current Code State | Status Bucket | Evidence | Follow-up Needed |
+|---|---|---|---|---|
+| Keep MariaDB and `slurmdbd` accounting. | Implemented and live tested. | Implemented correctly | `ansible/roles/ssn_slurmdbd`, live Quadro install | None for core service. |
+| QoS is tier authority with one default account. | Implemented via `sacctmgr` account/QoS setup. | Implemented correctly | `ansible/roles/ssn_slurm_config/tasks/main.yml` | Add admin/service accounts for archive workflows. |
+| Strict `cons_tres`, consumable CPU/mem/GRES, cgroup enforcement. | Slurm config renders `select/cons_tres`, cgroup plugins, memory defaults, and GPU GRES when needed. | Implemented correctly | `slurm.conf.j2`, `cgroup.conf.j2` | Verify all Slurm versions accept exact settings. |
+| GPU TRES/accounting where available. | GPU profiles include `gres/gpu`; CPU profiles remove GPU TRES. | Implemented correctly | `ssn/config.py`, `slurm.conf.j2` | Add version/capability check for GPU TRES support. |
+| Explicit memory defaults pinned by profile. | Profiles carry `def_mem_per_cpu` and `max_mem_per_cpu`; render fails on unresolved values. | Implemented correctly | `profiles/*.yml`, `ssn/config.py` | Add tests for memory REVIEW_REQUIRED edge cases. |
+| Generate local slurmdbd DB password once. | Implemented with protected file. | Implemented correctly | `ssn_slurmdbd` role | Add secret backup handling. |
+| Daily MariaDB dumps with 30-day retention. | Implemented as `ssn-slurmdb-backup.timer` plus `/usr/local/sbin/ssn-backup-slurmdb`; live manual run created a compressed dump. | Implemented correctly | `ansible/roles/ssn_slurmdbd/tasks/main.yml`, live Quadro backup file | Add external backup integration later if needed. |
+| Munge key generated if absent, protected, backed up, not auto-rotated. | Generated if absent and permissioned. Existing key is preserved. Backup is via installer preinstall copy, not dedicated secret backup. | Implemented partially | `ssn_base` role, `ssn/install.py` | Add protected service-secret backup policy. |
+
+## User Policy Model
+
+| Decision / Requirement | Current Code State | Status Bucket | Evidence | Follow-up Needed |
+|---|---|---|---|---|
+| YAML user source, keyed by username. | Implemented. | Implemented correctly | `ssn/users.py`, `profiles/users.example.yml` | None. |
+| Bootstrap discovery of human users and authorized keys. | `ssn-discover --users` scans UID range and keys. | Implemented correctly | `ssn/users.py`, `ssn/cli.py` | Improve exclude/adoption review controls. |
+| Preserve SSH key options raw plus parsed. | Parser stores `options_raw`, parsed `options`, comment, fingerprint; renderer preserves raw options. | Implemented correctly | `ssn/users.py`, tests | Add more option syntax tests. |
+| `ssh_keys` omitted/null unmanaged; `{}` managed empty. | Implemented in planning and apply. | Implemented correctly | `ssn/users.py` | None. |
+| Options raw and parsed mismatch fails. | Implemented validation. | Implemented correctly | `ssn/users.py`, tests | None. |
+| Managed users removed from YAML fail validation. | Planning emits a risky validation error and apply pre-scans validation errors before mutating. | Implemented correctly | `plan_user_sync`, `apply_user_actions`, tests | None for v1. |
+| UID/GID auto with explicit override support. | User creation supports explicit UID/GID; otherwise system allocates; explicit ID conflicts are validated. | Implemented correctly | `ssn/users.py`, tests | Broaden adoption-plan UX. |
+| Inactive reactivation must reuse original UID/GID. | Planning validates this case. | Implemented correctly | `ssn/users.py`, tests | Extend to tombstones once removal exists. |
+| Permanent UID/GID tombstones. | State sketch exists; real tombstone allocation protection is not implemented. | Yet to be implemented | No tombstone allocator present | Implement with inactive removal lifecycle. |
+| Back up `users.yml` and `users-state.yml` before writes. | CLI backs up both existing files before apply and reports 90-day retention candidates without deleting them. | Implemented partially | `ssn/cli.py`, `ssn/users.py`, live Quadro sync | Add approved retention pruning if desired. |
+| Top-level groups metadata only; user groups authoritative. | Validation rejects `groups.*.members`; apply reconciles SSN-managed supplementary groups and removes stale managed project/tier membership. | Implemented correctly | `ssn/users.py`, tests, live Quadro fixture groups | None for v1 managed users. |
+| Admin-exempt users in profile/site config. | Profiles define admins; Ansible creates admin group memberships. | Implemented partially | `profiles/*.yml`, `ssn_base` role | Wire admin exemptions into login confinement once implemented. |
+| User sync idempotence for managed fixtures. | Active/suspended fixture users remain functional after repeated install/sync rounds, but dry-run still reports reconciliation actions for existing fixtures instead of proving a fully empty no-op plan. | Implemented partially | live Quadro `ssn-sync-users --dry-run` output | Add state/current-system comparison so already-correct users/groups/keys/associations produce no planned changes. |
+| Staged state-machine reconciliation and resumable repair. | Basic state file update, backups, and validation pre-scan exist; no true staged/resumable state machine. | Yet to be implemented | `ssn/users.py` | Implement resumable user/group/Slurm/archive reconciliation. |
+| Tier templates and per-user overrides. | Tier templates exist. Override validation detects overlapping active fields, but overrides are not applied to associations/limits. | Implemented partially | `policies/tiers.yml`, `ssn/users.py` | Implement override resolution, expiry reconcile, and enforcement. |
+| Suspended lifecycle blocks login/Slurm and kills jobs. | Apply locks the Unix account, removes the default Slurm association, and runs `scancel`; live test killed a pending fixture job and blocked new submissions. PAM/login denial is basic account lock only. | Implemented differently | `ssn/users.py`, live Quadro suspended fixture | Add complete PAM/login denial validation and decide whether association removal is the final Slurm-disable mechanism. |
+| Inactive lifecycle archives, prunes, removes after backup. | Only planned as risky placeholder. | Yet to be implemented | `inactive_state_machine` in `ssn/users.py` | Build full inactive archive workflow. |
+
+## Slurm Partitions And Job Requests
+
+| Decision / Requirement | Current Code State | Status Bucket | Evidence | Follow-up Needed |
+|---|---|---|---|---|
+| Single default partition per profile. | Implemented. | Implemented correctly | `profiles/*.yml`, `slurm.conf.j2` | None. |
+| Generic partition name `compute`. | Implemented for generic and test profiles. | Implemented correctly | `profiles/generic-gpu.yml`, `profiles/gpu-bisect-quadro-p620.yml` | DGX intentionally uses `gpu`. |
+| CPU jobs default; GPU jobs explicitly request GRES. | Implemented and documented in examples. | Implemented correctly | `slurm.conf.j2`, `user-kit/README.md` | Expand docs per profile. |
+| CPU and GPU jobs share node under cgroups and limits. | Implemented in Slurm config and live-tested for GPU allocation. | Implemented correctly | live Quadro smoke | Add concurrent mixed workload tests. |
+| `job_submit.lua` is fast gate for explicit request fields. | Lua gate checks explicit QoS, CPU, GPU, `--no-requeue`; it does not do shellouts. | Implemented correctly | `job_submit.lua.j2` | Add RAM/walltime validation if reliable explicit fields are available. |
+| Reject over-tier CPU/GPU/RAM/walltime, unsafe GPU syntax, no-requeue. | CPU, GPU, disallowed QoS, and no-requeue were live-tested. RAM/walltime/unsafe syntax coverage is incomplete. | Yet to be implemented | `job_submit.lua.j2`, live Quadro fixture jobs | Extend submit filter tests and Lua logic. |
+
+## Fairshare And Billing
+
+| Decision / Requirement | Current Code State | Status Bucket | Evidence | Follow-up Needed |
+|---|---|---|---|---|
+| Slurm multifactor fairshare with 7-day decay. | Rendered in `slurm.conf`. | Implemented correctly | `slurm.conf.j2` | Validate resulting priority behavior with jobs. |
+| Billing weights CPU=1, GPU=64, RAM not billed. | Partition `TRESBillingWeights` renders CPU and GPU; CPU-only omits GPU. | Implemented correctly | `slurm.conf.j2` | Confirm account/user shares behavior in Slurm DB. |
+| Equal user shares under default account. | Default account exists; user sync creates associations and caps allowed QoS by tier rank. Explicit per-user fairshare shares are not actively managed. | Implemented partially | `ssn_slurm_config` tasks, `ssn/users.py`, live associations | Add explicit share management when user sync matures. |
+| Hard compute quotas are future work. | Not implemented, as intended. | Implemented correctly | No quota compute code | None. |
+
+## Preemption
+
+| Decision / Requirement | Current Code State | Status Bucket | Evidence | Follow-up Needed |
+|---|---|---|---|---|
+| QOS-based preemption with `REQUEUE`, `JobRequeue=1`, grace 300s. | Implemented in Slurm config and QoS setup. | Implemented correctly | `slurm.conf.j2`, `ssn_slurm_config` tasks | Live preemption test still needed. |
+| QOS `Preempt=` relationships by tier rank. | Implemented from policy relationships. | Implemented correctly | `ssn/config.py`, `ssn_slurm_config` tasks | Add test asserting rendered relationships. |
+| Reject normal-user `--no-requeue`. | Implemented and live-tested. | Implemented correctly | `job_submit.lua.j2`, installer smoke | Admin override path not implemented. |
+| Interactive `srun` allowed but canceled on preemption. | Docs mention interactive examples; no explicit cancellation policy code beyond Slurm preemption mode. | Yet to be implemented | `user-kit/examples/20-interactive-srun.sh` | Validate actual Slurm behavior and document exactly. |
+| Teach checkpointing. | User docs are basic; checkpointing guidance is not production-grade. | Yet to be implemented | `user-kit/README.md` | Expand docs/examples. |
+
+## Login Policy
+
+| Decision / Requirement | Current Code State | Status Bucket | Evidence | Follow-up Needed |
+|---|---|---|---|---|
+| Constrained login default, not strict Slurm-only SSH. | Implemented as policy docs, MOTD/banner, shell defaults, and process limit. | Implemented differently | `ssn_user_policy` role | Add real cgroup login slice enforcement. |
+| Per non-admin user login slice: 2 CPUs, 4 GB RAM, 128 tasks, low I/O weight. | Only `nproc` limits are installed; CPU/RAM/I/O slices are not implemented. | Yet to be implemented | `/etc/security/limits.d` template | Design and test systemd/PAM slice integration safely. |
+| Admin users exempt. | Admins are in profile and admin groups are created, but cap exemption is not meaningful until caps exist. | Yet to be implemented | `profiles/*.yml`, `ssn_base` role | Wire exemption into login slice policy. |
+| Hard non-Slurm GPU denial through cgroup v2 devices. | Not implemented; GPU direct access is not blocked. | Yet to be implemented | No device policy role present | Implement after confirming Slurm GPU job cgroups remain unaffected. |
+| Friendly PATH wrappers for direct GPU tools. | Not implemented. | Yet to be implemented | No wrapper templates present | Add wrappers once hard enforcement is safe. |
+| Profile-prefixed GPU status wrapper with 10s root snapshot and Slurm job mapping. | `ssn-gpu-status` exists, but falls back to live `nvidia-smi`; no collector or job mapping. | Implemented differently | `ssn/cli.py`, admin tools role | Add root/service collector and `/run` snapshot. |
+| No process-policing daemon in v1. | No policing daemon exists. | Implemented correctly | Repo inspection | None. |
+
+## Storage Policy
+
+| Decision / Requirement | Current Code State | Status Bucket | Evidence | Follow-up Needed |
+|---|---|---|---|---|
+| Optional `/home`, `/data`, `/scratch` per profile. | Implemented policies for no-scratch and three-area layouts. | Implemented correctly | `policies/storage.yml`, profiles | None. |
+| `/home` persistent path. | Installer allows `/home` to be a directory on `/` for the test host. | Implemented differently | `ssn/install.py` | Document this as an allowed dev/test compromise. |
+| RAID0 `/data` persistent but not durable, external backup required. | Policy records it; enforcement/acknowledgment is not active. | Yet to be implemented | `policies/storage.yml` | Add validation requiring site acknowledgment for nondurable data. |
+| Admins provision filesystems; automation verifies mounts. | Installer/verify checks `/data` and `/scratch` mounts for scratch profiles. | Implemented correctly | `ssn/install.py`, `ssn/cli.py`, storage role | Add filesystem type/free-space/quota checks. |
+| Quota-managed home/data/scratch and quota capability validation. | Quota values are policy-only; no quota enforcement. | Yet to be implemented | `policies/storage.yml` | Implement quota detection and enforcement. |
+| `/data` and `/scratch` capacity isolation. | Policy-only. | Yet to be implemented | `policies/storage.yml` | Validate separate filesystems/LVs/project quotas. |
+| Create `/data/$USER`, `/scratch/$USER/cache`, `/scratch/$USER/tmp`. | User sync apply creates data and scratch user directories. | Implemented correctly | `ssn/users.py` | Add quota assignment and ownership repair checks. |
+| Per-job scratch via root Prolog/Epilog and TaskProlog exports temp vars. | Implemented and live-tested. | Implemented correctly | prolog/epilog/task-prolog templates, live job output | Add runtime failure health-state logic. |
+| Scratch-required profiles block jobs until scratch healthy. | Installer/Ansible preflight checks mount and writeability; no persistent unhealthy marker/gate exists. | Implemented partially | `ssn/install.py`, storage role | Add scratch health state and submit/apply gating. |
+| Scratch cleanup deletes eligible aged files, excluding job scratch. | Report-only timer and command exist; deletion intentionally not implemented. | Implemented differently | `ssn-scratch-cleanup`, storage role | Add reviewed deletion mode when ready. |
+
+## Cache Policy
+
+| Decision / Requirement | Current Code State | Status Bucket | Evidence | Follow-up Needed |
+|---|---|---|---|---|
+| Broad-dev cache requires scratch. | Resolver validates scratch requirement. | Implemented correctly | `ssn/config.py`, `policies/cache.yml` | None. |
+| Core scratch/persistent/home cache env map. | Policy contains locked env map. | Implemented correctly | `policies/cache.yml` | None. |
+| Inject cache defaults into login shells and Slurm jobs. | `/etc/profile.d` injects shell defaults. Slurm batch inheritance works if environment is exported from login, but there is no dedicated Slurm-wide env injection. | Implemented partially | `ssn-profile.sh.j2` | Add Slurm job default injection independent of login shell provenance. |
+| User-provided values override managed defaults. | Shell template only exports when variable is empty. | Implemented correctly | `ssn-profile.sh.j2` | Confirm behavior under non-login `sbatch`. |
+| TaskProlog overrides job temp vars to per-job scratch. | Implemented. | Implemented correctly | `ssn-job-env-task-prolog.j2` | None. |
+| No default Matplotlib env override. | No `MPLCONFIGDIR` in cache policy. | Implemented correctly | `policies/cache.yml` | None. |
+
+## Inactive Users And Archives
+
+| Decision / Requirement | Current Code State | Status Bucket | Evidence | Follow-up Needed |
+|---|---|---|---|---|
+| Kill jobs, lock data, prune, archive, backup hook, remove account after success. | Inactive status plans a risky placeholder and apply refuses. | Yet to be implemented | `ssn/users.py` | Build the inactive state machine. |
+| Archive job under service/admin Slurm identity and protected QoS. | Policy-only. | Yet to be implemented | `policies/storage.yml` | Add service account, QoS, job submission, monitoring. |
+| Archive root required and Slurm unavailable blocks transition. | Policy-only. | Yet to be implemented | `policies/storage.yml` | Validate in inactive transition planner. |
+| Prune allowlist, symlink safety, report-only build trees. | Policy-only. | Yet to be implemented | `policies/storage.yml` | Implement prune manifest generator and tokenized apply. |
+| Dry plan writes plan id/hash and real apply requires token. | Not implemented. | Yet to be implemented | No inactive plan token code | Implement with general plan-token system. |
+| Backup hooks after local archive. | Not implemented. | Yet to be implemented | No hook runner present | Add hook directory, environment contract, status handling. |
+| UID/GID tombstones and reactivation semantics. | Reactivation identity validation exists; tombstone lifecycle does not. | Implemented partially | `ssn/users.py`, tests | Finish with archive/removal state machine. |
+
+## Modules And Shared Software
+
+| Decision / Requirement | Current Code State | Status Bucket | Evidence | Follow-up Needed |
+|---|---|---|---|---|
+| Use Lmod. | Installed when enabled; roots created. | Implemented partially | `ssn_modules` role | Create actual modulefiles and loader behavior. |
+| Shared roots under `/tools`. | Implemented. | Implemented correctly | `ssn_modules` role | None. |
+| Miniconda default shared base. | Policy records Miniconda root; role does not install/manage it. | Yet to be implemented | `policies/modules.yml`, `ssn_modules` role | Add validate-only or managed Miniconda workflow. |
+| CUDA validate-only by default, versioned modules when detected. | Policy-only. No CUDA module detection/rendering. | Yet to be implemented | `policies/modules.yml` | Implement CUDA detection, modulefiles, smoke checks. |
+| Admin-run updates, smoke checks, rollback targets. | Policy-only. | Yet to be implemented | `policies/modules.yml` | Build update workflow. |
+| Optional Apptainer and `/tools/containers`. | Root exists; Apptainer install/config absent. | Implemented partially | `ssn_modules` role | Add optional profile-controlled Apptainer role. |
+
+## Project Groups
+
+| Decision / Requirement | Current Code State | Status Bucket | Evidence | Follow-up Needed |
+|---|---|---|---|---|
+| Basic project/lab groups in `users.yml`. | Implemented validation and authoritative membership reconciliation for SSN-managed groups. | Implemented correctly | `ssn/users.py`, tests, live Quadro fixtures | None for v1 managed users. |
+| No shared group storage v1. | No shared group storage exists. | Implemented correctly | Repo inspection | None. |
+| Module visibility global v1. | No per-group module visibility exists. | Implemented correctly | `ssn_modules` role | None. |
+
+## Canonical YAML Sketches
+
+| Decision / Requirement | Current Code State | Status Bucket | Evidence | Follow-up Needed |
+|---|---|---|---|---|
+| `users.yml` shape with groups and keyed users. | Implemented with stricter v1 validation for top-level, group, user, SSH-key, and override keys. | Implemented correctly | `profiles/users.example.yml`, `ssn/users.py`, tests | Extend schema as new lifecycle fields are implemented. |
+| `users-state.yml` state shape with archive states. | Basic state file is written and strictly validates current fields; archive substates/tombstone model incomplete. | Yet to be implemented | `ssn/users.py`, tests | Implement lifecycle state model. |
+| Profile binding shape with services, admins, operations. | Profiles match the broad shape. | Implemented correctly | `profiles/*.yml` | Add strict schema and migrations. |
+| `policies/slurm-core.yml` shape. | Policy exists and drives render. | Implemented correctly | `policies/slurm-core.yml`, templates | Add validation for unsupported fields. |
+| `policies/tiers.yml` shape. | Policy exists and drives QoS/rendered tiers. | Implemented correctly | `policies/tiers.yml`, `ssn/config.py` | Add tests for all tier variants. |
+| `policies/storage.yml` shape. | Policy exists; only directory/scratch basics are active. | Implemented partially | `policies/storage.yml`, storage role | Implement quotas/archive/cleanup apply. |
+| `policies/cache.yml` shape. | Policy exists and is partially injected. | Implemented partially | `policies/cache.yml`, `ssn-profile.sh.j2` | Add Slurm-independent job env defaults. |
+| `policies/modules.yml` shape. | Policy exists; roots only. | Implemented partially | `policies/modules.yml`, modules role | Implement module/CUDA behavior. |
+| `policies/login.yml` shape. | Policy exists; only conservative limits/banner are active. | Implemented partially | `policies/login.yml`, user policy role | Implement systemd/PAM/cgroup enforcement. |
+
+## User-Facing Docs And Examples
+
+| Decision / Requirement | Current Code State | Status Bucket | Evidence | Follow-up Needed |
+|---|---|---|---|---|
+| New `user-kit/` docs and examples. | Basic docs and CPU/GPU examples exist. | Implemented partially | `user-kit/README.md`, `user-kit/examples/` | Generate/profile-check examples and expand guidance. |
+| Remove missing `gpu-shell`/`gpu-jupyter` helper model. | New docs use `sbatch`/`srun`; old `SLURM-user-kit` still exists for reference. | Implemented correctly | `user-kit/` | Decide when to archive/remove old user kit. |
+| Interactive workflows examples only. | `20-interactive-srun.sh` exists; no helper command added. | Implemented correctly | `user-kit/examples/20-interactive-srun.sh` | Add caveats around preemption/cancellation. |
+
+## Testing And Rollout
+
+| Decision / Requirement | Current Code State | Status Bucket | Evidence | Follow-up Needed |
+|---|---|---|---|---|
+| Local apply inventory by default. | Implemented with localhost inventory. | Implemented correctly | `ansible/inventories/local.ini`, installer | None. |
+| CPU-only validation before GPU rollout. | CPU profiles resolve; live GPU test was also performed on disposable Quadro host. | Implemented differently | tests, live Quadro notes | CPU live smoke on `cpu-dev-local` remains optional. |
+| Render-review gate for GPU/DGX production. | Generic GPU contains `REVIEW_REQUIRED`; render fails unless allowed. | Implemented correctly | `ssn/config.py`, tests | Add review artifact workflow. |
+| Live apply refuses changes while jobs are running unless force/drain. | `ssn-install` and `ssn-apply --run` refuse when `squeue` has queued jobs unless `--force --plan-token` is supplied. `ssn-apply --run --check` remains allowed without a token. Drain workflow is not implemented. | Implemented correctly | `ssn/install.py`, `ssn/cli.py`, `ssn/ops.py`, live Quadro queued-job/token/check-mode tests | Add an explicit drain workflow later. |
+| Resumable apply/sync workflows. | Partial user state update exists; install reports phases. Not truly resumable. | Yet to be implemented | `ssn/install.py`, `ssn/users.py` | Add staged reconciliation and repair plans. |
+| GPU verification tests include login denial and Slurm GPU access. | Slurm GPU job access live-tested. Login denial not implemented/tested. | Yet to be implemented | live Quadro smoke, no denial role | Add full GPU verification suite. |
+| Scratch-unhealthy, archive, hook, tombstone tests. | Scratch happy path and per-job cleanup were live-tested; unhealthy/archive/tombstone tests absent. | Yet to be implemented | tests, live notes | Add targeted integration tests. |
+| Static tests. | Unit tests, compileall, shell syntax, render checks, and remote static tests pass. | Implemented correctly | `tests/`, live session notes | Add CI entrypoint when repo is ready. |
+
+## Implemented Extra
+
+| Extra Item | Current Code State | Evidence | Keep / Follow-up |
+|---|---|---|---|
+| `gpu-bisect-quadro-p620` live profile. | Added for disposable Quadro test server. | `profiles/gpu-bisect-quadro-p620.yml` | Keep as useful hardware fixture. |
+| `cpu-bisect-node0` profile. | CPU-only profile for same test host. | `profiles/cpu-bisect-node0.yml` | Keep for CPU-only recovery testing. |
+| `starter-single-gpu-small` and `starter-cpu-small` policies. | Added for smaller machines. | `policies/tiers.yml` | Keep as practical starter tiers. |
+| Single-command installer smoke-user association setup. | Installer can create/update smoke user Slurm association for tests. | `ssn/install.py` | Keep; make clear it is test/smoke behavior. |
+| Automated install smoke rejection tests. | Installer tests over CPU, over GPU, and `--no-requeue`. | `ssn/install.py`, live Quadro notes | Expand to RAM/walltime/preemption. |
+| `ssn-scratch-cleanup` report-only command. | Added with service/timer integration. | `ssn/cli.py`, `bin/ssn-scratch-cleanup` | Convert to reviewed deletion mode later. |
+| Managed fixture users on Quadro. | `ssn-test-standard`, `ssn-test-priority`, and `ssn-test-suspended` remain on the test host for repeat sync/idempotence tests. | live Quadro users.yml/state | Keep as disposable test fixtures; do not treat as production users. |
+| Report-only retention helpers. | Plan and user-backup retention candidates are reported without deleting files. | `ssn/safety.py`, `ssn/install.py`, `ssn/cli.py` | Convert to approved deletion only after policy signoff. |
+| `ssn-plan-token` risk-token helper. | Added as an admin command for creating reviewed, short-lived tokens from install/apply reports. | `bin/ssn-plan-token`, `ssn/ops.py`, `ssn/cli.py`, live Quadro token test | Extend beyond queued-job risk as future risky workflows are implemented. |
+
+## Next Implementation Queue
+
+### Priority 1: Safety And Correctness Gates
+
+- Add required-field/type validation and migration handling on top of the new
+  profile/policy/user/state unknown-field schemas.
+- Extend the queued-job token pattern to all future risky operations, especially
+  inactive pruning/archive and retention deletion.
+- Add an explicit drain workflow for service-changing apply/install.
+- Deepen capability gates for Slurm submit-plugin support, MariaDB access
+  modes, Lua plugin compatibility, NVML/CUDA ordering, MIG/MPS/shared GPU
+  detection, and package/runtime compatibility.
+- Add approved pruning for old plan/user-backup artifacts if retention should
+  delete rather than report.
+
+### Priority 2: User And Storage Foundations
+
+- Broaden user sync adoption UX and conflict validation beyond the current v1
+  foundation.
+- Make user-sync dry-runs truly idempotent by comparing desired state with the
+  current Unix/group/SSH/Slurm state before planning actions.
+- Implement quota detection and quota assignment for `/home`, `/data`, and
+  `/scratch`.
+- Implement Slurm-independent cache/default env injection for jobs.
+- Turn scratch cleanup from report-only into reviewed deletion mode.
+- Add scratch health state so scratch-dependent jobs are blocked when unhealthy.
+
+### Priority 3: Login And GPU Isolation
+
+- Implement dedicated non-admin login slices with CPU/RAM/task/I/O limits.
+- Preserve Slurm-owned job cgroups outside login caps.
+- Implement hard non-Slurm GPU device denial for non-admin login sessions.
+- Add friendly GPU tool wrappers after hard enforcement is proven.
+- Add root/service GPU status collector with Slurm job/user mapping.
+
+### Priority 4: Inactive Lifecycle
+
+- Implement inactive prune dry-plan with manifest and reviewed token.
+- Add service/admin archive QoS and archive job submission.
+- Add backup/replication hook runner and failure handling.
+- Implement archive substates, tombstones, local-only override, and reactivation.
+
+### Priority 5: GPU Production Readiness And Docs
+
+- Implement full GPU health gate: GRES, device files, NVML/CUDA ordering,
+  topology if pinned, status mapping, login denial, and Slurm job access.
+- Implement CPU-only recovery overlay for GPU failures.
+- Add CUDA/toolkit/module validation and smoke-check workflow.
+- Expand `user-kit/` into profile-accurate production docs and examples.
+- Validate DGX/V100 render and behavior parity before replacing Tesla tooling.

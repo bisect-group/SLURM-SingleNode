@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 #SBATCH --partition=compute
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=16G
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=1G
 #SBATCH --time=04:00:00
 #SBATCH --job-name=single-gpu
 
 set -euo pipefail
 
 nvidia-smi
+echo "SLURM_TMPDIR=${SLURM_TMPDIR:-not configured}"
 python3 - <<'PY'
 try:
     import torch

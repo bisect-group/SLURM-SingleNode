@@ -13,8 +13,19 @@ from pathlib import Path
 from typing import Any
 
 from .config import config_hash, render_profile, repo_root, resolve_profile, summary_text
-from .ops import queued_jobs, validate_feature_gates, validate_plan_token
+from .ops import (
+    collect_capabilities,
+    drain_node,
+    queued_jobs,
+    resume_node,
+    validate_feature_gates,
+    validate_installed_slurm_features,
+    validate_plan_token,
+    validate_resolved_slurm_features,
+    wait_for_no_active_jobs,
+)
 from .safety import redact_for_plan, retention_candidates
+from .units import duration_to_seconds
 
 
 BOOTSTRAP_PACKAGES = [
@@ -70,6 +81,8 @@ class Installer:
         self.log_file = self._log_path()
         self.log_file.parent.mkdir(parents=True, exist_ok=True)
         self.admin_group = "slurm_admins"
+        self.drain_info: dict[str, Any] | None = None
+        self.service_change_started = False
         self.report: dict[str, Any] = {
             "schema_version": 1,
             "command": "install",
@@ -86,6 +99,8 @@ class Installer:
     def run(self) -> int:
         try:
             self._reexec_with_sudo_if_needed()
+            if self.args.force and self.args.drain:
+                raise RuntimeError("--force and --drain are mutually exclusive install safety modes")
             self._banner()
             self.report_file = self._plan_dir() / "install-report.json"
             resolved = self._phase_preflight()
@@ -100,6 +115,7 @@ class Installer:
                     + ", ".join(missing_packages)
                 )
                 if not self.args.dry_run:
+                    self.service_change_started = True
                     self._run(["apt-get", "update"])
                     self._run(["apt-get", "install", "-y", *missing_packages])
             else:
@@ -109,6 +125,10 @@ class Installer:
             output_dir = self._render_dir()
             self._log(f"Rendering profile artifacts into {output_dir}")
             resolved = render_profile(self.args.profile, output_dir, self.root)
+            rendered_errors = validate_resolved_slurm_features(resolved)
+            if rendered_errors:
+                raise RuntimeError("rendered Slurm feature validation failed: " + "; ".join(rendered_errors))
+            self._record_phase("rendered_feature_validation", "ok", {})
             self._secure_plan_tree(resolved)
             self._log(summary_text(resolved).rstrip())
             self._log(f"Config hash: {config_hash(resolved)}")
@@ -133,7 +153,12 @@ class Installer:
                 ansible_cmd.append("--check")
             self._log("Ansible command: " + " ".join(ansible_cmd))
             if not self.args.dry_run:
+                self.service_change_started = True
                 self._run(ansible_cmd)
+                installed_errors = validate_installed_slurm_features(resolved)
+                if installed_errors:
+                    raise RuntimeError("installed Slurm feature validation failed: " + "; ".join(installed_errors))
+                self._record_phase("installed_feature_validation", "ok", {})
                 self._record_phase("apply", "ok", {})
 
             if self.args.dry_run:
@@ -146,6 +171,7 @@ class Installer:
 
             self.report["status"] = "ok"
             self.report["finished_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+            self._resume_drained_node_after_success(resolved)
             self._write_report()
             self._write_report_summary()
             self._log(f"Install log: {self.log_file}")
@@ -157,6 +183,7 @@ class Installer:
             )
             return 0
         except Exception as exc:
+            self._handle_failed_drain_recovery()
             self.report["status"] = "failed"
             self.report["error"] = str(exc)
             self.report["finished_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -172,7 +199,7 @@ class Installer:
         self._log(summary_text(resolved).rstrip())
         self._log(f"Repo: {self.root}")
         self._log(f"User: euid={os.geteuid()} sudo_user={os.environ.get('SUDO_USER') or ''}")
-        capabilities = self._collect_capabilities(resolved)
+        capabilities = collect_capabilities(resolved, mode="install")
         self.report["capabilities"] = capabilities
         self._log(f"OS: {capabilities['os']['pretty_name']}")
         self._log(f"Kernel: {capabilities['os']['kernel']}")
@@ -204,66 +231,33 @@ class Installer:
             self._log("CPU-only profile selected; no GPU GRES/TRES will be rendered.")
         self._validate_profile_matches_host(resolved)
         self._validate_required_mounts(resolved)
-        self._validate_no_jobs_before_apply()
+        self._validate_no_jobs_before_apply(resolved)
         return resolved
 
-    def _collect_capabilities(self, resolved: dict[str, Any]) -> dict[str, Any]:
-        commands = {
-            command: shutil.which(command)
-            for command in ("ansible-playbook", "slurmd", "sacctmgr", "sinfo", "sbatch", "lua5.3", "nvidia-smi")
-        }
-        package_names = [
-            "slurm-wlm",
-            "slurmd",
-            "slurmctld",
-            "slurmdbd",
-            "mariadb-server",
-            "munge",
-            "lua5.3",
-            "liblua5.3-dev",
-        ]
-        mounts = {}
-        for path in dict.fromkeys(["/home", "/data", "/scratch", *[
-            str(value) for value in (resolved["derived"].get("paths") or {}).values() if value
-        ]]):
-            mounts[path] = {
-                "findmnt": self._findmnt(path),
-                "free_mb": self._free_mb(path),
-                "writable": os.access(path, os.W_OK) if Path(path).exists() else False,
-            }
-        capabilities = {
-            "os": {
-                "pretty_name": self._os_pretty_name(),
-                "kernel": self._command_stdout(["uname", "-r"]),
-            },
-            "cgroup_fs": self._command_stdout(["stat", "-fc", "%T", "/sys/fs/cgroup"]),
-            "commands": commands,
-            "packages": {name: self._package_version(name) for name in package_names},
-            "runtime_versions": {
-                "slurm": self._command_stdout(["sinfo", "--version"]),
-                "mariadb": self._command_stdout(["mariadb", "--version"]),
-                "lua": self._command_stdout(["lua5.3", "-v"]),
-                "nvidia_smi": self._command_stdout(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"]),
-            },
-            "mounts": mounts,
-        }
-        if resolved["derived"]["has_gpus"]:
-            capabilities["nvidia"] = {
-                "gpus": self._command_stdout([
-                    "nvidia-smi",
-                    "--query-gpu=index,name,uuid,pci.bus_id,memory.total",
-                    "--format=csv,noheader,nounits",
-                ])
-            }
-        return capabilities
-
-    def _validate_no_jobs_before_apply(self) -> None:
+    def _validate_no_jobs_before_apply(self, resolved: dict[str, Any]) -> None:
         if self.args.dry_run or self.args.check:
             return
         if shutil.which("squeue") is None:
             self._log("squeue is unavailable; running-job apply gate skipped on this not-yet-installed host.")
             return
         jobs = queued_jobs()
+        if self.args.drain:
+            timeout = duration_to_seconds(self.args.drain_timeout)
+            reason = f"{self.args.drain_reason} ({self.install_id})"
+            self.drain_info = drain_node(resolved["identity"]["node_name"], reason)
+            self.report["drain"] = self.drain_info
+            self._record_phase("node_drain", "ok", self.drain_info)
+            active = wait_for_no_active_jobs(timeout)
+            if active:
+                self.report["blocked_jobs"] = active
+                if self.drain_info.get("initiated_by_ssn"):
+                    resume_node(resolved["identity"]["node_name"])
+                    self.drain_info["initiated_by_ssn"] = False
+                    self._record_phase("node_resume_after_drain_timeout", "ok", {})
+                raise RuntimeError(f"drain timed out with active jobs still present: {active}")
+            self._record_phase("drain_wait", "ok", {})
+            self._log("Drain workflow: node is drained and no active Slurm jobs remain.")
+            return
         if not jobs:
             self._log("Running-job apply gate: no queued Slurm jobs found.")
             return
@@ -284,11 +278,34 @@ class Installer:
     def _validate_feature_gates(self, resolved: dict[str, Any]) -> None:
         if self.args.dry_run:
             return
-        errors = validate_feature_gates(resolved, mode="install")
+        capabilities = collect_capabilities(resolved, mode="install")
+        self.report["capabilities"] = capabilities
+        errors = validate_feature_gates(resolved, mode="install", capabilities=capabilities)
         if errors:
             raise RuntimeError("feature gate failed: " + "; ".join(errors))
         self._record_phase("feature_gates", "ok", {"mode": "install"})
         self._log("Feature gates passed for install.")
+
+    def _resume_drained_node_after_success(self, resolved: dict[str, Any]) -> None:
+        if self.drain_info and self.drain_info.get("initiated_by_ssn") and not self.args.dry_run and not self.args.check:
+            resume_node(resolved["identity"]["node_name"])
+            self.drain_info["initiated_by_ssn"] = False
+            self._record_phase("node_resume", "ok", {})
+            self._log("Drain workflow: node resumed after successful install.")
+
+    def _handle_failed_drain_recovery(self) -> None:
+        if not self.drain_info or not self.drain_info.get("initiated_by_ssn"):
+            return
+        node_name = str(self.drain_info.get("node"))
+        if not self.service_change_started:
+            try:
+                resume_node(node_name)
+                self.drain_info["initiated_by_ssn"] = False
+                self._record_phase("node_resume_after_preapply_failure", "ok", {})
+                return
+            except Exception as exc:
+                self.report["resume_error"] = str(exc)
+        self.report["manual_recovery"] = f"scontrol update NodeName={node_name} State=RESUME"
 
     def _validate_profile_matches_host(self, resolved: dict[str, Any]) -> None:
         host = self._command_stdout(["hostname"]) or ""
@@ -880,6 +897,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--smoke-user", default=None, help="existing local user to use for sbatch smoke tests")
     parser.add_argument("--force", action="store_true", help="allow service-changing apply while Slurm jobs are queued")
     parser.add_argument("--plan-token", default=None, help="reviewed token required with --force over risky operations")
+    parser.add_argument("--drain", action="store_true", help="drain the node and wait for active jobs before service-changing install")
+    parser.add_argument("--drain-timeout", default="10m", help="maximum wait for running/completing jobs when --drain is used")
+    parser.add_argument("--drain-reason", default="SSN install", help="Slurm node drain reason when --drain is used")
     args = parser.parse_args(argv)
     try:
         return Installer(args).run()

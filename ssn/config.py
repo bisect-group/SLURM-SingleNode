@@ -82,7 +82,13 @@ def load_profile(name: str, paths: RepoPaths) -> dict[str, Any]:
         child.pop("extends", None)
         merged = deep_merge(parent, child)
         merged["extends"] = parent_name
+        schema_errors = validate_profile_schema(name, merged, complete=True)
+        if schema_errors:
+            raise ValueError("\n".join(schema_errors))
         return merged
+    schema_errors = validate_profile_schema(name, data, complete=True)
+    if schema_errors:
+        raise ValueError("\n".join(schema_errors))
     return data
 
 

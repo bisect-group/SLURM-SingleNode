@@ -5,8 +5,9 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from ssn.ops import create_plan_token, validate_plan_token
+from ssn.ops import validate_feature_gates, wait_for_no_active_jobs, create_plan_token, validate_plan_token
 
 
 class PlanTokenTests(unittest.TestCase):
@@ -97,6 +98,54 @@ class PlanTokenTests(unittest.TestCase):
             plan = self._write_report(root, config_hash=None)
             with self.assertRaisesRegex(ValueError, "no config_hash"):
                 create_plan_token(plan, risk="queued_jobs", reason="unit test", store_root=root / "tokens")
+
+
+class FeatureGateTests(unittest.TestCase):
+    def test_feature_gate_reports_missing_required_commands(self) -> None:
+        resolved = {
+            "derived": {"has_gpus": False, "paths": {}},
+            "resolved_policies": {"storage": {"quotas": {}, "job_scratch": {}}},
+        }
+        capabilities = {
+            "cgroup_fs": "cgroup2fs",
+            "commands": {},
+            "mounts": {},
+        }
+        errors = validate_feature_gates(resolved, mode="apply", capabilities=capabilities)
+        self.assertTrue(any("ansible-playbook" in error for error in errors))
+        self.assertTrue(any("scontrol" in error for error in errors))
+
+    def test_feature_gate_checks_gpu_count_and_devices(self) -> None:
+        resolved = {
+            "hardware": {"gpus": 1},
+            "derived": {"has_gpus": True, "paths": {}},
+            "resolved_policies": {"storage": {"quotas": {}, "job_scratch": {}}},
+        }
+        capabilities = {
+            "cgroup_fs": "cgroup2fs",
+            "commands": {
+                "ansible-playbook": "/usr/bin/ansible-playbook",
+                "lua5.3": "/usr/bin/lua5.3",
+                "scontrol": "/usr/bin/scontrol",
+                "squeue": "/usr/bin/squeue",
+                "slurmd": "/usr/sbin/slurmd",
+                "sacctmgr": "/usr/bin/sacctmgr",
+                "sinfo": "/usr/bin/sinfo",
+                "sbatch": "/usr/bin/sbatch",
+                "nvidia-smi": "/usr/bin/nvidia-smi",
+            },
+            "mounts": {},
+            "nvidia": {"query": "", "devices": {"/dev/nvidia0": False}},
+            "slurm": {"accounting_cluster": "ssn"},
+        }
+        errors = validate_feature_gates(resolved, mode="apply", capabilities=capabilities)
+        self.assertTrue(any("expects 1 GPU" in error for error in errors))
+        self.assertTrue(any("/dev/nvidia0" in error for error in errors))
+
+    def test_wait_for_no_active_jobs_times_out_with_last_jobs(self) -> None:
+        with mock.patch("ssn.ops.active_jobs", return_value=[{"id": "1", "state": "RUNNING"}]):
+            jobs = wait_for_no_active_jobs(0, poll_seconds=0)
+        self.assertEqual(jobs[0]["id"], "1")
 
 
 if __name__ == "__main__":

@@ -12,7 +12,20 @@ from pathlib import Path
 from typing import Any
 
 from .config import config_hash, render_profile, repo_root, resolve_profile, summary_text
-from .ops import create_plan_token, queued_jobs, validate_feature_gates, validate_plan_token, write_protected_json
+from .ops import (
+    collect_capabilities,
+    create_plan_token,
+    drain_node,
+    queued_jobs,
+    resume_node,
+    validate_feature_gates,
+    validate_installed_slurm_features,
+    validate_plan_token,
+    validate_resolved_slurm_features,
+    wait_for_no_active_jobs,
+    write_protected_json,
+)
+from .units import duration_to_seconds
 from .users import (
     action_dicts,
     apply_user_actions,
@@ -151,7 +164,13 @@ def apply_cmd(argv: list[str]) -> int:
     parser.add_argument("--run", action="store_true", help="actually invoke ansible-playbook")
     parser.add_argument("--force", action="store_true", help="allow service-changing apply while Slurm jobs are queued")
     parser.add_argument("--plan-token", default=None, help="reviewed token required with --force over risky operations")
+    parser.add_argument("--drain", action="store_true", help="drain the node and wait for active jobs before service-changing apply")
+    parser.add_argument("--drain-timeout", default="10m", help="maximum wait for running/completing jobs when --drain is used")
+    parser.add_argument("--drain-reason", default="SSN apply", help="Slurm node drain reason when --drain is used")
     args = parser.parse_args(argv)
+    if args.force and args.drain:
+        print("ERROR: --force and --drain are mutually exclusive apply safety modes", file=sys.stderr)
+        return 2
 
     root = repo_root(args.repo)
     stamp = dt.datetime.now().strftime("%Y%m%d%H%M%S")
@@ -186,6 +205,7 @@ def apply_cmd(argv: list[str]) -> int:
         return 2
     report["config_hash"] = config_hash(resolved)
     report["rendered_dir"] = str(output)
+    report["capabilities"] = collect_capabilities(resolved, mode="apply")
     admin_group = resolved.get("derived", {}).get("admin_group", "slurm_admins")
     ansible_vars = output / "ansible-vars.json"
     cmd = [
@@ -208,13 +228,34 @@ def apply_cmd(argv: list[str]) -> int:
     try:
         if shutil.which("ansible-playbook") is None:
             raise RuntimeError("ansible-playbook is not installed")
+        rendered_errors = validate_resolved_slurm_features(resolved)
+        if rendered_errors:
+            raise RuntimeError("rendered Slurm feature validation failed: " + "; ".join(rendered_errors))
+        report["phases"].append({"name": "rendered_feature_validation", "status": "ok", "time": dt.datetime.now(dt.timezone.utc).isoformat()})
+        drain_info: dict[str, Any] | None = None
+        apply_started = False
         if not args.check:
-            feature_errors = validate_feature_gates(resolved, mode="apply")
+            feature_errors = validate_feature_gates(resolved, mode="apply", capabilities=report["capabilities"])
             if feature_errors:
                 raise RuntimeError("feature gate failed: " + "; ".join(feature_errors))
             report["phases"].append({"name": "feature_gates", "status": "ok", "time": dt.datetime.now(dt.timezone.utc).isoformat()})
             jobs = queued_jobs()
-            if jobs:
+            if args.drain:
+                timeout = duration_to_seconds(args.drain_timeout)
+                reason = f"{args.drain_reason} ({apply_id})"
+                drain_info = drain_node(resolved["identity"]["node_name"], reason)
+                report["drain"] = drain_info
+                report["phases"].append({"name": "node_drain", "status": "ok", "time": dt.datetime.now(dt.timezone.utc).isoformat(), "detail": drain_info})
+                active = wait_for_no_active_jobs(timeout)
+                if active:
+                    report["blocked_jobs"] = active
+                    if drain_info.get("initiated_by_ssn"):
+                        resume_node(resolved["identity"]["node_name"])
+                        drain_info["initiated_by_ssn"] = False
+                        report["phases"].append({"name": "node_resume_after_drain_timeout", "status": "ok", "time": dt.datetime.now(dt.timezone.utc).isoformat()})
+                    raise RuntimeError(f"drain timed out with active jobs still present: {active}")
+                report["phases"].append({"name": "drain_wait", "status": "ok", "time": dt.datetime.now(dt.timezone.utc).isoformat()})
+            elif jobs:
                 report["blocked_jobs"] = jobs
                 report["risk"] = "queued_jobs"
                 if not args.force:
@@ -229,15 +270,33 @@ def apply_cmd(argv: list[str]) -> int:
             else:
                 report["phases"].append({"name": "queued_job_gate", "status": "ok", "time": dt.datetime.now(dt.timezone.utc).isoformat()})
         write_protected_json(report_file, report, group=admin_group)
+        apply_started = True
         rc = subprocess.call(cmd)
         if rc != 0:
             raise RuntimeError(f"ansible-playbook failed with rc={rc}")
+        if not args.check:
+            installed_errors = validate_installed_slurm_features(resolved)
+            if installed_errors:
+                raise RuntimeError("installed Slurm feature validation failed: " + "; ".join(installed_errors))
+            report["phases"].append({"name": "installed_feature_validation", "status": "ok", "time": dt.datetime.now(dt.timezone.utc).isoformat()})
+            if drain_info and drain_info.get("initiated_by_ssn"):
+                resume_node(resolved["identity"]["node_name"])
+                report["phases"].append({"name": "node_resume", "status": "ok", "time": dt.datetime.now(dt.timezone.utc).isoformat()})
         report["status"] = "ok"
         report["finished_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
         write_protected_json(report_file, report, group=admin_group)
         print(f"Apply report: {report_file}")
         return 0
     except Exception as exc:
+        if "drain_info" in locals() and drain_info and drain_info.get("initiated_by_ssn") and not locals().get("apply_started", False):
+            try:
+                resume_node(resolved["identity"]["node_name"])
+                report["phases"].append({"name": "node_resume_after_preapply_failure", "status": "ok", "time": dt.datetime.now(dt.timezone.utc).isoformat()})
+            except Exception as resume_exc:
+                report["manual_recovery"] = f"scontrol update NodeName={resolved['identity']['node_name']} State=RESUME"
+                report["resume_error"] = str(resume_exc)
+        elif "drain_info" in locals() and drain_info and drain_info.get("initiated_by_ssn"):
+            report["manual_recovery"] = f"scontrol update NodeName={resolved['identity']['node_name']} State=RESUME"
         report["status"] = "failed"
         report["error"] = str(exc)
         report["finished_at"] = dt.datetime.now(dt.timezone.utc).isoformat()

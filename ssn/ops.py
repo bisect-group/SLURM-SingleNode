@@ -4,9 +4,11 @@ import datetime as dt
 import grp
 import json
 import os
+import platform
 import secrets
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +18,7 @@ from .safety import redact_for_plan
 
 TOKEN_PREFIX = "ssnpt"
 DEFAULT_TOKEN_STORE = Path("/var/lib/slurm-single-node/plan-tokens")
+ACTIVE_JOB_STATES = {"BOOT_FAIL", "CONFIGURING", "COMPLETING", "RESIZING", "RUNNING", "SUSPENDED"}
 
 
 def command_stdout(cmd: list[str]) -> str | None:
@@ -25,11 +28,68 @@ def command_stdout(cmd: list[str]) -> str | None:
         return None
 
 
-def queued_jobs() -> list[str]:
+def command_rc(cmd: list[str]) -> int:
+    return subprocess.run(cmd, text=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+
+
+def slurm_jobs() -> list[dict[str, str]]:
     if shutil.which("squeue") is None:
         return []
     output = command_stdout(["squeue", "-h", "-o", "%i|%T|%u|%j"]) or ""
-    return [line for line in output.splitlines() if line.strip()]
+    jobs = []
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("|", 3)
+        if len(parts) != 4:
+            jobs.append({"id": line.strip(), "state": "UNKNOWN", "user": "", "name": ""})
+            continue
+        jobs.append({"id": parts[0], "state": parts[1], "user": parts[2], "name": parts[3]})
+    return jobs
+
+
+def queued_jobs() -> list[str]:
+    return [f"{job['id']}|{job['state']}|{job['user']}|{job['name']}" for job in slurm_jobs()]
+
+
+def active_jobs() -> list[dict[str, str]]:
+    return [job for job in slurm_jobs() if job.get("state") in ACTIVE_JOB_STATES]
+
+
+def drain_node(node_name: str, reason: str) -> dict[str, Any]:
+    if shutil.which("scontrol") is None:
+        raise RuntimeError("scontrol is required for --drain")
+    state_before = command_stdout(["sinfo", "-h", "-N", "-n", node_name, "-o", "%T"]) or ""
+    already_drained = "drain" in state_before.lower()
+    command = ["scontrol", "update", f"NodeName={node_name}", "State=DRAIN", f"Reason={reason}"]
+    rc = command_rc(command)
+    if rc != 0:
+        raise RuntimeError("failed to drain node with scontrol")
+    return {
+        "node": node_name,
+        "state_before": state_before,
+        "initiated_by_ssn": not already_drained,
+        "reason": reason,
+    }
+
+
+def resume_node(node_name: str) -> None:
+    if shutil.which("scontrol") is None:
+        raise RuntimeError("scontrol is required to resume node")
+    rc = command_rc(["scontrol", "update", f"NodeName={node_name}", "State=RESUME"])
+    if rc != 0:
+        raise RuntimeError("failed to resume node with scontrol")
+
+
+def wait_for_no_active_jobs(timeout_seconds: int, *, poll_seconds: int = 2) -> list[dict[str, str]]:
+    deadline = time.time() + timeout_seconds
+    last = active_jobs()
+    while time.time() <= deadline:
+        last = active_jobs()
+        if not last:
+            return []
+        time.sleep(poll_seconds)
+    return last
 
 
 def secure_path(path: Path, *, group: str = "slurm_admins") -> None:
@@ -55,46 +115,199 @@ def write_protected_json(path: Path, payload: dict[str, Any], *, group: str = "s
     secure_path(path.parent, group=group)
 
 
-def validate_feature_gates(resolved: dict[str, Any], *, mode: str) -> list[str]:
+def collect_capabilities(resolved: dict[str, Any], *, mode: str) -> dict[str, Any]:
+    commands = [
+        "ansible-playbook",
+        "scontrol",
+        "squeue",
+        "sacctmgr",
+        "sinfo",
+        "sbatch",
+        "slurmd",
+        "lua5.3",
+        "nvidia-smi",
+    ]
+    paths = resolved.get("derived", {}).get("paths") or {}
+    mount_paths = dict.fromkeys(
+        str(value)
+        for value in ["/home", paths.get("home"), paths.get("data"), paths.get("scratch"), paths.get("archive")]
+        if value
+    )
+    package_names = [
+        "slurm-wlm",
+        "slurmd",
+        "slurmctld",
+        "slurmdbd",
+        "mariadb-server",
+        "munge",
+        "lua5.3",
+        "liblua5.3-dev",
+    ]
+    versions = {
+        "slurm": command_stdout(["sinfo", "--version"]),
+        "mariadb": command_stdout(["mariadb", "--version"]),
+        "lua": command_stdout(["lua5.3", "-v"]),
+        "nvidia_smi": command_stdout(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"]),
+    }
+    capabilities: dict[str, Any] = {
+        "mode": mode,
+        "os": {
+            "pretty_name": _os_pretty_name(),
+            "kernel": platform.release(),
+        },
+        "commands": {command: shutil.which(command) for command in commands},
+        "packages": {name: _package_version(name) for name in package_names},
+        "cgroup_fs": command_stdout(["stat", "-fc", "%T", "/sys/fs/cgroup"]),
+        "mounts": {path: _mount_capability(path) for path in mount_paths},
+        "versions": versions,
+        "runtime_versions": versions,
+        "slurm": {
+            "accounting_cluster": command_stdout(["sacctmgr", "-nP", "show", "cluster", "format=cluster"]),
+            "config_select": command_stdout(["scontrol", "show", "config"]),
+        },
+    }
+    if resolved.get("derived", {}).get("has_gpus"):
+        gpu_lines = command_stdout([
+            "nvidia-smi",
+            "--query-gpu=index,name,uuid,pci.bus_id,memory.total",
+            "--format=csv,noheader,nounits",
+        ])
+        capabilities["nvidia"] = {
+            "query": gpu_lines,
+            "devices": {f"/dev/nvidia{index}": Path(f"/dev/nvidia{index}").exists() for index in range(int(resolved["hardware"]["gpus"]))},
+        }
+    return capabilities
+
+
+def validate_feature_gates(resolved: dict[str, Any], *, mode: str, capabilities: dict[str, Any] | None = None) -> list[str]:
     errors: list[str] = []
-    if command_stdout(["stat", "-fc", "%T", "/sys/fs/cgroup"]) != "cgroup2fs":
+    capabilities = capabilities or collect_capabilities(resolved, mode=mode)
+    if capabilities.get("cgroup_fs") != "cgroup2fs":
         errors.append("cgroup v2 is required")
     required = ["ansible-playbook", "lua5.3"]
     if mode in {"apply", "install"}:
-        required.extend(["slurmd", "sacctmgr", "sinfo", "sbatch"])
+        required.extend(["scontrol", "squeue", "slurmd", "sacctmgr", "sinfo", "sbatch"])
     for command in required:
-        if shutil.which(command) is None:
+        if capabilities.get("commands", {}).get(command) is None:
             errors.append(f"required command is missing: {command}")
     storage = resolved["resolved_policies"]["storage"]
     paths = resolved["derived"].get("paths") or {}
     if storage.get("quotas", {}).get("fail_if_unavailable") or storage.get("job_scratch", {}).get("required_for_jobs"):
         for label in ("data", "scratch"):
             path = paths.get(label)
-            if path and command_stdout(["findmnt", "-no", "TARGET", str(path)]) is None:
+            detail = capabilities.get("mounts", {}).get(str(path), {})
+            if path and detail.get("findmnt") is None:
                 errors.append(f"required storage path is not mounted: {label}={path}")
-            if path and Path(path).exists() and not os.access(path, os.W_OK):
+            if path and detail.get("exists") and not detail.get("writable"):
                 errors.append(f"required storage path is not writable: {label}={path}")
     if resolved["derived"]["has_gpus"]:
-        if shutil.which("nvidia-smi") is None:
+        if capabilities.get("commands", {}).get("nvidia-smi") is None:
             errors.append("GPU profile requires nvidia-smi")
         else:
-            gpu_lines = command_stdout([
-                "nvidia-smi",
-                "--query-gpu=index,name,uuid",
-                "--format=csv,noheader",
-            ])
+            gpu_lines = capabilities.get("nvidia", {}).get("query")
             expected = int(resolved["hardware"]["gpus"])
             actual = len([line for line in (gpu_lines or "").splitlines() if line.strip()])
             if actual != expected:
                 errors.append(f"GPU profile expects {expected} GPU(s), discovered {actual}")
             for index in range(expected):
-                if not Path(f"/dev/nvidia{index}").exists():
+                if not capabilities.get("nvidia", {}).get("devices", {}).get(f"/dev/nvidia{index}"):
                     errors.append(f"GPU profile expects /dev/nvidia{index}")
-    if mode == "apply" and shutil.which("sacctmgr") is not None:
-        cluster = command_stdout(["sacctmgr", "-nP", "show", "cluster", "format=cluster"])
-        if cluster is None:
+    if mode == "apply" and capabilities.get("commands", {}).get("sacctmgr") is not None:
+        if capabilities.get("slurm", {}).get("accounting_cluster") is None:
             errors.append("Slurm accounting is unavailable through sacctmgr")
     return errors
+
+
+def validate_resolved_slurm_features(resolved: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    slurm_core = resolved["resolved_policies"]["slurm_core"]
+    if slurm_core.get("select", {}).get("type") != "select/cons_tres":
+        errors.append("Slurm SelectType must be select/cons_tres")
+    task = slurm_core.get("task_plugin", {})
+    for key in ("cgroup_v2", "constrain_cores", "constrain_ram", "constrain_devices"):
+        if task.get(key) is not True:
+            errors.append(f"Slurm task_plugin.{key} must be true")
+    if slurm_core.get("submit_filter", {}).get("plugin") != "job_submit.lua":
+        errors.append("Slurm submit_filter.plugin must be job_submit.lua")
+    if resolved["derived"]["has_gpus"]:
+        expected = int(resolved["hardware"]["gpus"])
+        if len(resolved["derived"].get("gres_entries", [])) != expected:
+            errors.append(f"GPU profile should render {expected} GRES entries")
+        if not any(str(item).startswith("gres/gpu") for item in resolved["derived"].get("accounting_storage_tres", [])):
+            errors.append("GPU profile should include gres/gpu accounting TRES")
+    else:
+        if resolved["derived"].get("gres_entries"):
+            errors.append("CPU-only profile must not render GPU GRES entries")
+        if any(str(item).startswith("gres/gpu") for item in resolved["derived"].get("accounting_storage_tres", [])):
+            errors.append("CPU-only profile must not include gres/gpu accounting TRES")
+    return errors
+
+
+def validate_installed_slurm_features(resolved: dict[str, Any], *, conf_dir: str | Path = "/etc/slurm") -> list[str]:
+    errors: list[str] = []
+    conf_root = Path(conf_dir)
+    slurm_conf = _read_text(conf_root / "slurm.conf")
+    cgroup_conf = _read_text(conf_root / "cgroup.conf")
+    gres_conf = _read_text(conf_root / "gres.conf")
+    expected = {
+        "SelectType=select/cons_tres": slurm_conf,
+        "ProctrackType=proctrack/cgroup": slurm_conf,
+        "TaskPlugin=task/cgroup": slurm_conf,
+        "JobSubmitPlugins=lua": slurm_conf,
+        "CgroupPlugin=cgroup/v2": cgroup_conf,
+        "ConstrainCores=yes": cgroup_conf,
+        "ConstrainRAMSpace=yes": cgroup_conf,
+        "ConstrainDevices=yes": cgroup_conf,
+    }
+    for needle, haystack in expected.items():
+        if needle not in haystack:
+            errors.append(f"installed Slurm config missing {needle}")
+    if resolved["derived"]["has_gpus"]:
+        if "GresTypes=gpu" not in slurm_conf:
+            errors.append("GPU profile installed config missing GresTypes=gpu")
+        if "Name=gpu" not in gres_conf:
+            errors.append("GPU profile installed config missing gres.conf entries")
+    else:
+        if "GresTypes=gpu" in slurm_conf or "gres/gpu" in slurm_conf or "Name=gpu" in gres_conf:
+            errors.append("CPU-only installed config must not include GPU GRES/TRES")
+    return errors
+
+
+def _mount_capability(path: str) -> dict[str, Any]:
+    target = Path(path)
+    free_mb = None
+    if target.exists():
+        try:
+            free_mb = int(shutil.disk_usage(path).free / 1024 / 1024)
+        except OSError:
+            free_mb = None
+    return {
+        "findmnt": command_stdout(["findmnt", "-no", "TARGET,SOURCE,FSTYPE,OPTIONS", path]),
+        "exists": target.exists(),
+        "writable": os.access(path, os.W_OK) if target.exists() else False,
+        "free_mb": free_mb,
+    }
+
+
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text()
+    except OSError:
+        return ""
+
+
+def _package_version(package: str) -> str | None:
+    return command_stdout(["dpkg-query", "-W", "-f=${Version}", package]) or None
+
+
+def _os_pretty_name() -> str:
+    path = Path("/etc/os-release")
+    if not path.exists():
+        return "unknown"
+    for line in path.read_text().splitlines():
+        if line.startswith("PRETTY_NAME="):
+            return line.partition("=")[2].strip().strip('"')
+    return "unknown"
 
 
 def token_input_hash(report: dict[str, Any], risk: str) -> str:

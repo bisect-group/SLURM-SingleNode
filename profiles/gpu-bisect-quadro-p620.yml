@@ -1,0 +1,39 @@
+schema_version: 1
+profile: gpu-bisect-quadro-p620
+extends: generic-gpu
+
+identity:
+  cluster_name: ssn-bisect
+  node_name: bisect-node0
+  command_prefix: ssn
+  group_prefix: ssn
+  default_partition: compute
+
+hardware:
+  discovered_at: "2026-06-11"
+  gpus: 1
+  gpu_vendor: nvidia
+  gpu_type: null
+  gpu_modes:
+    mig: fail_closed
+    mps: fail_closed
+    shared_gpu: fail_closed
+  gpu_affinity:
+    mode: reviewed
+    render_gres_cores: reviewed_only
+    cores: {}
+  cpus_total: 16
+  cpus_allocatable: 14
+  memory_total: 31283MB
+  memory_allocatable: 27187MB
+  reserved_cpus: 2
+  reserved_memory: 4GB
+  memory_defaults:
+    def_mem_per_cpu: 1GB
+    max_mem_per_cpu: 8GB
+
+overrides:
+  policies:
+    tiers: starter-single-gpu-small
+    storage: standard-three-area
+    cache: broad-dev

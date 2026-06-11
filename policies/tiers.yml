@@ -184,6 +184,70 @@ policies:
         memory_percent: 90
         preempt_rank: 100
 
+  starter-single-gpu-small:
+    slurm_account: default
+    default_tier: standard
+    memory_percent_base: allocatable_after_reserve
+    fairshare:
+      priority_type: multifactor
+      priority_decay_half_life: "7-0"
+      priority_weight_fairshare: 10000
+      priority_weight_age: 1000
+      priority_weight_qos: 1000
+      account_user_shares: equal
+      tres_billing_weights:
+        cpu: 1
+        gres/gpu: 64
+        mem: 0
+    preemption:
+      type: qos
+      mode: requeue
+      grace_time: 300s
+      job_requeue: true
+      allow_user_no_requeue: false
+      submit_rejects_no_requeue: true
+      interactive_jobs:
+        allowed: true
+        on_preempt: cancel
+      relationships:
+        standard:
+          preempts: []
+        priority:
+          preempts:
+            - standard
+        emergency:
+          preempts:
+            - standard
+            - priority
+    tiers:
+      standard:
+        max_gpus_per_job: 1
+        max_cpus_per_job: 4
+        max_running_jobs: 3
+        max_submitted_jobs: 3
+        default_walltime: 4h
+        max_walltime: 48h
+        memory_percent: 25
+        preempt_rank: 0
+      priority:
+        max_gpus_per_job: 1
+        max_cpus_per_job: 8
+        max_running_jobs: 5
+        max_submitted_jobs: 5
+        default_walltime: 4h
+        max_walltime: 72h
+        memory_percent: 50
+        preempt_rank: 50
+      emergency:
+        max_gpus_per_job: all
+        max_cpus_per_job: 14
+        max_running_jobs: 10
+        max_submitted_jobs: 10
+        default_walltime: 4h
+        max_walltime: 96h
+        memory_percent: 90
+        preempt_rank: 100
+
   starter-dgx-v100:
     slurm_account: default
     default_tier: standard

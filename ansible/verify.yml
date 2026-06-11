@@ -44,6 +44,46 @@
       register: ssn_check_sinfo
       changed_when: false
 
+    - name: Verify GPU count for GPU profiles
+      ansible.builtin.command:
+        argv:
+          - nvidia-smi
+          - --query-gpu=index,name,uuid
+          - --format=csv,noheader
+      register: ssn_check_nvidia
+      changed_when: false
+      failed_when:
+        - ssn.derived.has_gpus | bool
+        - ssn_check_nvidia.stdout_lines | length != ssn.hardware.gpus | int
+      when: ssn.derived.has_gpus | bool
+
+    - name: Verify Slurm node details
+      ansible.builtin.command:
+        argv:
+          - scontrol
+          - show
+          - node
+          - "{{ ssn.identity.node_name }}"
+      register: ssn_check_node
+      changed_when: false
+
+    - name: Assert GPU GRES appears only for GPU profiles
+      ansible.builtin.assert:
+        that:
+          - >-
+            (ssn.derived.has_gpus | bool and 'Gres=gpu:' in ssn_check_node.stdout)
+            or
+            ((not ssn.derived.has_gpus | bool) and 'Gres=(null)' in ssn_check_node.stdout)
+        fail_msg: "Slurm GRES state does not match the selected profile."
+
+    - name: Assert node is schedulable after apply
+      ansible.builtin.assert:
+        that:
+          - "'DRAIN' not in ssn_check_node.stdout"
+          - "'INVAL' not in ssn_check_node.stdout"
+          - "'DOWN' not in ssn_check_node.stdout"
+        fail_msg: "Slurm node is not schedulable after apply."
+
     - name: Verify cgroup v2
       ansible.builtin.command: stat -fc %T /sys/fs/cgroup
       register: ssn_check_cgroup
@@ -59,3 +99,4 @@
           - "slurmctld={{ ssn_check_slurmctld.stdout }}"
           - "slurmd={{ ssn_check_slurmd.stdout }}"
           - "sinfo={{ ssn_check_sinfo.stdout_lines }}"
+          - "node={{ ssn_check_node.stdout_lines }}"

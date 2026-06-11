@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import os
 import platform
@@ -14,6 +15,7 @@ from .config import config_hash, render_profile, repo_root, resolve_profile, sum
 from .users import (
     action_dicts,
     apply_user_actions,
+    backup_file,
     discover_users,
     load_state,
     load_users,
@@ -39,6 +41,7 @@ def main(argv: list[str] | None = None, prog: str | None = None) -> int:
         "ssn-sync-users": sync_users_cmd,
         "ssn-gpu-status": gpu_status_cmd,
         "ssn-archive-status": archive_status_cmd,
+        "ssn-scratch-cleanup": scratch_cleanup_cmd,
     }
     if invoked in direct:
         return direct[invoked](argv)
@@ -52,6 +55,7 @@ def main(argv: list[str] | None = None, prog: str | None = None) -> int:
     sub.add_parser("sync-users")
     sub.add_parser("gpu-status")
     sub.add_parser("archive-status")
+    sub.add_parser("scratch-cleanup")
     ns, rest = parser.parse_known_args(argv)
     return {
         "render": render_cmd,
@@ -61,6 +65,7 @@ def main(argv: list[str] | None = None, prog: str | None = None) -> int:
         "sync-users": sync_users_cmd,
         "gpu-status": gpu_status_cmd,
         "archive-status": archive_status_cmd,
+        "scratch-cleanup": scratch_cleanup_cmd,
     }[ns.command](rest)
 
 
@@ -180,6 +185,7 @@ def sync_users_cmd(argv: list[str]) -> int:
     parser.add_argument("--user", default=None)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--backup-root", default="/var/backups/slurm-single-node/users")
     args = parser.parse_args(argv)
 
     root = repo_root(args.repo)
@@ -205,7 +211,12 @@ def sync_users_cmd(argv: list[str]) -> int:
             flag = "RISKY" if action.risky else "PLAN"
             print(f"{flag:5s} {action.username:20s} {action.action:28s} {action.detail}")
     if args.apply:
-        apply_user_actions(actions, users_doc, resolved)
+        backup_file(args.users, args.backup_root)
+        backup_file(args.state, args.backup_root)
+        state_doc = apply_user_actions(actions, users_doc, resolved, state_doc=state_doc)
+        state_path = Path(args.state)
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(dump_yaml(state_doc))
     return 0
 
 
@@ -245,6 +256,70 @@ def archive_status_cmd(argv: list[str]) -> int:
     return 0
 
 
+def scratch_cleanup_cmd(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="ssn-scratch-cleanup")
+    parser.add_argument("--root", default="/scratch")
+    parser.add_argument("--jobs-root", default="/scratch/jobs")
+    parser.add_argument("--age-days", type=int, default=30)
+    parser.add_argument("--report", default="/var/log/slurm/scratch-cleanup.json")
+    parser.add_argument("--apply", action="store_true", help="delete eligible paths")
+    parser.add_argument("--yes-delete", action="store_true", help="required with --apply")
+    args = parser.parse_args(argv)
+
+    root = Path(args.root).resolve()
+    jobs_root = Path(args.jobs_root).resolve()
+    if str(root) != "/scratch":
+        print(f"ERROR: refusing scratch cleanup outside /scratch: {root}", file=sys.stderr)
+        return 2
+    if str(jobs_root) != "/scratch/jobs":
+        print(f"ERROR: refusing jobs root outside /scratch/jobs: {jobs_root}", file=sys.stderr)
+        return 2
+    if args.apply and not args.yes_delete:
+        print("ERROR: --apply requires --yes-delete", file=sys.stderr)
+        return 2
+    if not root.exists():
+        print("Scratch root is absent; nothing to report.")
+        return 0
+
+    cutoff = dt.datetime.now(dt.timezone.utc).timestamp() - args.age_days * 86400
+    candidates = []
+    for child in sorted(root.iterdir()):
+        if child == jobs_root:
+            continue
+        if child.is_symlink():
+            continue
+        try:
+            stat = child.stat()
+        except OSError:
+            continue
+        if stat.st_mtime > cutoff:
+            continue
+        candidates.append({
+            "path": str(child),
+            "mtime": dt.datetime.fromtimestamp(stat.st_mtime, dt.timezone.utc).isoformat(),
+            "type": "directory" if child.is_dir() else "file",
+        })
+
+    report = {
+        "schema_version": 1,
+        "mode": "apply" if args.apply else "report_only",
+        "root": str(root),
+        "jobs_root_excluded": str(jobs_root),
+        "age_days": args.age_days,
+        "candidate_count": len(candidates),
+        "candidates": candidates,
+    }
+    report_path = Path(args.report)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    print(f"Scratch cleanup report written: {report_path}")
+    print(f"Eligible top-level scratch paths: {len(candidates)}")
+    if args.apply:
+        print("Deletion mode is intentionally not implemented in v1; report only.")
+        return 2
+    return 0
+
+
 def discover_system() -> dict[str, Any]:
     return {
         "schema_version": 1,
@@ -270,6 +345,7 @@ def discover_system() -> dict[str, Any]:
             "data": _findmnt("/data"),
             "scratch": _findmnt("/scratch"),
         },
+        "gpus": _discover_nvidia_gpus(),
     }
 
 
@@ -282,9 +358,15 @@ def verify_local(resolved: dict[str, Any]) -> list[dict[str, str]]:
     checks.append(_check("ansible_playbook", shutil.which("ansible-playbook") is not None, shutil.which("ansible-playbook") or "missing"))
     for label, mount in (resolved["derived"].get("paths") or {}).items():
         if mount:
-            checks.append(_check(f"mount_{label}", Path(mount).exists(), str(mount)))
+            if label in {"data", "scratch"}:
+                mounted = _findmnt(str(mount))
+                checks.append(_check(f"mount_{label}", mounted is not None, mounted or str(mount)))
+            else:
+                checks.append(_check(f"path_{label}", Path(mount).exists(), str(mount)))
     if resolved["derived"]["has_gpus"]:
-        checks.append(_check("nvidia_smi", shutil.which("nvidia-smi") is not None, shutil.which("nvidia-smi") or "missing"))
+        gpus = _discover_nvidia_gpus()
+        expected = int(resolved["hardware"]["gpus"])
+        checks.append(_check("nvidia_smi", len(gpus) == expected, f"expected={expected} discovered={len(gpus)}"))
     return checks
 
 
@@ -302,6 +384,31 @@ def _command_stdout(cmd: list[str]) -> str | None:
 def _findmnt(path: str) -> str | None:
     out = _command_stdout(["findmnt", "-no", "TARGET,SOURCE,FSTYPE,OPTIONS", path])
     return out
+
+
+def _discover_nvidia_gpus() -> list[dict[str, str]]:
+    if shutil.which("nvidia-smi") is None:
+        return []
+    out = _command_stdout([
+        "nvidia-smi",
+        "--query-gpu=index,name,uuid,pci.bus_id,memory.total",
+        "--format=csv,noheader,nounits",
+    ])
+    if not out:
+        return []
+    gpus = []
+    for line in out.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 5:
+            continue
+        gpus.append({
+            "index": parts[0],
+            "name": parts[1],
+            "uuid": parts[2],
+            "pci_bus_id": parts[3],
+            "memory_total_mb": parts[4],
+        })
+    return gpus
 
 
 def _mem_total_mb() -> int | None:

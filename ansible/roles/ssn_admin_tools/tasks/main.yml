@@ -33,6 +33,7 @@
     - ssn-sync-users
     - ssn-verify
     - ssn-archive-status
+    - ssn-scratch-cleanup
 
 - name: Install user-facing GPU status wrapper
   ansible.builtin.template:

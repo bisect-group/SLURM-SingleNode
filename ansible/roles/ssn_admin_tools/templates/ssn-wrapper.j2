@@ -1,4 +1,5 @@
 #!/usr/bin/env sh
+export SSN_REPO="{{ playbook_dir }}/.."
 {% if item == 'ssn-install' %}
 PYTHONPATH=/usr/local/lib/slurm-single-node exec python3 -m ssn.install "$@"
 {% else %}

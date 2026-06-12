@@ -24,4 +24,22 @@ if [ -d "$job_dir" ] && [ ! -L "$job_dir" ]; then
     rm -rf --one-file-system "$job_dir"
 fi
 
+{% if ssn.derived.has_gpus | bool %}
+gpu_mode_file="/etc/slurm-single-node/gpu-isolation-mode"
+if [ -r "$gpu_mode_file" ] && [ "$(cat "$gpu_mode_file" 2>/dev/null)" = "acl" ]; then
+    job_user="${SLURM_JOB_USER:-}"
+    if [ -n "$job_user" ]; then
+        acl_root="/run/slurm-single-node/gpu-acl/$job_user"
+        rm -f "$acl_root/$job_id" 2>/dev/null || true
+        if [ -d "$acl_root" ] && ! find "$acl_root" -type f -print -quit 2>/dev/null | grep -q .; then
+            for dev in /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools /dev/nvidia-modeset /dev/nvidia[0-9]* /dev/nvidia-caps/*; do
+                [ -e "$dev" ] || continue
+                [ -c "$dev" ] || continue
+                setfacl -x "u:${job_user}" "$dev" 2>/dev/null || true
+            done
+        fi
+    fi
+fi
+{% endif %}
+
 exit 0

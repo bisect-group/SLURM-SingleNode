@@ -39,6 +39,14 @@ requests.
 sbatch examples/10-single-gpu.sh
 ```
 
+Direct GPU tools are blocked in login sessions on GPU profiles. Use
+`ssn-gpu-status` for a login-safe status snapshot, and request GPUs through
+Slurm for any command that needs the device:
+
+```bash
+srun --gres=gpu:1 --pty bash
+```
+
 ## Storage
 
 Profiles may expose:
@@ -66,6 +74,8 @@ examples/20-interactive-srun.sh
 
 Remote editors and login shells are for editing, queue checks, file movement,
 and job submission. Direct compute on login is prohibited by policy and
-constrained technically.
+constrained technically. On enforced profiles, managed login sessions may have
+CPU, memory, task, I/O, and direct GPU-device limits; Slurm jobs receive their
+own Slurm-managed cgroups and allocated GPU devices.
 
 Check the site MOTD or ask an admin which profile is active.

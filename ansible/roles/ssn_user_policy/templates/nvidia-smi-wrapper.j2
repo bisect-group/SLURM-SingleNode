@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Managed by Slurm Single-Node.
+set -euo pipefail
+
+real_nvidia_smi="/usr/bin/nvidia-smi"
+
+if [ ! -x "$real_nvidia_smi" ]; then
+    echo "nvidia-smi is not installed at $real_nvidia_smi" >&2
+    exit 127
+fi
+
+if [ "$(id -u)" -eq 0 ] || [ -n "${SLURM_JOB_ID:-}" ] || id -nG 2>/dev/null | tr ' ' '\n' | grep -qx "{{ ssn.derived.admin_group }}"; then
+    exec "$real_nvidia_smi" "$@"
+fi
+
+cat >&2 <<'EOF'
+Direct GPU tools are disabled in login sessions on this Slurm Single-Node host.
+Submit GPU work through Slurm, for example:
+
+  sbatch --gres=gpu:1 your-job.sh
+  srun --gres=gpu:1 --pty bash
+
+Use ssn-gpu-status for a login-safe GPU status snapshot.
+EOF
+exit 126

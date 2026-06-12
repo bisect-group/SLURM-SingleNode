@@ -12,6 +12,14 @@ from pathlib import Path
 from typing import Any
 
 from .config import config_hash, render_profile, repo_root, resolve_profile, summary_text
+from .login import (
+    DEFAULT_FIXTURE_PREFIX as DEFAULT_LOGIN_FIXTURE_PREFIX,
+    collect_gpu_status_snapshot,
+    apply_login_isolation,
+    login_isolation_report,
+    login_isolation_status,
+    login_isolation_status_for_report,
+)
 from .ops import (
     collect_capabilities,
     create_plan_token,
@@ -65,6 +73,9 @@ def main(argv: list[str] | None = None, prog: str | None = None) -> int:
         "ssn-apply": apply_cmd,
         "ssn-sync-users": sync_users_cmd,
         "ssn-gpu-status": gpu_status_cmd,
+        "ssn-gpu-collector": gpu_collector_cmd,
+        "ssn-login-isolation": login_isolation_cmd,
+        "ssn-login-status": login_status_cmd,
         "ssn-archive-status": archive_status_cmd,
         "ssn-scratch-cleanup": scratch_cleanup_cmd,
         "ssn-scratch-health": scratch_health_cmd,
@@ -81,6 +92,9 @@ def main(argv: list[str] | None = None, prog: str | None = None) -> int:
     sub.add_parser("apply")
     sub.add_parser("sync-users")
     sub.add_parser("gpu-status")
+    sub.add_parser("gpu-collector")
+    sub.add_parser("login-isolation")
+    sub.add_parser("login-status")
     sub.add_parser("archive-status")
     sub.add_parser("scratch-cleanup")
     sub.add_parser("scratch-health")
@@ -93,6 +107,9 @@ def main(argv: list[str] | None = None, prog: str | None = None) -> int:
         "apply": apply_cmd,
         "sync-users": sync_users_cmd,
         "gpu-status": gpu_status_cmd,
+        "gpu-collector": gpu_collector_cmd,
+        "login-isolation": login_isolation_cmd,
+        "login-status": login_status_cmd,
         "archive-status": archive_status_cmd,
         "scratch-cleanup": scratch_cleanup_cmd,
         "scratch-health": scratch_health_cmd,
@@ -218,6 +235,7 @@ def apply_cmd(argv: list[str]) -> int:
     report["config_hash"] = config_hash(resolved)
     report["rendered_dir"] = str(output)
     report["capabilities"] = collect_capabilities(resolved, mode="apply")
+    report["login_isolation"] = login_isolation_status_for_report(resolved)
     admin_group = resolved.get("derived", {}).get("admin_group", "slurm_admins")
     ansible_vars = output / "ansible-vars.json"
     cmd = [
@@ -450,17 +468,152 @@ def gpu_status_cmd(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     path = Path(args.snapshot)
     if path.exists():
+        try:
+            payload = json.loads(path.read_text())
+            generated = dt.datetime.fromisoformat(payload.get("generated_at", ""))
+            age = (dt.datetime.now(dt.timezone.utc) - generated).total_seconds()
+            if age > 30:
+                print(f"WARN: GPU status snapshot is stale ({age:.0f}s old).", file=sys.stderr)
+        except Exception:
+            print("WARN: GPU status snapshot exists but could not be parsed.", file=sys.stderr)
         print(path.read_text(), end="")
         return 0
     if shutil.which("nvidia-smi") is None:
         print("No NVIDIA GPU status is available on this CPU-only host.")
         return 0
+    print("WARN: no root/service GPU snapshot found; falling back to live nvidia-smi.", file=sys.stderr)
     cmd = [
         "nvidia-smi",
         "--query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu",
         "--format=csv,noheader",
     ]
     return subprocess.call(cmd)
+
+
+def gpu_collector_cmd(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="ssn-gpu-collector")
+    parser.add_argument("--profile", default="cpu-dev-local")
+    parser.add_argument("--repo", default=None)
+    parser.add_argument("--snapshot", default="/run/slurm-single-node/gpu-status.json")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+
+    try:
+        resolved = resolve_profile(args.profile, repo_root(args.repo))
+        snapshot = collect_gpu_status_snapshot(resolved, snapshot_path=args.snapshot)
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(snapshot, indent=2, sort_keys=True))
+    else:
+        print(f"GPU status snapshot written: {args.snapshot}")
+        print(f"GPU count: {len(snapshot.get('gpus') or [])}")
+        print(f"Slurm GPU jobs: {len(snapshot.get('slurm_jobs') or [])}")
+    return 0
+
+
+def login_isolation_cmd(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="ssn-login-isolation")
+    parser.add_argument("--profile", default="cpu-dev-local")
+    parser.add_argument("--repo", default=None)
+    parser.add_argument("--users", default=DEFAULT_USERS)
+    parser.add_argument("--state", default=DEFAULT_STATE)
+    parser.add_argument("--fixture-prefix", default=DEFAULT_LOGIN_FIXTURE_PREFIX)
+    parser.add_argument("--mode", choices=["cgroup", "acl", "limits", "disabled"], default="cgroup")
+    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--report", default="/etc/slurm-single-node/login-isolation.json")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+
+    try:
+        resolved = resolve_profile(args.profile, repo_root(args.repo))
+        users_doc = load_users(args.users)
+        state_doc = load_state(args.state)
+        errors = [*validate_state(state_doc), *validate_users(users_doc, resolved, state_doc=state_doc)]
+        if errors:
+            raise ValueError("; ".join(errors))
+        report = (
+            apply_login_isolation(
+                users_doc,
+                state_doc,
+                resolved,
+                fixture_prefix=args.fixture_prefix,
+                mode=args.mode,
+                report_path=args.report,
+            )
+            if args.apply
+            else login_isolation_report(
+                users_doc,
+                state_doc,
+                resolved,
+                fixture_prefix=args.fixture_prefix,
+                mode=args.mode,
+            )
+        )
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        action = "Applied" if args.apply else "Planned"
+        print(f"{action} login isolation mode={args.mode} targets={len(report.get('targets') or [])}")
+        if args.apply:
+            print(f"Report: {args.report}")
+        for target in report.get("targets", []):
+            print(f"TARGET {target.get('user')} uid={target.get('uid', '-')} {target.get('status')}")
+    return 0
+
+
+def login_status_cmd(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="ssn-login-status")
+    parser.add_argument("--profile", default="cpu-dev-local")
+    parser.add_argument("--repo", default=None)
+    parser.add_argument("--users", default=DEFAULT_USERS)
+    parser.add_argument("--state", default=DEFAULT_STATE)
+    parser.add_argument("--fixture-prefix", default=DEFAULT_LOGIN_FIXTURE_PREFIX)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+
+    try:
+        resolved = resolve_profile(args.profile, repo_root(args.repo))
+        users_doc = load_users(args.users)
+        state_doc = load_state(args.state)
+        errors = [*validate_state(state_doc), *validate_users(users_doc, resolved, state_doc=state_doc)]
+        if errors:
+            raise ValueError("; ".join(errors))
+        report = login_isolation_status(
+            users_doc,
+            state_doc,
+            resolved,
+            fixture_prefix=args.fixture_prefix,
+        )
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print(f"Login isolation mode: {report.get('mode')}")
+        snapshot = report.get("snapshot") or {}
+        print(
+            "GPU snapshot: "
+            f"exists={snapshot.get('exists')} fresh={snapshot.get('fresh')} "
+            f"gpus={snapshot.get('gpu_count', '-')}"
+        )
+        for status in report.get("status", []):
+            props = status.get("properties") or {}
+            print(
+                f"USER {status['user']} {status['unit']} "
+                f"dropin={status.get('dropin_exists')} "
+                f"CPUQuota={props.get('CPUQuotaPerSecUSec', '-')} "
+                f"MemoryMax={props.get('MemoryMax', '-')} "
+                f"TasksMax={props.get('TasksMax', '-')} "
+                f"DevicePolicy={props.get('DevicePolicy', '-')}"
+            )
+    return 0
 
 
 def archive_status_cmd(argv: list[str]) -> int:

@@ -39,3 +39,14 @@
     owner: root
     group: root
     mode: "0644"
+
+- name: Install friendly nvidia-smi login wrapper
+  ansible.builtin.template:
+    src: nvidia-smi-wrapper.j2
+    dest: /usr/local/bin/nvidia-smi
+    owner: root
+    group: root
+    mode: "0755"
+  when:
+    - ssn.derived.has_gpus | bool
+    - ssn.resolved_policies.login.gpu_outside_slurm.friendly_path_wrappers | default(false) | bool

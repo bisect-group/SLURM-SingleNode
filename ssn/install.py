@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import config_hash, render_profile, repo_root, resolve_profile, summary_text
+from .login import login_isolation_status_for_report
 from .ops import (
     collect_capabilities,
     drain_node,
@@ -201,6 +202,7 @@ class Installer:
         self._log(f"User: euid={os.geteuid()} sudo_user={os.environ.get('SUDO_USER') or ''}")
         capabilities = collect_capabilities(resolved, mode="install")
         self.report["capabilities"] = capabilities
+        self.report["login_isolation"] = login_isolation_status_for_report(resolved)
         self._log(f"OS: {capabilities['os']['pretty_name']}")
         self._log(f"Kernel: {capabilities['os']['kernel']}")
         self._log(f"cgroup fs: {capabilities['cgroup_fs']}")
@@ -280,6 +282,7 @@ class Installer:
             return
         capabilities = collect_capabilities(resolved, mode="install")
         self.report["capabilities"] = capabilities
+        self.report["login_isolation"] = login_isolation_status_for_report(resolved)
         errors = validate_feature_gates(resolved, mode="install", capabilities=capabilities)
         if errors:
             raise RuntimeError("feature gate failed: " + "; ".join(errors))

@@ -36,6 +36,9 @@
     - ssn-archive-status
     - ssn-scratch-cleanup
     - ssn-scratch-health
+    - ssn-gpu-collector
+    - ssn-login-isolation
+    - ssn-login-status
 
 - name: Install user-facing GPU status wrapper
   ansible.builtin.template:
@@ -46,6 +49,58 @@
     mode: "0755"
   vars:
     item: ssn-gpu-status
+
+- name: Install GPU status collector service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/ssn-gpu-status.service
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Slurm Single-Node GPU status snapshot
+      After=slurmctld.service slurmd.service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/ssn-gpu-collector --profile {{ ssn.profile }} --snapshot /run/slurm-single-node/gpu-status.json
+  when: ssn.derived.has_gpus | bool
+  notify: Reload systemd
+
+- name: Install GPU status collector timer
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/ssn-gpu-status.timer
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Refresh Slurm Single-Node GPU status snapshot
+
+      [Timer]
+      OnBootSec=10s
+      OnUnitActiveSec={{ ssn.resolved_policies.login.gpu_outside_slurm.refresh | default('10s') }}
+      AccuracySec=1s
+      Unit=ssn-gpu-status.service
+
+      [Install]
+      WantedBy=timers.target
+  when: ssn.derived.has_gpus | bool
+  notify: Reload systemd
+
+- name: Enable GPU status collector timer
+  ansible.builtin.systemd:
+    name: ssn-gpu-status.timer
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: ssn.derived.has_gpus | bool
+
+- name: Refresh GPU status snapshot once
+  ansible.builtin.command: /usr/local/sbin/ssn-gpu-collector --profile {{ ssn.profile }} --snapshot /run/slurm-single-node/gpu-status.json
+  changed_when: false
+  failed_when: false
+  when: ssn.derived.has_gpus | bool
 
 - name: Install optional Tesla compatibility aliases
   ansible.builtin.file:

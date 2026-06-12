@@ -1,6 +1,6 @@
 # SSN Current Implementation Status
 
-Audit date: 2026-06-11
+Audit date: 2026-06-12
 
 Source decision contract: `docs/decisions.md`
 
@@ -16,7 +16,10 @@ drained reinstall idempotence, user-sync no-op idempotence, targeted fixture
 drift repair, quota capability reporting with unsupported fixture quota apply
 skip, Slurm `--export=NONE` cache/default environment injection, scratch
 health marker gating, fixture-only tokenized scratch cleanup deletion, and final
-CPU/GPU/scratch smoke tests were observed during live testing.
+CPU/GPU/scratch smoke tests were observed during live testing. A later login
+and GPU-isolation tranche also live-tested fixture-scoped systemd login slices,
+cgroup v2 direct GPU denial, Slurm GPU access by the same user, root GPU status
+snapshots, and Slurm job mapping on the Quadro host.
 
 Status buckets:
 
@@ -34,15 +37,16 @@ Quadro P620 host has passed live end-to-end install and Slurm smoke testing.
 
 The strongest implemented areas are the resolver/profile model, core Slurm
 configuration, accounting/QoS tiers, preemption wiring, single-command install,
-GPU GRES rendering, per-job scratch basics, accounting database backups, and
-active/suspended user sync for managed fixture users. User sync is now
-current-state-aware enough for the managed Quadro fixtures to produce a clean
-no-op dry-run after repair.
+GPU GRES rendering, per-job scratch basics, accounting database backups,
+active/suspended user sync for managed fixture users, fixture-scoped login
+cgroup limits, hard direct-GPU denial for fixture login sessions, and root GPU
+status snapshots. User sync is now current-state-aware enough for the managed
+Quadro fixtures to produce a clean no-op dry-run after repair.
 
-The largest remaining gaps are production quota enforcement, hard login
-confinement, hard non-Slurm GPU denial, root/service GPU status snapshots, full
-GPU health gates and CPU-only recovery, inactive archive lifecycle,
-CUDA/module management, and production-grade user docs.
+The largest remaining gaps are production quota enforcement, production-wide
+login/GPU isolation beyond fixtures, full multi-GPU health gates and CPU-only
+recovery, inactive archive lifecycle, CUDA/module management, and
+production-grade user docs.
 
 ## Generalization Model
 
@@ -82,7 +86,7 @@ CUDA/module management, and production-grade user docs.
 | Target cgroup v2 only. | Installer and Ansible fail if cgroup fs is not `cgroup2fs`; Slurm cgroup config uses v2. | Implemented correctly | `ssn/install.py`, `ansible/site.yml`, `cgroup.conf.j2` | None. |
 | NVIDIA whole-GPU and CPU-only only; MIG/MPS/shared fail closed unless supported. | Profiles encode fail-closed modes and feature gates verify expected whole-GPU count/device files. MIG/MPS/shared mode detection is not implemented. | Implemented partially | `profiles/generic-gpu.yml`, `ssn/ops.py` | Add validation of MIG/MPS/shared modes during GPU verify. |
 | Validate driver, do not install it. | Installer/Ansible require `nvidia-smi` for GPU profiles; no driver install role. | Implemented correctly | `ssn/install.py`, `ansible/site.yml` | Add clearer driver/toolkit diagnostic output. |
-| GPU mapping verification as boot/apply health gate. | Basic GPU count, `/dev/nvidiaN`, rendered GRES entry count, installed `gres.conf`, and Slurm node GRES checks exist; full NVML/CUDA/status/topology gate does not. | Implemented partially | `ansible/verify.yml`, `ssn/ops.py`, `ssn/cli.py`, live Quadro reports | Implement full GPU verification and health-state handling. |
+| GPU mapping verification as boot/apply health gate. | Basic GPU count, `/dev/nvidiaN`, rendered GRES entry count, installed `gres.conf`, and Slurm node GRES checks exist. Root GPU status snapshots and single-GPU Slurm job mapping are now live-tested. Full NVML/CUDA ordering, topology, multi-GPU mapping, and health-state gate remain incomplete. | Implemented partially | `ansible/verify.yml`, `ssn/ops.py`, `ssn/cli.py`, `ssn/login.py`, live Quadro reports | Implement full GPU verification and health-state handling. |
 | CPU-only recovery overlay on GPU verification failure. | Not implemented. | Yet to be implemented | No overlay/recovery code present | Add drain/hold/overlay workflow. |
 | Apptainer optional/off by default. | Policy marks off; roots are created. No install/config workflow. | Implemented partially | `policies/modules.yml`, `ssn_modules` role | Add optional Apptainer management if profile enables it. |
 
@@ -91,7 +95,7 @@ CUDA/module management, and production-grade user docs.
 | Decision / Requirement | Current Code State | Status Bucket | Evidence | Follow-up Needed |
 |---|---|---|---|---|
 | Default command prefix is `ssn-*`. | Implemented for repo and installed wrappers. | Implemented correctly | `bin/ssn-*`, `ansible/roles/ssn_admin_tools/tasks/main.yml` | Make prefix fully configurable for all wrappers if non-ssn prefix is needed. |
-| Core helper commands exist. | All listed commands exist, plus installer, scratch cleanup, and scratch health. | Implemented correctly | `bin/`, `ssn/cli.py` | `ssn-archive-status` is status-only until archive lifecycle exists. |
+| Core helper commands exist. | All listed commands exist, plus installer, scratch cleanup, scratch health, login isolation/status, and GPU collector commands. | Implemented correctly | `bin/`, `ssn/cli.py` | `ssn-archive-status` is status-only until archive lifecycle exists. |
 | DGX may install `tesla-*` aliases. | Conditional alias install exists for selected tools. | Implemented correctly | `ssn_admin_tools` role | Expand aliases only after DGX parity review. |
 | Deployed user source is `/etc/slurm-single-node/users.yml`. | CLI default points there. | Implemented correctly | `ssn/cli.py` | Ensure installer creates example or empty file when desired. |
 
@@ -165,11 +169,11 @@ CUDA/module management, and production-grade user docs.
 | Decision / Requirement | Current Code State | Status Bucket | Evidence | Follow-up Needed |
 |---|---|---|---|---|
 | Constrained login default, not strict Slurm-only SSH. | Implemented as policy docs, MOTD/banner, shell defaults, and process limit. | Implemented differently | `ssn_user_policy` role | Add real cgroup login slice enforcement. |
-| Per non-admin user login slice: 2 CPUs, 4 GB RAM, 128 tasks, low I/O weight. | Only `nproc` limits are installed; CPU/RAM/I/O slices are not implemented. | Yet to be implemented | `/etc/security/limits.d` template | Design and test systemd/PAM slice integration safely. |
-| Admin users exempt. | Admins are in profile and admin groups are created, but cap exemption is not meaningful until caps exist. | Yet to be implemented | `profiles/*.yml`, `ssn_base` role | Wire exemption into login slice policy. |
-| Hard non-Slurm GPU denial through cgroup v2 devices. | Not implemented; GPU direct access is not blocked. | Yet to be implemented | No device policy role present | Implement after confirming Slurm GPU job cgroups remain unaffected. |
-| Friendly PATH wrappers for direct GPU tools. | Not implemented. | Yet to be implemented | No wrapper templates present | Add wrappers once hard enforcement is safe. |
-| Profile-prefixed GPU status wrapper with 10s root snapshot and Slurm job mapping. | `ssn-gpu-status` exists, but falls back to live `nvidia-smi`; no collector or job mapping. | Implemented differently | `ssn/cli.py`, admin tools role | Add root/service collector and `/run` snapshot. |
+| Per non-admin user login slice: 2 CPUs, 4 GB RAM, 128 tasks, low I/O weight. | Implemented and live-tested for active managed `ssn-test-*` fixture users with per-user `user-<uid>.slice` drop-ins: `CPUQuota=200%`, `MemoryMax=4GB`, `TasksMax=128`, and `IOWeight=50`. Slurm CPU/GPU jobs by the same user stayed under `slurmstepd` cgroups, not the login slice. Production-wide non-admin rollout is not enabled. | Implemented partially | `ssn/login.py`, `ssn-login-isolation`, live Quadro SSH/session and Slurm job cgroup tests | Generalize beyond fixtures after more safety testing. |
+| Admin users exempt. | Fixture-scoped login isolation excludes configured admins; root/admin Slurm operation remains unaffected. Production-wide cap exemption still needs rollout testing. | Implemented partially | `ssn/login.py`, profiles, live Quadro tests | Re-test when applying to all managed/non-admin users. |
+| Hard non-Slurm GPU denial through cgroup v2 devices. | Implemented and live-tested for active managed fixture login sessions in cgroup mode. SSH as `ssn-test-standard` landed in `user-1003.slice`; absolute `/usr/bin/nvidia-smi` failed with NVML error, while `sbatch --gres=gpu:1 nvidia-smi` by the same user succeeded under Slurm cgroups. Production-wide denial is not enabled. | Implemented partially | `ssn/login.py`, per-user slice drop-ins, live Quadro direct-denial and Slurm GPU tests | Generalize scope and add multi-user/multi-GPU tests. |
+| Friendly PATH wrappers for direct GPU tools. | `nvidia-smi` wrapper is installed on GPU profiles. It allows root/admins and Slurm jobs through to `/usr/bin/nvidia-smi`; ordinary login use gets a friendly Slurm-only message. Other GPU tools are not wrapped yet. | Implemented partially | `nvidia-smi-wrapper.j2`, live Quadro wrapper test | Add wrappers for additional GPU tools as needed. |
+| Profile-prefixed GPU status wrapper with 10s root snapshot and Slurm job mapping. | `ssn-gpu-status` now reads a root/service snapshot refreshed by `ssn-gpu-status.timer`; the collector includes utilization, memory, temperature, identity, and Slurm job/user mapping. Live single-GPU Quadro mapping worked for a running fixture GPU job. Multi-GPU exact device mapping remains basic. | Implemented partially | `ssn/login.py`, `ssn-gpu-collector`, admin tools role, live Quadro snapshot test | Harden multi-GPU mapping and stale/failure reporting. |
 | No process-policing daemon in v1. | No policing daemon exists. | Implemented correctly | Repo inspection | None. |
 
 ## Storage Policy
@@ -241,13 +245,13 @@ CUDA/module management, and production-grade user docs.
 | `policies/storage.yml` shape. | Policy exists; directory creation, per-job scratch, scratch health marker gating, quota capability reporting, and fixture-only cleanup apply are active. Archive, production quota enforcement, and production cleanup deletion remain incomplete. | Implemented partially | `policies/storage.yml`, `ssn/storage.py`, storage role | Implement archive workflows and production quota/cleanup enforcement after policy signoff. |
 | `policies/cache.yml` shape. | Policy exists and is injected into login shells and Slurm jobs as defaults. | Implemented correctly | `policies/cache.yml`, `ssn-profile.sh.j2`, `ssn-job-env-task-prolog.j2`, live `--export=NONE` job | Add profile-specific cache extensions only when needed. |
 | `policies/modules.yml` shape. | Policy exists; roots only. | Implemented partially | `policies/modules.yml`, modules role | Implement module/CUDA behavior. |
-| `policies/login.yml` shape. | Policy exists; only conservative limits/banner are active. | Implemented partially | `policies/login.yml`, user policy role | Implement systemd/PAM/cgroup enforcement. |
+| `policies/login.yml` shape. | Policy exists; conservative limits/banner are active, and fixture-scoped systemd login-slice enforcement plus GPU cgroup denial are implemented through explicit admin commands. Production-wide policy application remains incomplete. | Implemented partially | `policies/login.yml`, `ssn_user_policy` role, `ssn/login.py`, live Quadro tests | Generalize and harden login/GPU isolation beyond fixtures. |
 
 ## User-Facing Docs And Examples
 
 | Decision / Requirement | Current Code State | Status Bucket | Evidence | Follow-up Needed |
 |---|---|---|---|---|
-| New `user-kit/` docs and examples. | Basic docs and CPU/GPU examples exist. | Implemented partially | `user-kit/README.md`, `user-kit/examples/` | Generate/profile-check examples and expand guidance. |
+| New `user-kit/` docs and examples. | Basic docs and CPU/GPU examples exist. The README now explains constrained login, direct GPU denial, `ssn-gpu-status`, and Slurm GPU workflow. | Implemented partially | `user-kit/README.md`, `user-kit/examples/` | Generate/profile-check examples and expand guidance. |
 | Remove missing `gpu-shell`/`gpu-jupyter` helper model. | New docs use `sbatch`/`srun`; old `SLURM-user-kit` still exists for reference. | Implemented correctly | `user-kit/` | Decide when to archive/remove old user kit. |
 | Interactive workflows examples only. | `20-interactive-srun.sh` exists; no helper command added. | Implemented correctly | `user-kit/examples/20-interactive-srun.sh` | Add caveats around preemption/cancellation. |
 
@@ -260,7 +264,7 @@ CUDA/module management, and production-grade user docs.
 | Render-review gate for GPU/DGX production. | Generic GPU contains `REVIEW_REQUIRED`; render fails unless allowed. | Implemented correctly | `ssn/config.py`, tests | Add review artifact workflow. |
 | Live apply refuses changes while jobs are running unless force/drain. | `ssn-install` and `ssn-apply --run` refuse when `squeue` has queued jobs unless `--force --plan-token` is supplied, or `--drain` successfully drains the node and waits for active jobs to clear. `--check` remains allowed without a token. | Implemented correctly | `ssn/install.py`, `ssn/cli.py`, `ssn/ops.py`, live Quadro queued-job refusal, force token, drain success, drain timeout, and drained install tests | Add a richer drain/hold workflow only if future multi-node or recovery needs demand it. |
 | Resumable apply/sync workflows. | Partial user state update exists; install reports phases. Not truly resumable. | Yet to be implemented | `ssn/install.py`, `ssn/users.py` | Add staged reconciliation and repair plans. |
-| GPU verification tests include login denial and Slurm GPU access. | Slurm GPU job access live-tested. Login denial not implemented/tested. | Yet to be implemented | live Quadro smoke, no denial role | Add full GPU verification suite. |
+| GPU verification tests include login denial and Slurm GPU access. | Fixture-scoped login denial and Slurm GPU access by the same user were live-tested on Quadro. This is not yet a full production GPU health gate and does not cover multi-GPU mapping or CPU-only recovery. | Implemented partially | live Quadro SSH direct-denial and Slurm GPU tests | Add full GPU verification suite. |
 | Scratch-unhealthy, archive, hook, tombstone tests. | Scratch happy path, per-job cleanup, and unhealthy marker/job rejection were live-tested. Archive, hook, and tombstone tests remain absent. | Implemented partially | `ssn/storage.py`, live Quadro scratch health test | Add archive/hook/tombstone integration tests with inactive lifecycle. |
 | Static tests. | Unit tests, compileall, shell syntax, render checks, `git diff --check`, and remote static tests pass. Tests now include schema validation, capability gates, drain wait timeout behavior, user-sync idempotence, quota report safety, scratch health, cleanup operation hashes, and fixture cleanup safety. | Implemented correctly | `tests/`, live session notes | Add CI entrypoint when repo is ready. |
 
@@ -281,6 +285,8 @@ CUDA/module management, and production-grade user docs.
 | Report-only retention helpers. | Plan and user-backup retention candidates are reported without deleting files. | `ssn/safety.py`, `ssn/install.py`, `ssn/cli.py` | Convert to approved deletion only after policy signoff. |
 | `ssn-plan-token` risk-token helper. | Added as an admin command for creating reviewed, short-lived tokens from install/apply reports. | `bin/ssn-plan-token`, `ssn/ops.py`, `ssn/cli.py`, live Quadro token test | Extend beyond queued-job risk as future risky workflows are implemented. |
 | Explicit drain workflow. | `ssn-install` and `ssn-apply --run` support `--drain`, `--drain-timeout`, and `--drain-reason`; live tests covered success, timeout safe resume, and drained reinstall idempotence. | `ssn/install.py`, `ssn/cli.py`, `ssn/ops.py`, live Quadro reports | Keep; consider pending-job hold semantics only if future workflows need it. |
+| Fixture-scoped login isolation commands. | Added `ssn-login-isolation` and `ssn-login-status` for cgroup/ACL/disabled modes and per-user slice reporting. Live cgroup mode succeeded; ACL fallback code exists but was not needed live. | `ssn/login.py`, `bin/ssn-login-isolation`, `bin/ssn-login-status`, live Quadro tests | Keep fixture-scoped until wider rollout is approved. |
+| Root GPU status collector. | Added `ssn-gpu-collector` plus `ssn-gpu-status.service/timer`; live snapshot and single-GPU job mapping passed. | `ssn/login.py`, `bin/ssn-gpu-collector`, admin tools role, live Quadro tests | Harden multi-GPU mapping. |
 
 ## Next Implementation Queue
 
@@ -309,11 +315,13 @@ CUDA/module management, and production-grade user docs.
 
 ### Priority 3: Login And GPU Isolation
 
-- Implement dedicated non-admin login slices with CPU/RAM/task/I/O limits.
-- Preserve Slurm-owned job cgroups outside login caps.
-- Implement hard non-Slurm GPU device denial for non-admin login sessions.
-- Add friendly GPU tool wrappers after hard enforcement is proven.
-- Add root/service GPU status collector with Slurm job/user mapping.
+- Generalize fixture-scoped login slices to all managed non-admin users, then
+  optionally to all local non-admin users after safety review.
+- Harden cgroup GPU denial across multiple concurrent users and multi-GPU
+  hosts; keep the ACL fallback available but disabled unless needed.
+- Add wrappers for additional direct GPU tools beyond `nvidia-smi`.
+- Improve root/service GPU status mapping for multi-GPU jobs and exact device
+  allocation.
 
 ### Priority 4: Inactive Lifecycle
 

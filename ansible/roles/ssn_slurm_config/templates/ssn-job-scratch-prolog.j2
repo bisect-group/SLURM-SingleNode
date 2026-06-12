@@ -53,5 +53,25 @@ else
     chown "$job_user" "$job_dir"
 fi
 
+{% if ssn.derived.has_gpus | bool %}
+gpu_mode_file="/etc/slurm-single-node/gpu-isolation-mode"
+if [ -r "$gpu_mode_file" ] && [ "$(cat "$gpu_mode_file" 2>/dev/null)" = "acl" ]; then
+    job_details="$(scontrol show job "$job_id" -o 2>/dev/null || true)"
+    case "$job_details" in
+        *gres/gpu*|*gpu:*)
+            acl_root="/run/slurm-single-node/gpu-acl/$job_user"
+            mkdir -p "$acl_root"
+            chmod 0700 "$acl_root"
+            touch "$acl_root/$job_id"
+            for dev in /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools /dev/nvidia-modeset /dev/nvidia[0-9]* /dev/nvidia-caps/*; do
+                [ -e "$dev" ] || continue
+                [ -c "$dev" ] || continue
+                setfacl -m "u:${job_user}:rw" "$dev" 2>/dev/null || true
+            done
+            ;;
+    esac
+fi
+{% endif %}
+
 trap - EXIT
 exit 0

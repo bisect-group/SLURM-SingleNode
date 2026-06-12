@@ -44,11 +44,14 @@ from .storage import (
 )
 from .units import duration_to_seconds
 from .users import (
+    INACTIVE_LOCAL_ONLY_RISK,
     action_dicts,
     apply_user_actions,
     backup_file,
     backup_retention_report,
     discover_users,
+    inactive_actions,
+    inactive_plan_report,
     load_state,
     load_users,
     plan_user_sync,
@@ -61,6 +64,7 @@ from .yamlutil import dump_yaml
 
 DEFAULT_USERS = "/etc/slurm-single-node/users.yml"
 DEFAULT_STATE = "/var/lib/slurm-single-node/users-state.yml"
+DEFAULT_TOKEN_STORE = "/var/lib/slurm-single-node/plan-tokens"
 
 
 def main(argv: list[str] | None = None, prog: str | None = None) -> int:
@@ -374,8 +378,12 @@ def sync_users_cmd(argv: list[str]) -> int:
     parser.add_argument("--users", default=DEFAULT_USERS)
     parser.add_argument("--state", default=DEFAULT_STATE)
     parser.add_argument("--user", default=None)
+    parser.add_argument("--dry-run", action="store_true", help="plan only; this is the default without --apply")
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--plan-output", default=None, help="write inactive lifecycle plan report to this path")
+    parser.add_argument("--plan-token", default=None, help="reviewed token required for inactive lifecycle apply")
+    parser.add_argument("--token-store", default=DEFAULT_TOKEN_STORE)
     parser.add_argument("--backup-root", default="/var/backups/slurm-single-node/users")
     parser.add_argument("--retention-days", type=int, default=90)
     parser.add_argument("--quota-report", action="store_true", help="report quota capability for fixture users")
@@ -401,16 +409,45 @@ def sync_users_cmd(argv: list[str]) -> int:
             print(f"ERROR: {error}", file=sys.stderr)
         return 2
     actions = plan_user_sync(users_doc, state_doc, resolved, single_user=args.user)
+    inactive = inactive_actions(actions)
+    inactive_report = None
+    inactive_report_path = None
+    if inactive:
+        inactive_report = inactive_plan_report(actions, users_doc, state_doc, resolved)
+        inactive_report_path = Path(args.plan_output) if args.plan_output else _default_sync_plan_path("inactive-plan.json")
+        write_protected_json(inactive_report_path, inactive_report, group=resolved["derived"]["admin_group"])
     quota_requested = args.quota_report or args.apply_fixture_quotas
     if args.json and not args.apply and not quota_requested:
-        print(json.dumps({"actions": action_dicts(actions)}, indent=2, sort_keys=True))
+        payload = {"actions": action_dicts(actions)}
+        if inactive_report:
+            payload["inactive_plan"] = inactive_report
+            payload["inactive_plan_path"] = str(inactive_report_path)
+        print(json.dumps(payload, indent=2, sort_keys=True))
     elif not args.json:
         if not actions:
             print("No user changes planned.")
         for action in actions:
             flag = "RISKY" if action.risky else "PLAN"
             print(f"{flag:5s} {action.username:20s} {action.action:28s} {action.detail}")
+        if inactive_report_path:
+            print(f"Inactive lifecycle plan: {inactive_report_path}")
+            print(f"Inactive lifecycle risk: {INACTIVE_LOCAL_ONLY_RISK}")
     if args.apply:
+        if inactive:
+            if not args.plan_token:
+                print("ERROR: inactive lifecycle apply requires --plan-token", file=sys.stderr)
+                print(f"Inactive lifecycle plan: {inactive_report_path}", file=sys.stderr)
+                return 2
+            try:
+                validate_plan_token(
+                    args.plan_token,
+                    inactive_report or {},
+                    risk=INACTIVE_LOCAL_ONLY_RISK,
+                    store_root=args.token_store,
+                )
+            except Exception as exc:
+                print(f"ERROR: {exc}", file=sys.stderr)
+                return 2
         users_backup = backup_file(args.users, args.backup_root)
         state_backup = backup_file(args.state, args.backup_root)
         if not args.json:
@@ -418,7 +455,13 @@ def sync_users_cmd(argv: list[str]) -> int:
                 print(f"Backed up users.yml: {users_backup}")
             if state_backup:
                 print(f"Backed up users-state.yml: {state_backup}")
-        state_doc = apply_user_actions(actions, users_doc, resolved, state_doc=state_doc)
+        state_doc = apply_user_actions(
+            actions,
+            users_doc,
+            resolved,
+            state_doc=state_doc,
+            allow_inactive_fixture=bool(inactive),
+        )
         state_path = Path(args.state)
         state_path.parent.mkdir(parents=True, exist_ok=True)
         state_path.write_text(dump_yaml(state_doc))
@@ -460,6 +503,11 @@ def sync_users_cmd(argv: list[str]) -> int:
                     f"{action.get('reason') or action.get('path') or ''}"
                 )
     return 0
+
+
+def _default_sync_plan_path(filename: str) -> Path:
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d%H%M%S")
+    return Path("/var/lib/slurm-single-node/plans") / f"user-sync-{stamp}" / filename
 
 
 def gpu_status_cmd(argv: list[str]) -> int:
@@ -619,18 +667,57 @@ def login_status_cmd(argv: list[str]) -> int:
 def archive_status_cmd(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="ssn-archive-status")
     parser.add_argument("--state", default=DEFAULT_STATE)
+    parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     state = load_state(args.state)
     users = state.get("users") or {}
-    found = False
+    rows = []
     for username, entry in sorted(users.items()):
         archive_state = entry.get("archive_state")
         if archive_state:
-            found = True
-            print(f"{username:20s} {archive_state}")
+            rows.append(
+                {
+                    "username": username,
+                    "archive_state": archive_state,
+                    "archive_path": entry.get("archive_path"),
+                    "local_only": entry.get("archive_local_only"),
+                    "last_error": entry.get("archive_last_error"),
+                    "next_action": _archive_next_action(archive_state),
+                }
+            )
+    if args.json:
+        print(json.dumps({"archives": rows}, indent=2, sort_keys=True))
+        return 0
+    found = False
+    for row in rows:
+        found = True
+        print(
+            f"{row['username']:20s} {row['archive_state']:20s} "
+            f"local_only={row['local_only']} next={row['next_action']}"
+        )
+        if row.get("archive_path"):
+            print(f"{'':20s} archive={row['archive_path']}")
+        if row.get("last_error"):
+            print(f"{'':20s} error={row['last_error']}")
     if not found:
         print("No inactive archive workflows recorded.")
     return 0
+
+
+def _archive_next_action(archive_state: str) -> str:
+    if archive_state == "archive_pending":
+        return "run_archive"
+    if archive_state == "archive_running":
+        return "inspect_or_resume"
+    if archive_state in {"archived_local_only", "backup_complete"}:
+        return "mark_removal_ready"
+    if archive_state == "removal_ready":
+        return "remove_account"
+    if archive_state == "tombstoned":
+        return "complete"
+    if archive_state == "backup_failed":
+        return "retry_backup_or_local_override"
+    return "unknown"
 
 
 def scratch_health_cmd(argv: list[str]) -> int:

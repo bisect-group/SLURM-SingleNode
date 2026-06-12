@@ -19,7 +19,14 @@ health marker gating, fixture-only tokenized scratch cleanup deletion, and final
 CPU/GPU/scratch smoke tests were observed during live testing. A later login
 and GPU-isolation tranche also live-tested fixture-scoped systemd login slices,
 cgroup v2 direct GPU denial, Slurm GPU access by the same user, root GPU status
-snapshots, and Slurm job mapping on the Quadro host.
+snapshots, and Slurm job mapping on the Quadro host. The inactive lifecycle
+foundation was then live-tested with fixture user `ssn-test-inactive`: inactive
+dry-run manifest/report generation, local-only reviewed plan token, running job
+cancellation, local 7z archive creation, `/data` lockout, account removal,
+UID/GID tombstone state, token reuse rejection, and explicit UID/GID
+reactivation all passed. A managed `sbatch` PATH wrapper was added after live
+testing showed this Slurm build did not expose `--no-requeue` reliably to
+`job_submit.lua`.
 
 Status buckets:
 
@@ -41,12 +48,14 @@ GPU GRES rendering, per-job scratch basics, accounting database backups,
 active/suspended user sync for managed fixture users, fixture-scoped login
 cgroup limits, hard direct-GPU denial for fixture login sessions, and root GPU
 status snapshots. User sync is now current-state-aware enough for the managed
-Quadro fixtures to produce a clean no-op dry-run after repair.
+Quadro fixtures to produce a clean no-op dry-run after repair, and the
+inactive lifecycle has a fixture-scoped end-to-end implementation with reviewed
+local-only archive tokens and UID/GID reactivation checks.
 
 The largest remaining gaps are production quota enforcement, production-wide
 login/GPU isolation beyond fixtures, full multi-GPU health gates and CPU-only
-recovery, inactive archive lifecycle, CUDA/module management, and
-production-grade user docs.
+recovery, production-grade inactive archive backup hooks/service QoS,
+CUDA/module management, and production-grade user docs.
 
 ## Generalization Model
 
@@ -71,10 +80,10 @@ production-grade user docs.
 | Light-dependency Python resolver. | Implemented with stdlib plus PyYAML. | Implemented correctly | `ssn/config.py`, `ssn/yamlutil.py` | None. |
 | Strict validation before touching the system. | Resolver validates authored profiles and policy files for `schema_version: 1`, unknown fields, required fields after profile inheritance, primitive/container types, and legal `REVIEW_REQUIRED` placement. Install/apply also validate host/profile match, capabilities, and Slurm feature shape before applying. | Implemented correctly | `ssn/config.py`, `ssn/schema.py`, `ssn/install.py`, `ssn/ops.py`, tests, live Quadro apply/install reports | Keep schemas current as new domains mature; add migrations only when schema versions change. |
 | Unknown fields fail validation. | Authored profile/policy/user/state unknown fields now fail validation; `x_*` keys are allowed as explicit local-extension escape hatches. | Implemented correctly | `ssn/schema.py`, `ssn/users.py`, `tests/test_schema.py`, `tests/test_users.py` | Keep schemas current as policy files grow. |
-| Dry run produces readable and JSON plan artifacts. | Installer dry-run renders/readably reports; live install/apply write protected JSON reports and summaries. `ssn-sync-users --json` outputs planned actions. | Implemented differently | `ssn/install.py`, `ssn/cli.py`, live Quadro reports | Make all dry-runs write protected machine-readable plan artifacts consistently. |
+| Dry run produces readable and JSON plan artifacts. | Installer dry-run renders/readably reports; live install/apply write protected JSON reports and summaries. `ssn-sync-users` writes protected inactive lifecycle plan reports with operation hashes when inactive actions are present. | Implemented differently | `ssn/install.py`, `ssn/cli.py`, `ssn/users.py`, live Quadro inactive plan | Make all remaining dry-runs write protected machine-readable plan artifacts consistently. |
 | Plan artifacts live under `/var/lib/slurm-single-node/plans`, mode `0750/0640`, retained 90 days. | Install and apply reports plus rendered artifacts are written under protected per-run plan dirs; retention is report-only. Reports now include capability snapshots and drain phases when used. | Implemented partially | `ssn/install.py`, `ssn/cli.py`, live Quadro `install-20260611200316`, `apply-20260611195922`, `apply-20260611200037` | Implement actual retention pruning for old plan artifacts when deletion policy is approved. |
-| Redaction classes for secrets, keys, emails, manifests. | Central redaction helpers exist; install reports redact sensitive key names; SSH user plans show labels/fingerprints; DB secret Ansible tasks use `no_log`. Full manifest redaction is not implemented. | Implemented partially | `ssn/safety.py`, `ssn/users.py`, tests, live user dry-run | Extend redaction to future prune/archive manifests and all plan artifact writers. |
-| Risky operations require reviewed plan id/hash tokens. | Implemented for queued-jobs risk on install/apply and for fixture-only scratch cleanup deletion. Tokens are config/input/operation-hash-bound where available, expiring, stored hashed, and single-use. Live forced apply, cleanup deletion, token reuse rejection, and operation-hash mismatch rejection passed. Other risky workflows do not use tokens yet. | Implemented partially | `ssn/ops.py`, `ssn/install.py`, `ssn/cli.py`, `ssn/storage.py`, `bin/ssn-plan-token`, `tests/test_ops.py`, live Quadro token tests | Reuse this token system for inactive pruning/archive, retention deletion, and broader cleanup applies. |
+| Redaction classes for secrets, keys, emails, manifests. | Central redaction helpers exist; install reports redact sensitive key names; SSH user plans show labels/fingerprints; DB secret Ansible tasks use `no_log`. Inactive manifests are protected root/admin-readable plan artifacts, but full terminal path minimization for private manifests is still basic. | Implemented partially | `ssn/safety.py`, `ssn/users.py`, tests, live user and inactive dry-runs | Extend redaction/path minimization to future production prune/archive manifests and all plan artifact writers. |
+| Risky operations require reviewed plan id/hash tokens. | Implemented for queued-jobs risk on install/apply, fixture-only scratch cleanup deletion, and fixture inactive local-only archive apply. Tokens are config/input/operation-hash-bound where available, expiring, stored hashed, and single-use. Live forced apply, cleanup deletion, inactive archive apply, token reuse rejection, and operation-hash mismatch rejection passed. Other risky workflows do not use tokens yet. | Implemented partially | `ssn/ops.py`, `ssn/install.py`, `ssn/cli.py`, `ssn/storage.py`, `ssn/users.py`, `bin/ssn-plan-token`, tests, live Quadro token tests | Reuse this token system for production inactive backup/removal, retention deletion, and broader cleanup applies. |
 | Persist resolved audit file at `/etc/slurm-single-node/config.yml`. | Implemented by base role. | Implemented correctly | `ansible/roles/ssn_base/tasks/main.yml` | None. |
 
 ## Target Scope
@@ -95,7 +104,7 @@ production-grade user docs.
 | Decision / Requirement | Current Code State | Status Bucket | Evidence | Follow-up Needed |
 |---|---|---|---|---|
 | Default command prefix is `ssn-*`. | Implemented for repo and installed wrappers. | Implemented correctly | `bin/ssn-*`, `ansible/roles/ssn_admin_tools/tasks/main.yml` | Make prefix fully configurable for all wrappers if non-ssn prefix is needed. |
-| Core helper commands exist. | All listed commands exist, plus installer, scratch cleanup, scratch health, login isolation/status, and GPU collector commands. | Implemented correctly | `bin/`, `ssn/cli.py` | `ssn-archive-status` is status-only until archive lifecycle exists. |
+| Core helper commands exist. | All listed commands exist, plus installer, scratch cleanup, scratch health, login isolation/status, and GPU collector commands. `ssn-archive-status` reports fixture archive states when present. | Implemented correctly | `bin/`, `ssn/cli.py` | Expand archive status once service archive jobs and backup hooks exist. |
 | DGX may install `tesla-*` aliases. | Conditional alias install exists for selected tools. | Implemented correctly | `ssn_admin_tools` role | Expand aliases only after DGX parity review. |
 | Deployed user source is `/etc/slurm-single-node/users.yml`. | CLI default points there. | Implemented correctly | `ssn/cli.py` | Ensure installer creates example or empty file when desired. |
 
@@ -123,8 +132,8 @@ production-grade user docs.
 | Options raw and parsed mismatch fails. | Implemented validation. | Implemented correctly | `ssn/users.py`, tests | None. |
 | Managed users removed from YAML fail validation. | Planning emits a risky validation error and apply pre-scans validation errors before mutating. | Implemented correctly | `plan_user_sync`, `apply_user_actions`, tests | None for v1. |
 | UID/GID auto with explicit override support. | User creation supports explicit UID/GID; otherwise system allocates; explicit ID conflicts are validated. | Implemented correctly | `ssn/users.py`, tests | Broaden adoption-plan UX. |
-| Inactive reactivation must reuse original UID/GID. | Planning validates this case. | Implemented correctly | `ssn/users.py`, tests | Extend to tombstones once removal exists. |
-| Permanent UID/GID tombstones. | State sketch exists; real tombstone allocation protection is not implemented. | Yet to be implemented | No tombstone allocator present | Implement with inactive removal lifecycle. |
+| Inactive reactivation must reuse original UID/GID. | Planning validates this case, and live Quadro reactivation without explicit IDs was rejected after tombstoning. Reactivation with original UID/GID recreated `ssn-test-inactive` and restored `/data` ownership. | Implemented correctly | `ssn/users.py`, tests, live Quadro inactive/reactivation test | Broaden restore workflow beyond fixture testing. |
+| Permanent UID/GID tombstones. | Fixture inactive apply records original UID/GID and reaches `archive_state: tombstoned` after account removal. Reactivation consumes the original IDs. Permanent tombstone reservation after production account removal is only fixture-proven. | Implemented partially | `ssn/users.py`, live Quadro `ssn-test-inactive` state | Add admin migration/clear workflow and broader conflict tests. |
 | Back up `users.yml` and `users-state.yml` before writes. | CLI backs up both existing files before apply and reports 90-day retention candidates without deleting them. | Implemented partially | `ssn/cli.py`, `ssn/users.py`, live Quadro sync | Add approved retention pruning if desired. |
 | Top-level groups metadata only; user groups authoritative. | Validation rejects `groups.*.members`; apply reconciles SSN-managed supplementary groups and removes stale managed project/tier membership. | Implemented correctly | `ssn/users.py`, tests, live Quadro fixture groups | None for v1 managed users. |
 | Admin-exempt users in profile/site config. | Profiles define admins; Ansible creates admin group memberships. | Implemented partially | `profiles/*.yml`, `ssn_base` role | Wire admin exemptions into login confinement once implemented. |
@@ -132,7 +141,7 @@ production-grade user docs.
 | Staged state-machine reconciliation and resumable repair. | Basic state file update, backups, and validation pre-scan exist; no true staged/resumable state machine. | Yet to be implemented | `ssn/users.py` | Implement resumable user/group/Slurm/archive reconciliation. |
 | Tier templates and per-user overrides. | Tier templates exist. Override validation detects overlapping active fields, but overrides are not applied to associations/limits. | Implemented partially | `policies/tiers.yml`, `ssn/users.py` | Implement override resolution, expiry reconcile, and enforcement. |
 | Suspended lifecycle blocks login/Slurm and kills jobs. | Apply locks the Unix account, removes the default Slurm association, and runs `scancel`; live test killed a pending fixture job and blocked new submissions. PAM/login denial is basic account lock only. | Implemented differently | `ssn/users.py`, live Quadro suspended fixture | Add complete PAM/login denial validation and decide whether association removal is the final Slurm-disable mechanism. |
-| Inactive lifecycle archives, prunes, removes after backup. | Only planned as risky placeholder. | Yet to be implemented | `inactive_state_machine` in `ssn/users.py` | Build full inactive archive workflow. |
+| Inactive lifecycle archives, prunes, removes after backup. | Fixture-scoped local-only inactive lifecycle is implemented for `ssn-test-inactive`: dry-plan manifest, reviewed token, job cancellation, account lock, Slurm association disable, data lock, allowlisted prune, local 7z archive, account removal, tombstone, and reactivation validation were live-tested. Real backup/replication success is not implemented. | Implemented partially | `ssn/users.py`, `ssn/cli.py`, live Quadro inactive lifecycle test | Add production backup hooks, service archive jobs, and non-fixture rollout controls. |
 
 ## Slurm Partitions And Job Requests
 
@@ -142,8 +151,8 @@ production-grade user docs.
 | Generic partition name `compute`. | Implemented for generic and test profiles. | Implemented correctly | `profiles/generic-gpu.yml`, `profiles/gpu-bisect-quadro-p620.yml` | DGX intentionally uses `gpu`. |
 | CPU jobs default; GPU jobs explicitly request GRES. | Implemented and documented in examples. | Implemented correctly | `slurm.conf.j2`, `user-kit/README.md` | Expand docs per profile. |
 | CPU and GPU jobs share node under cgroups and limits. | Implemented in Slurm config and live-tested for GPU allocation. | Implemented correctly | live Quadro smoke | Add concurrent mixed workload tests. |
-| `job_submit.lua` is fast gate for explicit request fields. | Lua gate checks explicit QoS, CPU, GPU, `--no-requeue`; it does not do shellouts. | Implemented correctly | `job_submit.lua.j2` | Add RAM/walltime validation if reliable explicit fields are available. |
-| Reject over-tier CPU/GPU/RAM/walltime, unsafe GPU syntax, no-requeue. | CPU, GPU, disallowed QoS, and no-requeue were live-tested. RAM/walltime/unsafe syntax coverage is incomplete. | Yet to be implemented | `job_submit.lua.j2`, live Quadro fixture jobs | Extend submit filter tests and Lua logic. |
+| `job_submit.lua` is fast gate for explicit request fields. | Lua gate checks explicit QoS, CPU, GPU, scratch health, and attempts to reject no-requeue without shellouts. On Slurm 25.11, `--no-requeue` was not exposed reliably to Lua at submit time, so a managed `/usr/local/bin/sbatch` wrapper was added for the ordinary user PATH. | Implemented differently | `job_submit.lua.j2`, `sbatch-wrapper.j2`, live Quadro no-requeue test | Investigate Slurm `cli_filter` or another server-side path for absolute `/usr/bin/sbatch` no-requeue enforcement. |
+| Reject over-tier CPU/GPU/RAM/walltime, unsafe GPU syntax, no-requeue. | CPU and GPU over-limit rejections passed via Slurm/QoS. Ordinary `sbatch --no-requeue` through PATH now rejects via managed wrapper; absolute `/usr/bin/sbatch --no-requeue` still bypasses on this Slurm build. RAM/walltime/unsafe syntax coverage is incomplete. | Implemented partially | `job_submit.lua.j2`, `sbatch-wrapper.j2`, live Quadro fixture jobs | Add RAM/walltime/unsafe syntax checks and a server-side no-requeue enforcement path if available. |
 
 ## Fairshare And Billing
 
@@ -160,7 +169,7 @@ production-grade user docs.
 |---|---|---|---|---|
 | QOS-based preemption with `REQUEUE`, `JobRequeue=1`, grace 300s. | Implemented in Slurm config and QoS setup. | Implemented correctly | `slurm.conf.j2`, `ssn_slurm_config` tasks | Live preemption test still needed. |
 | QOS `Preempt=` relationships by tier rank. | Implemented from policy relationships. | Implemented correctly | `ssn/config.py`, `ssn_slurm_config` tasks | Add test asserting rendered relationships. |
-| Reject normal-user `--no-requeue`. | Implemented and live-tested. | Implemented correctly | `job_submit.lua.j2`, installer smoke | Admin override path not implemented. |
+| Reject normal-user `--no-requeue`. | Implemented for ordinary user PATH through a managed `sbatch` wrapper and retained in Lua where Slurm exposes the field. Live testing showed absolute `/usr/bin/sbatch --no-requeue` still bypasses the wrapper. | Implemented differently | `sbatch-wrapper.j2`, `job_submit.lua.j2`, live Quadro no-requeue regression test | Find a Slurm-side enforcement option or `cli_filter` workflow for absolute binary bypass. |
 | Interactive `srun` allowed but canceled on preemption. | Docs mention interactive examples; no explicit cancellation policy code beyond Slurm preemption mode. | Yet to be implemented | `user-kit/examples/20-interactive-srun.sh` | Validate actual Slurm behavior and document exactly. |
 | Teach checkpointing. | User docs are basic; checkpointing guidance is not production-grade. | Yet to be implemented | `user-kit/README.md` | Expand docs/examples. |
 
@@ -206,13 +215,13 @@ production-grade user docs.
 
 | Decision / Requirement | Current Code State | Status Bucket | Evidence | Follow-up Needed |
 |---|---|---|---|---|
-| Kill jobs, lock data, prune, archive, backup hook, remove account after success. | Inactive status plans a risky placeholder and apply refuses. | Yet to be implemented | `ssn/users.py` | Build the inactive state machine. |
-| Archive job under service/admin Slurm identity and protected QoS. | Policy-only. | Yet to be implemented | `policies/storage.yml` | Add service account, QoS, job submission, monitoring. |
-| Archive root required and Slurm unavailable blocks transition. | Policy-only. | Yet to be implemented | `policies/storage.yml` | Validate in inactive transition planner. |
-| Prune allowlist, symlink safety, report-only build trees. | Policy-only. | Yet to be implemented | `policies/storage.yml` | Implement prune manifest generator and tokenized apply. |
-| Dry plan writes plan id/hash and real apply requires token. | Not implemented. | Yet to be implemented | No inactive plan token code | Implement with general plan-token system. |
-| Backup hooks after local archive. | Not implemented. | Yet to be implemented | No hook runner present | Add hook directory, environment contract, status handling. |
-| UID/GID tombstones and reactivation semantics. | Reactivation identity validation exists; tombstone lifecycle does not. | Implemented partially | `ssn/users.py`, tests | Finish with archive/removal state machine. |
+| Kill jobs, lock data, prune, archive, backup hook, remove account after success. | Fixture local-only path is implemented: a running `ssn-test-inactive` job was canceled, the Unix account was locked/removed, Slurm association disabled, `/data/ssn-test-inactive` chowned root, home pruned/archived, and state tombstoned. Real backup hook success is not implemented. | Implemented partially | `ssn/users.py`, live Quadro job 46 and archive test | Add production backup hook gate and non-fixture controls before real users. |
+| Archive job under service/admin Slurm identity and protected QoS. | Fixture archive currently runs directly as root/admin during `ssn-sync-users --apply`; it does not submit a protected Slurm archive job. | Implemented differently | `ssn/users.py`, live Quadro inactive apply | Add service/admin QoS and monitored Slurm archive job submission. |
+| Archive root required and Slurm unavailable blocks transition. | Archive root is required by the fixture apply path and `/data/_archive` was used live. Slurm job cancellation/association commands run during apply, but a full "Slurm unavailable blocks transition" preflight is not complete. | Implemented partially | `ssn/users.py`, live Quadro archive path | Add explicit Slurm health gate to inactive transition planner. |
+| Prune allowlist, symlink safety, report-only build trees. | Implemented for the fixture manifest/apply path: fixed allowlisted paths, marker-detected venv/conda envs, symlink remove-link-only handling, and report-only build trees. Live manifest found delete and report-only candidates. | Implemented partially | `ssn/users.py`, `tests/test_users.py`, live Quadro inactive plan | Broaden tests and keep production apply disabled until policy signoff. |
+| Dry plan writes plan id/hash and real apply requires token. | Implemented for inactive fixture lifecycle. Dry-run writes a protected plan with `operation_hash`; apply requires `inactive_local_only_archive` token; token reuse failed live. | Implemented correctly | `ssn/cli.py`, `ssn/users.py`, `ssn-plan-token`, live Quadro inactive plan/token test | Reuse for production backup/removal risks. |
+| Backup hooks after local archive. | Not implemented. The Quadro test used the reviewed local-only override token path. | Yet to be implemented | No hook runner present | Add hook directory, environment contract, status handling. |
+| UID/GID tombstones and reactivation semantics. | Fixture account removal records original UID/GID and tombstone state. Reactivation without explicit original IDs failed; reactivation with original UID/GID recreated the fixture and restored `/data` ownership. | Implemented partially | `ssn/users.py`, tests, live Quadro reactivation | Add permanent production tombstone reservation and admin migration controls. |
 
 ## Modules And Shared Software
 
@@ -238,7 +247,7 @@ production-grade user docs.
 | Decision / Requirement | Current Code State | Status Bucket | Evidence | Follow-up Needed |
 |---|---|---|---|---|
 | `users.yml` shape with groups and keyed users. | Implemented with stricter v1 validation for top-level, group, user, SSH-key, and override keys. | Implemented correctly | `profiles/users.example.yml`, `ssn/users.py`, tests | Extend schema as new lifecycle fields are implemented. |
-| `users-state.yml` state shape with archive states. | Basic state file is written and strictly validates current fields; archive substates/tombstone model incomplete. | Yet to be implemented | `ssn/users.py`, tests | Implement lifecycle state model. |
+| `users-state.yml` state shape with archive states. | State validation accepts archive fields and the fixture inactive lifecycle records archive path, operation hash, local-only flag, original UID/GID, `removal_ready`, and `tombstoned`. Full production archive substates and backup failure handling are incomplete. | Implemented partially | `ssn/users.py`, tests, live Quadro `ssn-test-inactive` state | Add backup failure/retry substates and production tombstone migration controls. |
 | Profile binding shape with services, admins, operations. | Profiles match the broad shape. | Implemented correctly | `profiles/*.yml` | Add strict schema and migrations. |
 | `policies/slurm-core.yml` shape. | Policy exists and drives render. | Implemented correctly | `policies/slurm-core.yml`, templates | Add validation for unsupported fields. |
 | `policies/tiers.yml` shape. | Policy exists and drives QoS/rendered tiers. | Implemented correctly | `policies/tiers.yml`, `ssn/config.py` | Add tests for all tier variants. |
@@ -265,8 +274,8 @@ production-grade user docs.
 | Live apply refuses changes while jobs are running unless force/drain. | `ssn-install` and `ssn-apply --run` refuse when `squeue` has queued jobs unless `--force --plan-token` is supplied, or `--drain` successfully drains the node and waits for active jobs to clear. `--check` remains allowed without a token. | Implemented correctly | `ssn/install.py`, `ssn/cli.py`, `ssn/ops.py`, live Quadro queued-job refusal, force token, drain success, drain timeout, and drained install tests | Add a richer drain/hold workflow only if future multi-node or recovery needs demand it. |
 | Resumable apply/sync workflows. | Partial user state update exists; install reports phases. Not truly resumable. | Yet to be implemented | `ssn/install.py`, `ssn/users.py` | Add staged reconciliation and repair plans. |
 | GPU verification tests include login denial and Slurm GPU access. | Fixture-scoped login denial and Slurm GPU access by the same user were live-tested on Quadro. This is not yet a full production GPU health gate and does not cover multi-GPU mapping or CPU-only recovery. | Implemented partially | live Quadro SSH direct-denial and Slurm GPU tests | Add full GPU verification suite. |
-| Scratch-unhealthy, archive, hook, tombstone tests. | Scratch happy path, per-job cleanup, and unhealthy marker/job rejection were live-tested. Archive, hook, and tombstone tests remain absent. | Implemented partially | `ssn/storage.py`, live Quadro scratch health test | Add archive/hook/tombstone integration tests with inactive lifecycle. |
-| Static tests. | Unit tests, compileall, shell syntax, render checks, `git diff --check`, and remote static tests pass. Tests now include schema validation, capability gates, drain wait timeout behavior, user-sync idempotence, quota report safety, scratch health, cleanup operation hashes, and fixture cleanup safety. | Implemented correctly | `tests/`, live session notes | Add CI entrypoint when repo is ready. |
+| Scratch-unhealthy, archive, hook, tombstone tests. | Scratch happy path, per-job cleanup, and unhealthy marker/job rejection were live-tested. Fixture inactive dry-plan, local archive, tombstone, token reuse, job cancellation, and reactivation were live-tested. Backup hook tests remain absent. | Implemented partially | `ssn/storage.py`, `ssn/users.py`, live Quadro scratch and inactive lifecycle tests | Add backup-hook success/failure tests with production inactive lifecycle. |
+| Static tests. | Unit tests, compileall, shell syntax, render checks, `git diff --check`, and remote static tests pass. Tests now include schema validation, capability gates, drain wait timeout behavior, user-sync idempotence, quota report safety, scratch health, cleanup operation hashes, fixture cleanup safety, inactive plan reports, prune manifests, and fixture-limited inactive apply. | Implemented correctly | `tests/`, live session notes | Add CI entrypoint when repo is ready. |
 
 ## Implemented Extra
 
@@ -276,27 +285,32 @@ production-grade user docs.
 | `cpu-bisect-node0` profile. | CPU-only profile for same test host. | `profiles/cpu-bisect-node0.yml` | Keep for CPU-only recovery testing. |
 | `starter-single-gpu-small` and `starter-cpu-small` policies. | Added for smaller machines. | `policies/tiers.yml` | Keep as practical starter tiers. |
 | Single-command installer smoke-user association setup. | Installer can create/update smoke user Slurm association for tests. | `ssn/install.py` | Keep; make clear it is test/smoke behavior. |
-| Automated install smoke rejection tests. | Installer tests over CPU, over GPU, and `--no-requeue`. | `ssn/install.py`, live Quadro notes | Expand to RAM/walltime/preemption. |
+| Automated install smoke rejection tests. | Installer tests over CPU and over GPU. `--no-requeue` is covered by the managed `sbatch` wrapper live regression test rather than installer smoke. | `ssn/install.py`, `sbatch-wrapper.j2`, live Quadro notes | Expand to RAM/walltime/preemption and server-side no-requeue enforcement if available. |
 | `ssn-scratch-cleanup` report-only command. | Added with service/timer integration. | `ssn/cli.py`, `bin/ssn-scratch-cleanup` | Convert to reviewed deletion mode later. |
 | `ssn-scratch-health` command. | Added for scratch health reports and unhealthy marker management; live tests verified healthy, unhealthy, submission block, and recovery paths. | `ssn/storage.py`, `bin/ssn-scratch-health`, live Quadro scratch health test | Keep; extend to install/apply preflight if desired. |
 | Fixture-only scratch cleanup deletion. | Reviewed tokenized reports can delete only top-level `/scratch/ssn-test-*` candidates; live test deleted a fixture path and rejected token reuse/mismatch. | `ssn/storage.py`, `ssn-scratch-cleanup`, live Quadro cleanup test | Keep scoped to fixtures until production deletion is explicitly approved. |
 | Fixture quota apply skip path. | `ssn-sync-users --apply-fixture-quotas` reports skipped fixture quotas when user quotas are not already active, without remounting or editing `/etc/fstab`. | `ssn/storage.py`, live Quadro quota report | Keep; production quota enforcement remains future work. |
-| Managed fixture users on Quadro. | `ssn-test-standard`, `ssn-test-priority`, and `ssn-test-suspended` remain on the test host for repeat sync/idempotence tests. | live Quadro users.yml/state | Keep as disposable test fixtures; do not treat as production users. |
+| Managed fixture users on Quadro. | `ssn-test-standard`, `ssn-test-priority`, `ssn-test-suspended`, and reactivated `ssn-test-inactive` remain on the test host for repeat sync/idempotence/lifecycle tests. | live Quadro users.yml/state | Keep as disposable test fixtures; do not treat as production users. |
 | Report-only retention helpers. | Plan and user-backup retention candidates are reported without deleting files. | `ssn/safety.py`, `ssn/install.py`, `ssn/cli.py` | Convert to approved deletion only after policy signoff. |
 | `ssn-plan-token` risk-token helper. | Added as an admin command for creating reviewed, short-lived tokens from install/apply reports. | `bin/ssn-plan-token`, `ssn/ops.py`, `ssn/cli.py`, live Quadro token test | Extend beyond queued-job risk as future risky workflows are implemented. |
 | Explicit drain workflow. | `ssn-install` and `ssn-apply --run` support `--drain`, `--drain-timeout`, and `--drain-reason`; live tests covered success, timeout safe resume, and drained reinstall idempotence. | `ssn/install.py`, `ssn/cli.py`, `ssn/ops.py`, live Quadro reports | Keep; consider pending-job hold semantics only if future workflows need it. |
 | Fixture-scoped login isolation commands. | Added `ssn-login-isolation` and `ssn-login-status` for cgroup/ACL/disabled modes and per-user slice reporting. Live cgroup mode succeeded; ACL fallback code exists but was not needed live. | `ssn/login.py`, `bin/ssn-login-isolation`, `bin/ssn-login-status`, live Quadro tests | Keep fixture-scoped until wider rollout is approved. |
 | Root GPU status collector. | Added `ssn-gpu-collector` plus `ssn-gpu-status.service/timer`; live snapshot and single-GPU job mapping passed. | `ssn/login.py`, `bin/ssn-gpu-collector`, admin tools role, live Quadro tests | Harden multi-GPU mapping. |
+| Fixture inactive lifecycle. | Added token-gated inactive dry-plan/apply for `ssn-test-inactive`, including prune manifest, local archive, tombstone, and reactivation validation. | `ssn/users.py`, `ssn/cli.py`, live Quadro inactive test | Keep fixture-scoped until backup hooks and production controls are implemented. |
+| Managed `sbatch` no-requeue wrapper. | Added `/usr/local/bin/sbatch` wrapper to reject ordinary user `--no-requeue` submissions after Slurm 25.11 did not expose the flag reliably to `job_submit.lua`; direct `/usr/bin/sbatch` still bypasses. | `sbatch-wrapper.j2`, live Quadro no-requeue test | Replace or supplement with Slurm-side enforcement if available. |
 
 ## Next Implementation Queue
 
 ### Priority 1: Safety And Correctness Gates
 
-- Extend the queued-job token pattern to all future risky operations, especially
-  inactive pruning/archive and production retention deletion.
+- Extend the reviewed-token pattern to remaining risky operations, especially
+  production inactive backup/removal and production retention deletion.
 - Deepen capability gates for Slurm submit-plugin support, MariaDB access
   modes, Lua plugin compatibility, NVML/CUDA ordering, MIG/MPS/shared GPU
   detection, and package/runtime compatibility.
+- Investigate a Slurm-side or `cli_filter` no-requeue enforcement path because
+  `job_submit.lua` did not catch absolute `/usr/bin/sbatch --no-requeue` on the
+  Quadro Slurm 25.11 stack.
 - Add schema migration handling if/when `schema_version` moves beyond v1.
 - Add approved pruning for old plan/user-backup artifacts if retention should
   delete rather than report.
@@ -325,10 +339,12 @@ production-grade user docs.
 
 ### Priority 4: Inactive Lifecycle
 
-- Implement inactive prune dry-plan with manifest and reviewed token.
 - Add service/admin archive QoS and archive job submission.
 - Add backup/replication hook runner and failure handling.
-- Implement archive substates, tombstones, local-only override, and reactivation.
+- Broaden fixture-only inactive apply into a production-reviewed workflow after
+  backup hooks and non-fixture controls are ready.
+- Add backup-failed/retry substates, permanent tombstone migration controls,
+  and broader restore/rollback documentation.
 
 ### Priority 5: GPU Production Readiness And Docs
 

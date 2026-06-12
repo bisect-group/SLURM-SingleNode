@@ -40,6 +40,14 @@
     group: root
     mode: "0644"
 
+- name: Install sbatch policy wrapper
+  ansible.builtin.template:
+    src: sbatch-wrapper.j2
+    dest: /usr/local/bin/sbatch
+    owner: root
+    group: root
+    mode: "0755"
+
 - name: Install friendly nvidia-smi login wrapper
   ansible.builtin.template:
     src: nvidia-smi-wrapper.j2

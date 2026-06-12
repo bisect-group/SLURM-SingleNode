@@ -4,6 +4,7 @@ import base64
 import datetime as dt
 import grp
 import hashlib
+import json
 import os
 import pwd
 import stat
@@ -14,11 +15,23 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
 
+from .config import config_hash
 from .safety import retention_candidates
 from .yamlutil import dump_yaml, load_yaml
 
 
 VALID_STATUSES = {"active", "suspended", "inactive"}
+INACTIVE_FIXTURE_USER = "ssn-test-inactive"
+INACTIVE_LOCAL_ONLY_RISK = "inactive_local_only_archive"
+INACTIVE_ARCHIVE_STATES = {
+    "archive_pending",
+    "archive_running",
+    "archived_local_only",
+    "backup_failed",
+    "backup_complete",
+    "removal_ready",
+    "tombstoned",
+}
 SSH_KEY_TYPES = ("ssh-rsa", "ssh-dss", "ssh-ed25519", "ecdsa-sha2-")
 USER_DOC_KEYS = {"schema_version", "groups", "users"}
 GROUP_KEYS = {"description", "notes", "adopt_existing"}
@@ -50,6 +63,14 @@ STATE_USER_KEYS = {
     "scratch_dir",
     "managed_groups",
     "archive_state",
+    "archive_path",
+    "archive_plan_id",
+    "archive_operation_hash",
+    "archive_local_only",
+    "archive_last_error",
+    "inactive_at",
+    "tombstoned_at",
+    "home_dir",
     "updated_at",
 }
 DEFAULT_EXCLUDES = {
@@ -121,6 +142,9 @@ def validate_state(state_doc: dict[str, Any]) -> list[str]:
         unknown_entry = set(entry) - STATE_USER_KEYS
         if unknown_entry:
             errors.append(f"state.users.{username} has unknown keys: {sorted(unknown_entry)}")
+        archive_state = entry.get("archive_state")
+        if archive_state is not None and archive_state not in INACTIVE_ARCHIVE_STATES:
+            errors.append(f"state.users.{username}.archive_state is invalid: {archive_state}")
     return errors
 
 
@@ -270,7 +294,11 @@ def plan_user_sync(
             if exists and not _state_entry_matches(username, user, previous_state, resolved):
                 actions.append(UserAction(username, "update_state", "record managed state"))
         elif status == "inactive":
-            actions.append(UserAction(username, "inactive_state_machine", "archive lifecycle required", risky=True))
+            previous_archive = previous_state.get("archive_state")
+            detail = "archive lifecycle required"
+            if previous_archive:
+                detail = f"archive lifecycle state={previous_archive}"
+            actions.append(UserAction(username, "inactive_state_machine", detail, risky=True))
     return actions
 
 
@@ -449,12 +477,207 @@ def action_dicts(actions: list[UserAction]) -> list[dict[str, Any]]:
     return [asdict(action) for action in actions]
 
 
+def inactive_actions(actions: list[UserAction]) -> list[UserAction]:
+    return [action for action in actions if action.action == "inactive_state_machine"]
+
+
+def inactive_plan_report(
+    actions: list[UserAction],
+    users_doc: dict[str, Any],
+    state_doc: dict[str, Any],
+    resolved: dict[str, Any],
+) -> dict[str, Any]:
+    inactive = inactive_actions(actions)
+    payload = _inactive_operation_payload(inactive, users_doc, state_doc, resolved)
+    operation_hash = config_hash({"inactive_lifecycle": payload})
+    planned_users = [
+        _inactive_user_plan(action.username, users_doc, state_doc, resolved, operation_hash)
+        for action in inactive
+    ]
+    return {
+        "schema_version": 1,
+        "command": "sync-users",
+        "profile": resolved.get("profile"),
+        "config_hash": config_hash(resolved),
+        "risk": INACTIVE_LOCAL_ONLY_RISK,
+        "operation_hash": operation_hash,
+        "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "mode": "dry_run",
+        "fixture_only_user": INACTIVE_FIXTURE_USER,
+        "inactive_users": planned_users,
+        "actions": action_dicts(inactive),
+    }
+
+
+def _inactive_operation_payload(
+    actions: list[UserAction],
+    users_doc: dict[str, Any],
+    state_doc: dict[str, Any],
+    resolved: dict[str, Any],
+) -> dict[str, Any]:
+    users = users_doc.get("users") or {}
+    state_users = state_doc.get("users") or {}
+    archive_policy = resolved["resolved_policies"]["storage"].get("inactive_archive") or {}
+    payload_users: dict[str, Any] = {}
+    for action in actions:
+        username = action.username
+        payload_users[username] = {
+            "desired_status": (users.get(username) or {}).get("status"),
+            "desired_tier": (users.get(username) or {}).get("tier"),
+            "previous_status": (state_users.get(username) or {}).get("status"),
+            "previous_archive_state": (state_users.get(username) or {}).get("archive_state"),
+            "original_uid": (state_users.get(username) or {}).get("original_uid"),
+            "original_gid": (state_users.get(username) or {}).get("original_gid"),
+            "uid": _current_uid(username) or (users.get(username) or {}).get("uid"),
+            "gid": _current_gid(username) or (users.get(username) or {}).get("gid"),
+            "home_dir": _current_home(username) or f"{resolved['derived']['paths'].get('home', '/home')}/{username}",
+            "data_dir": _data_dir(resolved, username),
+            "archive_root": resolved["derived"]["paths"].get("archive"),
+        }
+    return {
+        "users": payload_users,
+        "archive_policy": {
+            "compression": archive_policy.get("compression"),
+            "local_only_override": (archive_policy.get("backup_hook") or {}).get("local_only_override"),
+            "removal_override": archive_policy.get("removal_override"),
+        },
+        "fixture_only_user": INACTIVE_FIXTURE_USER,
+    }
+
+
+def _inactive_user_plan(
+    username: str,
+    users_doc: dict[str, Any],
+    state_doc: dict[str, Any],
+    resolved: dict[str, Any],
+    operation_hash: str,
+) -> dict[str, Any]:
+    home_dir = _current_home(username) or f"{resolved['derived']['paths'].get('home', '/home')}/{username}"
+    archive_path = _inactive_archive_path(resolved, username, operation_hash)
+    prune = inactive_prune_manifest(Path(home_dir), resolved)
+    previous = (state_doc.get("users") or {}).get(username) or {}
+    return {
+        "username": username,
+        "current_archive_state": previous.get("archive_state"),
+        "fixture_apply_allowed": username == INACTIVE_FIXTURE_USER,
+        "uid": _current_uid(username) or previous.get("uid") or previous.get("original_uid"),
+        "gid": _current_gid(username) or previous.get("gid") or previous.get("original_gid"),
+        "original_uid": previous.get("original_uid") or _current_uid(username),
+        "original_gid": previous.get("original_gid") or _current_gid(username),
+        "home_dir": home_dir,
+        "data_dir": _data_dir(resolved, username),
+        "scratch_dir": _scratch_dir(resolved, username),
+        "archive_path": str(archive_path),
+        "local_only_override_required": True,
+        "prune_manifest": prune,
+        "next_action": _inactive_next_action(previous.get("archive_state")),
+    }
+
+
+def _inactive_next_action(archive_state: str | None) -> str:
+    if archive_state == "tombstoned":
+        return "already_tombstoned"
+    if archive_state == "removal_ready":
+        return "remove_account_and_tombstone"
+    if archive_state in {"archived_local_only", "backup_complete"}:
+        return "mark_removal_ready"
+    return "lock_prune_archive_remove_tombstone"
+
+
+def inactive_prune_manifest(home_dir: Path, resolved: dict[str, Any]) -> dict[str, Any]:
+    policy = resolved["resolved_policies"]["storage"].get("inactive_archive") or {}
+    delete_fixed = list(policy.get("delete_fixed_paths") or [])
+    report_only_names = set(policy.get("report_only_names") or [])
+    recursive_rules = policy.get("recursive_marker_rules") or {}
+    candidates: list[dict[str, Any]] = []
+    report_only: list[dict[str, Any]] = []
+    if not home_dir.exists():
+        return {
+            "home_dir": str(home_dir),
+            "exists": False,
+            "delete_candidates": candidates,
+            "report_only": report_only,
+        }
+    for relative in delete_fixed:
+        path = home_dir / relative
+        if path.exists() or path.is_symlink():
+            candidates.append(_prune_entry(home_dir, path, reason="policy_allowlist"))
+    for root, dirs, _files in os.walk(home_dir, topdown=True, followlinks=False):
+        root_path = Path(root)
+        kept_dirs = []
+        for dirname in dirs:
+            child = root_path / dirname
+            if child.is_symlink():
+                kept_dirs.append(dirname)
+                continue
+            if dirname in report_only_names:
+                report_only.append(_prune_entry(home_dir, child, reason="report_only_name"))
+                kept_dirs.append(dirname)
+                continue
+            marker_reason = _marker_reason(child, recursive_rules)
+            if marker_reason:
+                candidates.append(_prune_entry(home_dir, child, reason=marker_reason))
+                continue
+            kept_dirs.append(dirname)
+        dirs[:] = kept_dirs
+    candidates = _dedupe_prune_entries(candidates)
+    report_only = _dedupe_prune_entries(report_only)
+    return {
+        "home_dir": str(home_dir),
+        "exists": True,
+        "delete_candidates": candidates,
+        "report_only": report_only,
+    }
+
+
+def _marker_reason(path: Path, recursive_rules: dict[str, Any]) -> str | None:
+    for name, rule in recursive_rules.items():
+        marker = rule.get("marker_file") if isinstance(rule, dict) else None
+        if marker and (path / marker).exists():
+            return f"marker:{name}"
+    return None
+
+
+def _prune_entry(home_dir: Path, path: Path, *, reason: str) -> dict[str, Any]:
+    try:
+        path.relative_to(home_dir)
+    except ValueError:
+        relative = str(path)
+    else:
+        relative = str(path.relative_to(home_dir))
+    try:
+        mode = path.lstat().st_mode
+        path_type = "symlink" if stat.S_ISLNK(mode) else "directory" if stat.S_ISDIR(mode) else "file"
+    except OSError:
+        path_type = "missing"
+    return {
+        "relative_path": relative,
+        "path": str(path),
+        "type": path_type,
+        "reason": reason,
+        "symlink_action": "remove_link_only" if path_type == "symlink" else None,
+    }
+
+
+def _dedupe_prune_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen = set()
+    unique = []
+    for entry in entries:
+        path = entry["path"]
+        if path in seen:
+            continue
+        seen.add(path)
+        unique.append(entry)
+    return unique
+
+
 def apply_user_actions(
     actions: list[UserAction],
     users_doc: dict[str, Any],
     resolved: dict[str, Any],
     *,
     state_doc: dict[str, Any] | None = None,
+    allow_inactive_fixture: bool = False,
 ) -> dict[str, Any]:
     if os.geteuid() != 0:
         raise PermissionError("user sync apply must run as root")
@@ -493,9 +716,206 @@ def apply_user_actions(
         elif action.action == "update_state":
             pass
         elif action.action == "inactive_state_machine":
-            raise ValueError(f"{action.username}: inactive lifecycle is dry-plan only in this implementation pass")
+            _apply_inactive_lifecycle(
+                action.username,
+                user,
+                resolved,
+                state_doc,
+                allow_fixture=allow_inactive_fixture,
+            )
+            continue
         _update_state_for_user(state_doc, action.username, users.get(action.username), resolved)
     return state_doc
+
+
+def _apply_inactive_lifecycle(
+    username: str,
+    user: dict[str, Any],
+    resolved: dict[str, Any],
+    state_doc: dict[str, Any],
+    *,
+    allow_fixture: bool,
+) -> None:
+    if not allow_fixture:
+        raise ValueError(f"{username}: inactive lifecycle apply requires a reviewed plan token")
+    if username != INACTIVE_FIXTURE_USER:
+        raise ValueError(f"{username}: inactive apply is fixture-limited to {INACTIVE_FIXTURE_USER}")
+    state_users = state_doc.setdefault("users", {})
+    previous = state_users.get(username) or {}
+    if previous.get("archive_state") == "tombstoned" and not _user_exists(username):
+        return
+    if not _user_exists(username):
+        raise ValueError(f"{username}: inactive lifecycle requires an existing fixture account")
+    archive_root = resolved["derived"]["paths"].get("archive")
+    if not archive_root:
+        raise ValueError(f"{username}: inactive lifecycle requires an archive root")
+    compressor = _archive_compressor()
+    if compressor is None:
+        raise ValueError("7zz or 7z is required for inactive archive apply")
+
+    entry = pwd.getpwnam(username)
+    operation_payload = _inactive_operation_payload(
+        [UserAction(username, "inactive_state_machine", risky=True)],
+        {"users": {username: user}},
+        state_doc,
+        resolved,
+    )
+    operation_hash = config_hash({"inactive_lifecycle": operation_payload})
+    archive_path = _inactive_archive_path(resolved, username, operation_hash)
+    home_dir = Path(entry.pw_dir)
+    now = dt.datetime.now(dt.timezone.utc).isoformat()
+    _set_state_user_fields(
+        state_doc,
+        username,
+        {
+            "managed": True,
+            "status": "inactive",
+            "tier": user.get("tier"),
+            "uid": entry.pw_uid,
+            "gid": entry.pw_gid,
+            "original_uid": previous.get("original_uid", entry.pw_uid),
+            "original_gid": previous.get("original_gid", entry.pw_gid),
+            "home_dir": str(home_dir),
+            "data_dir": _data_dir(resolved, username),
+            "scratch_dir": _scratch_dir(resolved, username),
+            "managed_groups": _desired_managed_groups(user, resolved),
+            "archive_state": "archive_pending",
+            "archive_path": str(archive_path),
+            "archive_operation_hash": operation_hash,
+            "archive_local_only": True,
+            "inactive_at": previous.get("inactive_at", now),
+            "updated_at": now,
+            "archive_last_error": None,
+        },
+    )
+    try:
+        _run(["scancel", "-u", username], check=False)
+        _run(["usermod", "-L", "-e", "1", username], check=False)
+        _disable_slurm_association(username, resolved)
+        _lock_data_dir(resolved, username)
+        _set_state_user_fields(
+            state_doc,
+            username,
+            {"archive_state": "archive_running", "updated_at": dt.datetime.now(dt.timezone.utc).isoformat()},
+        )
+        _apply_inactive_prune(home_dir, resolved)
+        archive_path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
+        _run([compressor, "a", "-t7z", "-mx=9", str(archive_path), home_dir.name], cwd=home_dir.parent)
+        _set_state_user_fields(
+            state_doc,
+            username,
+            {
+                "archive_state": "archived_local_only",
+                "archive_path": str(archive_path),
+                "archive_local_only": True,
+                "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            },
+        )
+        _set_state_user_fields(
+            state_doc,
+            username,
+            {"archive_state": "removal_ready", "updated_at": dt.datetime.now(dt.timezone.utc).isoformat()},
+        )
+        _run(["loginctl", "terminate-user", username], check=False)
+        _run(["userdel", username])
+        _set_state_user_fields(
+            state_doc,
+            username,
+            {
+                "archive_state": "tombstoned",
+                "tombstoned_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            },
+        )
+    except Exception as exc:
+        _set_state_user_fields(
+            state_doc,
+            username,
+            {
+                "archive_last_error": str(exc),
+                "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            },
+        )
+        raise
+
+
+def _apply_inactive_prune(home_dir: Path, resolved: dict[str, Any]) -> None:
+    manifest = inactive_prune_manifest(home_dir, resolved)
+    for entry in manifest.get("delete_candidates", []):
+        path = Path(entry["path"])
+        _remove_prune_candidate(home_dir, path)
+
+
+def _remove_prune_candidate(home_dir: Path, path: Path) -> None:
+    _assert_under_home(home_dir, path)
+    try:
+        mode = path.lstat().st_mode
+    except OSError:
+        return
+    if stat.S_ISLNK(mode):
+        path.unlink()
+    elif stat.S_ISDIR(mode):
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def _assert_under_home(home_dir: Path, path: Path) -> None:
+    try:
+        path.relative_to(home_dir)
+    except ValueError as exc:
+        raise ValueError(f"refusing prune path outside home: {path}") from exc
+
+
+def _lock_data_dir(resolved: dict[str, Any], username: str) -> None:
+    data_root = resolved["derived"]["paths"].get("data")
+    if not data_root:
+        return
+    path = Path(data_root) / username
+    _refuse_unsafe_user_dir(path)
+    if not path.exists():
+        return
+    path.chmod(0o700)
+    os.chown(path, 0, 0)
+
+
+def _inactive_archive_path(resolved: dict[str, Any], username: str, operation_hash: str) -> Path:
+    archive_root = resolved["derived"]["paths"].get("archive")
+    if not archive_root:
+        archive_root = "/data/_archive"
+    return Path(archive_root) / username / f"{username}-{operation_hash[:12]}.7z"
+
+
+def _archive_compressor() -> str | None:
+    return shutil.which("7zz") or shutil.which("7z")
+
+
+def _set_state_user_fields(state_doc: dict[str, Any], username: str, fields: dict[str, Any]) -> None:
+    state_users = state_doc.setdefault("users", {})
+    previous = state_users.get(username) or {}
+    merged = {**previous, **fields}
+    state_users[username] = {key: value for key, value in merged.items() if value is not None}
+
+
+def _current_uid(username: str) -> int | None:
+    try:
+        return pwd.getpwnam(username).pw_uid
+    except KeyError:
+        return None
+
+
+def _current_gid(username: str) -> int | None:
+    try:
+        return pwd.getpwnam(username).pw_gid
+    except KeyError:
+        return None
+
+
+def _current_home(username: str) -> str | None:
+    try:
+        return pwd.getpwnam(username).pw_dir
+    except KeyError:
+        return None
 
 
 def _validate_ssh_keys(username: str, ssh_keys: Any) -> list[str]:
@@ -712,8 +1132,13 @@ def _authorized_keys_match(username: str, ssh_keys: dict[str, Any]) -> bool:
     return path_stat.st_uid == entry.pw_uid and path_stat.st_gid == entry.pw_gid and mode == 0o600
 
 
-def _run(cmd: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, text=True, capture_output=True, check=check)
+def _run(
+    cmd: list[str],
+    *,
+    check: bool = True,
+    cwd: str | Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(cmd, text=True, capture_output=True, check=check, cwd=cwd)
 
 
 def _create_unix_user(username: str, user: dict[str, Any]) -> None:
@@ -1063,7 +1488,7 @@ def _update_state_for_user(
     entry = pwd.getpwnam(username)
     state_users = state_doc.setdefault("users", {})
     previous = state_users.get(username) or {}
-    state_users[username] = {
+    next_entry = {
         **previous,
         "managed": True,
         "status": user.get("status"),
@@ -1077,3 +1502,13 @@ def _update_state_for_user(
         "managed_groups": _desired_managed_groups(user, resolved),
         "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
+    if user.get("status") == "active":
+        for key in (
+            "archive_state",
+            "archive_last_error",
+            "archive_local_only",
+            "inactive_at",
+            "tombstoned_at",
+        ):
+            next_entry.pop(key, None)
+    state_users[username] = next_entry

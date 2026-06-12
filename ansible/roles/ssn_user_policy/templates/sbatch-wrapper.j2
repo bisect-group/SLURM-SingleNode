@@ -1,0 +1,29 @@
+#!/bin/sh
+# Managed by Slurm Single-Node.
+
+deny() {
+  echo "Slurm single-node: --no-requeue is not allowed for normal preemptible tiers." >&2
+  exit 1
+}
+
+for arg in "$@"; do
+  case "$arg" in
+    --no-requeue|--requeue=0|--requeue=no|--requeue=false)
+      deny
+      ;;
+  esac
+done
+
+for arg in "$@"; do
+  case "$arg" in
+    -*)
+      ;;
+    *)
+      if [ -f "$arg" ] && grep -Eq '^[[:space:]]*#SBATCH([[:space:]].*)?--no-requeue([[:space:]]|$)' "$arg"; then
+        deny
+      fi
+      ;;
+  esac
+done
+
+exec /usr/bin/sbatch "$@"

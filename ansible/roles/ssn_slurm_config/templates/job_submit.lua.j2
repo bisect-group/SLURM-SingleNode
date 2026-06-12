@@ -70,6 +70,10 @@ local function reject(message)
   return slurm.ERROR
 end
 
+local function requested_no_requeue(job_desc)
+  return job_desc.requeue ~= nil and tostring(job_desc.requeue) == "0"
+end
+
 function slurm_job_submit(job_desc, part_list, submit_uid)
   if path_exists(scratch_unhealthy_marker) then
     return reject("Slurm single-node: scratch is currently unhealthy; new scratch-dependent jobs are blocked.")
@@ -104,7 +108,7 @@ function slurm_job_submit(job_desc, part_list, submit_uid)
     ))
   end
 
-  if job_desc.requeue ~= nil and job_desc.requeue == 0 then
+  if requested_no_requeue(job_desc) then
     return reject("Slurm single-node: --no-requeue is not allowed for normal preemptible tiers.")
   end
 
@@ -112,7 +116,7 @@ function slurm_job_submit(job_desc, part_list, submit_uid)
 end
 
 function slurm_job_modify(job_desc, job_rec, part_list, modify_uid)
-  if job_desc.requeue ~= nil and job_desc.requeue == 0 then
+  if requested_no_requeue(job_desc) then
     return reject("Slurm single-node: --no-requeue is not allowed for normal preemptible tiers.")
   end
   return slurm.SUCCESS

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import config_hash, render_profile, repo_root, resolve_profile, summary_text
+from .gpu import gpu_verification_errors, gpu_verification_report
 from .login import login_isolation_status_for_report
 from .ops import (
     collect_capabilities,
@@ -160,6 +161,13 @@ class Installer:
                 if installed_errors:
                     raise RuntimeError("installed Slurm feature validation failed: " + "; ".join(installed_errors))
                 self._record_phase("installed_feature_validation", "ok", {})
+                if resolved["derived"]["has_gpus"]:
+                    gpu_report = gpu_verification_report(resolved)
+                    self.report["gpu_verification"] = gpu_report
+                    gpu_errors = gpu_verification_errors(gpu_report)
+                    if gpu_errors:
+                        raise RuntimeError("GPU verification failed: " + "; ".join(gpu_errors))
+                    self._record_phase("gpu_verification", "ok", {})
                 self._record_phase("apply", "ok", {})
 
             if self.args.dry_run:

@@ -16,6 +16,8 @@ movement while pushing compute through Slurm.
 - `ssn-login-status --profile <profile>` reports targeted user slices and GPU
   snapshot freshness.
 - `ssn-gpu-status` reads `/run/slurm-single-node/gpu-status.json`.
+- `ssn-gpu-recovery status --profile <profile>` reports GPU health checks and
+  the current CPU-only recovery state.
 
 ## Recovery
 
@@ -36,3 +38,8 @@ getfacl /dev/nvidia0 /dev/nvidiactl 2>/dev/null
 The current live-test scope is intentionally limited to `ssn-test-*` fixture
 users. Production-wide login and GPU isolation should be enabled only after the
 fixture path passes SSH, Slurm CPU, Slurm GPU, and direct-GPU-denial tests.
+
+For GPU service failures, use `docs/gpu-safety-recovery.md`. The current
+CPU-only recovery workflow is also fixture-scoped: it may hold/cancel only
+`ssn-test-*` GPU jobs and must not be used for real users until production
+policy controls are added.

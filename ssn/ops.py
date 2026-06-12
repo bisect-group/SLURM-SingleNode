@@ -164,6 +164,7 @@ def collect_capabilities(resolved: dict[str, Any], *, mode: str) -> dict[str, An
         "slurm": {
             "accounting_cluster": command_stdout(["sacctmgr", "-nP", "show", "cluster", "format=cluster"]),
             "config_select": command_stdout(["scontrol", "show", "config"]),
+            "cli_filter_lua_plugin": _find_slurm_plugin("cli_filter_lua.so"),
         },
     }
     if resolved.get("derived", {}).get("has_gpus"):
@@ -190,6 +191,15 @@ def validate_feature_gates(resolved: dict[str, Any], *, mode: str, capabilities:
     for command in required:
         if capabilities.get("commands", {}).get(command) is None:
             errors.append(f"required command is missing: {command}")
+    client_filter = (
+        resolved.get("resolved_policies", {})
+        .get("slurm_core", {})
+        .get("submit_filter", {})
+        .get("client_filter", {})
+    )
+    if client_filter.get("enabled") and mode in {"apply", "install"}:
+        if not capabilities.get("slurm", {}).get("cli_filter_lua_plugin"):
+            errors.append("Slurm cli_filter/lua plugin is required but cli_filter_lua.so was not found")
     storage = resolved["resolved_policies"]["storage"]
     paths = resolved["derived"].get("paths") or {}
     if storage.get("quotas", {}).get("fail_if_unavailable") or storage.get("job_scratch", {}).get("required_for_jobs"):
@@ -229,6 +239,12 @@ def validate_resolved_slurm_features(resolved: dict[str, Any]) -> list[str]:
             errors.append(f"Slurm task_plugin.{key} must be true")
     if slurm_core.get("submit_filter", {}).get("plugin") != "job_submit.lua":
         errors.append("Slurm submit_filter.plugin must be job_submit.lua")
+    client_filter = slurm_core.get("submit_filter", {}).get("client_filter", {})
+    if client_filter.get("enabled"):
+        if client_filter.get("plugin") != "cli_filter/lua":
+            errors.append("Slurm submit_filter.client_filter.plugin must be cli_filter/lua")
+        if not client_filter.get("path"):
+            errors.append("Slurm submit_filter.client_filter.path must be set")
     if resolved["derived"]["has_gpus"]:
         expected = int(resolved["hardware"]["gpus"])
         if len(resolved["derived"].get("gres_entries", [])) != expected:
@@ -262,6 +278,18 @@ def validate_installed_slurm_features(resolved: dict[str, Any], *, conf_dir: str
     for needle, haystack in expected.items():
         if needle not in haystack:
             errors.append(f"installed Slurm config missing {needle}")
+    client_filter = (
+        resolved.get("resolved_policies", {})
+        .get("slurm_core", {})
+        .get("submit_filter", {})
+        .get("client_filter", {})
+    )
+    if client_filter.get("enabled"):
+        if "CliFilterPlugins=cli_filter/lua" not in slurm_conf:
+            errors.append("installed Slurm config missing CliFilterPlugins=cli_filter/lua")
+        configured_path = Path(str(client_filter.get("path") or conf_root / "cli_filter.lua"))
+        if not configured_path.exists():
+            errors.append(f"installed Slurm cli_filter.lua is missing: {configured_path}")
     if resolved["derived"]["has_gpus"]:
         if "GresTypes=gpu" not in slurm_conf:
             errors.append("GPU profile installed config missing GresTypes=gpu")
@@ -298,6 +326,28 @@ def _read_text(path: Path) -> str:
 
 def _package_version(package: str) -> str | None:
     return command_stdout(["dpkg-query", "-W", "-f=${Version}", package]) or None
+
+
+def _find_slurm_plugin(filename: str) -> str | None:
+    candidates = [
+        Path("/usr/lib/x86_64-linux-gnu/slurm-wlm") / filename,
+        Path("/usr/lib/slurm-wlm") / filename,
+        Path("/usr/lib64/slurm") / filename,
+        Path("/usr/lib/slurm") / filename,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    for base in (Path("/usr/lib"), Path("/usr/lib64")):
+        if not base.exists():
+            continue
+        try:
+            matches = sorted(base.glob(f"*/slurm*/{filename}"))
+        except OSError:
+            matches = []
+        if matches:
+            return str(matches[0])
+    return None
 
 
 def _os_pretty_name() -> str:

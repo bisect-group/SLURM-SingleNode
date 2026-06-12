@@ -154,6 +154,9 @@ POLICY_REQUIRED: dict[str, list[tuple[str, ...]]] = {
         ("memory", "render_qos_max_tres_mem"),
         ("submit_filter", "plugin"),
         ("submit_filter", "mode"),
+        ("submit_filter", "client_filter", "enabled"),
+        ("submit_filter", "client_filter", "plugin"),
+        ("submit_filter", "client_filter", "path"),
         ("submit_filter", "reject"),
         ("submit_filter", "disallow_slow_io"),
         ("submit_filter", "disallow_runtime_state_checks"),
@@ -934,6 +937,11 @@ POLICY_SCHEMAS: dict[str, dict[str, Any]] = {
         "submit_filter": {
             "plugin": None,
             "mode": None,
+            "client_filter": {
+                "enabled": None,
+                "plugin": None,
+                "path": None,
+            },
             "reject": None,
             "disallow_slow_io": None,
             "disallow_runtime_state_checks": None,

@@ -51,6 +51,18 @@
     mode: "0644"
   notify: Restart slurmctld
 
+- name: Deploy cli_filter.lua
+  ansible.builtin.template:
+    src: cli_filter.lua.j2
+    dest: "{{ ssn.resolved_policies.slurm_core.submit_filter.client_filter.path | default(ssn.derived.slurm_conf_dir ~ '/cli_filter.lua') }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Restart slurmctld
+    - Restart slurmd
+  when: ssn.resolved_policies.slurm_core.submit_filter.client_filter.enabled | default(false) | bool
+
 - name: Ensure Slurm prolog directories exist
   ansible.builtin.file:
     path: "{{ item }}"

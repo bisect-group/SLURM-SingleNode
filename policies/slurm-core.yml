@@ -29,6 +29,10 @@ policies:
     submit_filter:
       plugin: job_submit.lua
       mode: validate_explicit_requests_only
+      client_filter:
+        enabled: true
+        plugin: cli_filter/lua
+        path: /etc/slurm/cli_filter.lua
       reject:
         - over_tier_cpu_gpu_ram_walltime
         - unsafe_gpu_syntax

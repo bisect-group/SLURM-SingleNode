@@ -25,6 +25,11 @@ ProctrackType=proctrack/cgroup
 TaskPlugin=task/cgroup,task/affinity
 
 JobSubmitPlugins=lua
+{% set ssn_cli_filter = ssn.resolved_policies.slurm_core.submit_filter.client_filter | default({}) %}
+{% if ssn_cli_filter.enabled | default(false) | bool %}
+CliFilterPlugins={{ ssn_cli_filter.plugin | default('cli_filter/lua') }}
+CliFilterParameters=cli_filter_lua_path={{ ssn_cli_filter.path | default(ssn.derived.slurm_conf_dir ~ '/cli_filter.lua') }}
+{% endif %}
 {% if ssn.resolved_policies.storage.job_scratch.implementation | default('disabled') == 'prolog_epilog' %}
 Prolog=/etc/slurm/prolog.d/ssn-job-scratch
 Epilog=/etc/slurm/epilog.d/ssn-job-scratch

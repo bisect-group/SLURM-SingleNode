@@ -1,0 +1,2 @@
+#!/usr/bin/env sh
+PYTHONPATH="${PYTHONPATH:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}" exec python3 -m ssn.cli gpu-recovery "$@"

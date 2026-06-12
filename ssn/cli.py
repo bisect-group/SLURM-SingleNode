@@ -12,6 +12,13 @@ from pathlib import Path
 from typing import Any
 
 from .config import config_hash, render_profile, repo_root, resolve_profile, summary_text
+from .gpu import (
+    GPU_RECOVERY_RISK,
+    GPU_RECOVERY_STATE,
+    gpu_recovery_plan,
+    gpu_verification_errors,
+    gpu_verification_report,
+)
 from .login import (
     DEFAULT_FIXTURE_PREFIX as DEFAULT_LOGIN_FIXTURE_PREFIX,
     collect_gpu_status_snapshot,
@@ -26,6 +33,7 @@ from .ops import (
     drain_node,
     queued_jobs,
     resume_node,
+    secure_path,
     validate_feature_gates,
     validate_installed_slurm_features,
     validate_plan_token,
@@ -78,6 +86,7 @@ def main(argv: list[str] | None = None, prog: str | None = None) -> int:
         "ssn-sync-users": sync_users_cmd,
         "ssn-gpu-status": gpu_status_cmd,
         "ssn-gpu-collector": gpu_collector_cmd,
+        "ssn-gpu-recovery": gpu_recovery_cmd,
         "ssn-login-isolation": login_isolation_cmd,
         "ssn-login-status": login_status_cmd,
         "ssn-archive-status": archive_status_cmd,
@@ -97,6 +106,7 @@ def main(argv: list[str] | None = None, prog: str | None = None) -> int:
     sub.add_parser("sync-users")
     sub.add_parser("gpu-status")
     sub.add_parser("gpu-collector")
+    sub.add_parser("gpu-recovery")
     sub.add_parser("login-isolation")
     sub.add_parser("login-status")
     sub.add_parser("archive-status")
@@ -112,6 +122,7 @@ def main(argv: list[str] | None = None, prog: str | None = None) -> int:
         "sync-users": sync_users_cmd,
         "gpu-status": gpu_status_cmd,
         "gpu-collector": gpu_collector_cmd,
+        "gpu-recovery": gpu_recovery_cmd,
         "login-isolation": login_isolation_cmd,
         "login-status": login_status_cmd,
         "archive-status": archive_status_cmd,
@@ -313,6 +324,13 @@ def apply_cmd(argv: list[str]) -> int:
             if installed_errors:
                 raise RuntimeError("installed Slurm feature validation failed: " + "; ".join(installed_errors))
             report["phases"].append({"name": "installed_feature_validation", "status": "ok", "time": dt.datetime.now(dt.timezone.utc).isoformat()})
+            if resolved["derived"]["has_gpus"]:
+                gpu_report = gpu_verification_report(resolved)
+                report["gpu_verification"] = gpu_report
+                gpu_errors = gpu_verification_errors(gpu_report)
+                if gpu_errors:
+                    raise RuntimeError("GPU verification failed: " + "; ".join(gpu_errors))
+                report["phases"].append({"name": "gpu_verification", "status": "ok", "time": dt.datetime.now(dt.timezone.utc).isoformat()})
             if drain_info and drain_info.get("initiated_by_ssn"):
                 resume_node(resolved["identity"]["node_name"])
                 report["phases"].append({"name": "node_resume", "status": "ok", "time": dt.datetime.now(dt.timezone.utc).isoformat()})
@@ -559,6 +577,257 @@ def gpu_collector_cmd(argv: list[str]) -> int:
         print(f"GPU count: {len(snapshot.get('gpus') or [])}")
         print(f"Slurm GPU jobs: {len(snapshot.get('slurm_jobs') or [])}")
     return 0
+
+
+def gpu_recovery_cmd(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="ssn-gpu-recovery")
+    sub = parser.add_subparsers(dest="command", required=True)
+    for name in ("plan", "enter", "exit", "status"):
+        child = sub.add_parser(name)
+        child.add_argument("--profile", default="gpu-bisect-quadro-p620")
+        child.add_argument("--recovery-profile", default="cpu-bisect-node0")
+        child.add_argument("--repo", default=None)
+        child.add_argument("--fixture-prefix", default="ssn-test-")
+        child.add_argument("--state", default=str(GPU_RECOVERY_STATE))
+        child.add_argument("--json", action="store_true")
+        if name in {"plan", "enter"}:
+            child.add_argument("--plan", default=None, help="recovery plan report path")
+        if name == "enter":
+            child.add_argument("--plan-token", required=True)
+            child.add_argument("--token-store", default=DEFAULT_TOKEN_STORE)
+            child.add_argument("--drain-timeout", default="10m")
+            child.add_argument("--drain-reason", default="SSN GPU CPU-only recovery")
+        if name == "exit":
+            child.add_argument("--drain-timeout", default="10m")
+            child.add_argument("--drain-reason", default="SSN GPU recovery exit")
+    args = parser.parse_args(argv)
+
+    root = repo_root(args.repo)
+    try:
+        resolved = resolve_profile(args.profile, root)
+        recovery_resolved = resolve_profile(args.recovery_profile, root)
+        if not resolved["derived"]["has_gpus"]:
+            raise ValueError(f"profile {args.profile} is not a GPU profile")
+        if recovery_resolved["derived"]["has_gpus"]:
+            raise ValueError(f"recovery profile {args.recovery_profile} must be CPU-only")
+        admin_group = resolved["derived"]["admin_group"]
+        if args.command == "plan":
+            report = gpu_recovery_plan(resolved, recovery_resolved, fixture_prefix=args.fixture_prefix)
+            report_path = Path(args.plan) if args.plan else _default_gpu_recovery_plan_path()
+            write_protected_json(report_path, report, group=admin_group)
+            _print_gpu_recovery_report(report, report_path=report_path, as_json=args.json)
+            return 0
+        if args.command == "status":
+            state_path = Path(args.state)
+            state = json.loads(state_path.read_text()) if state_path.exists() else {"status": "normal"}
+            verification = gpu_verification_report(resolved)
+            payload = {"state": state, "gpu_verification": verification}
+            if args.json:
+                print(json.dumps(payload, indent=2, sort_keys=True))
+            else:
+                print(f"GPU recovery state: {state.get('status', 'normal')}")
+                if state.get("active_profile"):
+                    print(f"Active profile: {state.get('active_profile')}")
+                for check in verification.get("checks", []):
+                    print(f"{check['status']:4s} {check['name']}: {check['detail']}")
+            return 0
+        if args.command == "enter":
+            return _gpu_recovery_enter(args, root, resolved, recovery_resolved, admin_group)
+        if args.command == "exit":
+            return _gpu_recovery_exit(args, root, resolved, admin_group)
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    return 2
+
+
+def _gpu_recovery_enter(
+    args: argparse.Namespace,
+    root: Path,
+    resolved: dict[str, Any],
+    recovery_resolved: dict[str, Any],
+    admin_group: str,
+) -> int:
+    plan_path = Path(args.plan) if args.plan else _default_gpu_recovery_plan_path()
+    if not plan_path.exists():
+        raise ValueError(f"recovery plan not found: {plan_path}")
+    plan = json.loads(plan_path.read_text())
+    validate_plan_token(args.plan_token, plan, risk=GPU_RECOVERY_RISK, store_root=args.token_store, mark_used=False)
+    current = gpu_recovery_plan(resolved, recovery_resolved, fixture_prefix=args.fixture_prefix)
+    if current.get("operation_hash") != plan.get("operation_hash"):
+        raise ValueError("current GPU recovery operation no longer matches reviewed plan; rerun plan and create a new token")
+    if current.get("nonfixture_gpu_jobs"):
+        raise ValueError("non-fixture GPU jobs are present; refusing fixture-only recovery")
+    validate_plan_token(args.plan_token, plan, risk=GPU_RECOVERY_RISK, store_root=args.token_store)
+
+    state_path = Path(args.state)
+    recovery_id = f"gpu-recovery-{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d%H%M%S')}"
+    plan_dir = plan_path.parent
+    drain_info: dict[str, Any] | None = None
+    apply_started = False
+    state = {
+        "schema_version": 1,
+        "status": "entering_cpu_only",
+        "recovery_id": recovery_id,
+        "profile": resolved["profile"],
+        "recovery_profile": recovery_resolved["profile"],
+        "plan": str(plan_path),
+        "operation_hash": plan.get("operation_hash"),
+        "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "fixture_prefix": args.fixture_prefix,
+        "job_actions": [],
+    }
+    try:
+        drain_info = drain_node(resolved["identity"]["node_name"], f"{args.drain_reason} ({recovery_id})")
+        state["drain"] = drain_info
+        _apply_recovery_job_actions(current.get("actions") or [], state)
+        active = wait_for_no_active_jobs(duration_to_seconds(args.drain_timeout))
+        if active:
+            raise RuntimeError(f"drain timed out with active jobs still present: {active}")
+        apply_started = True
+        _apply_profile_via_ansible(recovery_resolved["profile"], root, plan_dir / "cpu-only-rendered")
+        state["status"] = "cpu_only"
+        state["active_profile"] = recovery_resolved["profile"]
+        state["entered_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        if drain_info.get("initiated_by_ssn"):
+            resume_node(resolved["identity"]["node_name"])
+            drain_info["initiated_by_ssn"] = False
+        _write_gpu_recovery_state(state_path, state, group=admin_group)
+    except Exception:
+        state["status"] = "failed_enter"
+        state["failed_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        if drain_info and drain_info.get("initiated_by_ssn") and not apply_started:
+            try:
+                resume_node(resolved["identity"]["node_name"])
+                drain_info["initiated_by_ssn"] = False
+            except Exception as resume_exc:
+                state["resume_error"] = str(resume_exc)
+        elif drain_info and drain_info.get("initiated_by_ssn"):
+            state["manual_recovery"] = f"scontrol update NodeName={resolved['identity']['node_name']} State=RESUME"
+        _write_gpu_recovery_state(state_path, state, group=admin_group)
+        raise
+    print(f"GPU recovery entered CPU-only mode using profile {recovery_resolved['profile']}")
+    print(f"Recovery state: {state_path}")
+    return 0
+
+
+def _gpu_recovery_exit(args: argparse.Namespace, root: Path, resolved: dict[str, Any], admin_group: str) -> int:
+    state_path = Path(args.state)
+    state = json.loads(state_path.read_text()) if state_path.exists() else {}
+    recovery_id = state.get("recovery_id") or f"gpu-recovery-exit-{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d%H%M%S')}"
+    plan_dir = Path("/var/lib/slurm-single-node/plans") / str(recovery_id)
+    drain_info: dict[str, Any] | None = None
+    apply_started = False
+    try:
+        drain_info = drain_node(resolved["identity"]["node_name"], f"{args.drain_reason} ({recovery_id})")
+        active = wait_for_no_active_jobs(duration_to_seconds(args.drain_timeout))
+        if active:
+            raise RuntimeError(f"drain timed out with active jobs still present: {active}")
+        apply_started = True
+        _apply_profile_via_ansible(resolved["profile"], root, plan_dir / "gpu-rendered")
+        verification = gpu_verification_report(resolved)
+        errors = gpu_verification_errors(verification)
+        if errors:
+            raise RuntimeError("GPU verification failed after recovery exit: " + "; ".join(errors))
+        _release_held_jobs(state)
+        state.update(
+            {
+                "schema_version": 1,
+                "status": "normal",
+                "profile": resolved["profile"],
+                "active_profile": resolved["profile"],
+                "exited_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "gpu_verification": verification,
+            }
+        )
+        if drain_info.get("initiated_by_ssn"):
+            resume_node(resolved["identity"]["node_name"])
+            drain_info["initiated_by_ssn"] = False
+        _write_gpu_recovery_state(state_path, state, group=admin_group)
+    except Exception:
+        state["status"] = "failed_exit"
+        state["failed_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        if drain_info and drain_info.get("initiated_by_ssn") and not apply_started:
+            try:
+                resume_node(resolved["identity"]["node_name"])
+                drain_info["initiated_by_ssn"] = False
+            except Exception as resume_exc:
+                state["resume_error"] = str(resume_exc)
+        elif drain_info and drain_info.get("initiated_by_ssn"):
+            state["manual_recovery"] = f"scontrol update NodeName={resolved['identity']['node_name']} State=RESUME"
+        _write_gpu_recovery_state(state_path, state, group=admin_group)
+        raise
+    print(f"GPU recovery exited; restored profile {resolved['profile']}")
+    print(f"Recovery state: {state_path}")
+    return 0
+
+
+def _apply_recovery_job_actions(actions: list[dict[str, Any]], state: dict[str, Any]) -> None:
+    for action in actions:
+        job_id = str(action.get("job_id"))
+        if action.get("action") == "hold":
+            proc = subprocess.run(["scontrol", "hold", job_id], text=True, capture_output=True)
+        else:
+            proc = subprocess.run(["scancel", job_id], text=True, capture_output=True)
+        result = dict(action)
+        result["rc"] = proc.returncode
+        result["stdout"] = proc.stdout.strip()
+        result["stderr"] = proc.stderr.strip()
+        if proc.returncode != 0:
+            raise RuntimeError(f"failed to {action.get('action')} GPU fixture job {job_id}: {proc.stderr.strip()}")
+        state.setdefault("job_actions", []).append(result)
+
+
+def _write_gpu_recovery_state(path: Path, state: dict[str, Any], *, group: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+    secure_path(path, group=group)
+
+
+def _release_held_jobs(state: dict[str, Any]) -> None:
+    for action in state.get("job_actions") or []:
+        if action.get("action") != "hold" or action.get("rc") != 0:
+            continue
+        job_id = str(action.get("job_id"))
+        subprocess.run(["scontrol", "release", job_id], text=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _apply_profile_via_ansible(profile: str, root: Path, output_dir: Path) -> None:
+    render_profile(profile, output_dir, root)
+    ansible_vars = output_dir / "ansible-vars.json"
+    cmd = [
+        "ansible-playbook",
+        "-i",
+        str(root / "ansible" / "inventories" / "local.ini"),
+        str(root / "ansible" / "site.yml"),
+        "-e",
+        f"@{ansible_vars}",
+    ]
+    rc = subprocess.call(cmd)
+    if rc != 0:
+        raise RuntimeError(f"ansible-playbook failed with rc={rc}")
+
+
+def _default_gpu_recovery_plan_path() -> Path:
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d%H%M%S")
+    if os.geteuid() == 0:
+        return Path("/var/lib/slurm-single-node/plans") / f"gpu-recovery-{stamp}" / "gpu-recovery-plan.json"
+    return repo_root(None) / "build" / "plans" / f"gpu-recovery-{stamp}" / "gpu-recovery-plan.json"
+
+
+def _print_gpu_recovery_report(report: dict[str, Any], *, report_path: Path, as_json: bool) -> None:
+    if as_json:
+        payload = dict(report)
+        payload["path"] = str(report_path)
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    print(f"GPU recovery plan: {report_path}")
+    print(f"Risk: {GPU_RECOVERY_RISK}")
+    print(f"Operation hash: {report.get('operation_hash')}")
+    print(f"Fixture GPU jobs: {len(report.get('fixture_gpu_jobs') or [])}")
+    print(f"Non-fixture GPU jobs: {len(report.get('nonfixture_gpu_jobs') or [])}")
+    for action in report.get("actions") or []:
+        print(f"PLAN {action['action']:6s} job={action['job_id']} user={action['user']} state={action['state']}")
 
 
 def login_isolation_cmd(argv: list[str]) -> int:
@@ -873,9 +1142,9 @@ def verify_local(resolved: dict[str, Any]) -> list[dict[str, str]]:
             else:
                 checks.append(_check(f"path_{label}", Path(mount).exists(), str(mount)))
     if resolved["derived"]["has_gpus"]:
-        gpus = _discover_nvidia_gpus()
-        expected = int(resolved["hardware"]["gpus"])
-        checks.append(_check("nvidia_smi", len(gpus) == expected, f"expected={expected} discovered={len(gpus)}"))
+        report = gpu_verification_report(resolved)
+        for check in report.get("checks", []):
+            checks.append({"name": f"gpu_{check['name']}", "status": check["status"], "detail": check["detail"]})
     return checks
 
 

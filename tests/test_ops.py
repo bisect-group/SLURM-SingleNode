@@ -169,6 +169,32 @@ class FeatureGateTests(unittest.TestCase):
             jobs = wait_for_no_active_jobs(0, poll_seconds=0)
         self.assertEqual(jobs[0]["id"], "1")
 
+    def test_feature_gate_requires_cli_filter_plugin_when_enabled(self) -> None:
+        resolved = {
+            "derived": {"has_gpus": False, "paths": {}},
+            "resolved_policies": {
+                "storage": {"quotas": {}, "job_scratch": {}},
+                "slurm_core": {"submit_filter": {"client_filter": {"enabled": True}}},
+            },
+        }
+        capabilities = {
+            "cgroup_fs": "cgroup2fs",
+            "commands": {
+                "ansible-playbook": "/usr/bin/ansible-playbook",
+                "lua5.3": "/usr/bin/lua5.3",
+                "scontrol": "/usr/bin/scontrol",
+                "squeue": "/usr/bin/squeue",
+                "slurmd": "/usr/sbin/slurmd",
+                "sacctmgr": "/usr/bin/sacctmgr",
+                "sinfo": "/usr/bin/sinfo",
+                "sbatch": "/usr/bin/sbatch",
+            },
+            "mounts": {},
+            "slurm": {"accounting_cluster": "ssn", "cli_filter_lua_plugin": None},
+        }
+        errors = validate_feature_gates(resolved, mode="apply", capabilities=capabilities)
+        self.assertTrue(any("cli_filter/lua" in error for error in errors))
+
 
 if __name__ == "__main__":
     unittest.main()

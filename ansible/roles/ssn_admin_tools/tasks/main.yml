@@ -37,6 +37,7 @@
     - ssn-scratch-cleanup
     - ssn-scratch-health
     - ssn-gpu-collector
+    - ssn-gpu-recovery
     - ssn-login-isolation
     - ssn-login-status
 

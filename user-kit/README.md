@@ -30,6 +30,9 @@ Request a tier explicitly only when you know you have access:
 sbatch --qos=ssn-priority examples/00-hello-cpu.sh
 ```
 
+Jobs on normal tiers must remain requeueable. SSN rejects `--no-requeue` so
+preemption can safely move lower-tier work out of the way.
+
 ## GPU Jobs
 
 GPU examples are valid only on GPU profiles. CPU-only profiles reject GPU
@@ -46,6 +49,10 @@ Slurm for any command that needs the device:
 ```bash
 srun --gres=gpu:1 --pty bash
 ```
+
+If admins place the node into CPU-only recovery, GPU submissions will be
+rejected until GPU service is restored. CPU jobs should continue to run through
+the normal `compute` partition.
 
 ## Storage
 

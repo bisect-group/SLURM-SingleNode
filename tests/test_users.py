@@ -7,6 +7,7 @@ from unittest import mock
 
 from ssn.config import resolve_profile
 from ssn.users import (
+    INACTIVE_ARCHIVE_RISK,
     INACTIVE_LOCAL_ONLY_RISK,
     _allowed_qos_for_tier,
     apply_user_actions,
@@ -290,15 +291,50 @@ class UserTests(unittest.TestCase):
             mock.patch("ssn.users._current_uid", return_value=2401),
             mock.patch("ssn.users._current_gid", return_value=2401),
             mock.patch("ssn.users._current_home", return_value="/home/ssn-test-inactive"),
+            mock.patch("ssn.users._backup_hook_report", return_value={"directory": "/hooks", "required": True, "executable_hooks": []}),
         ):
             actions = plan_user_sync(users_doc, state_doc, resolved)
             report = inactive_plan_report(actions, users_doc, state_doc, resolved)
             report_again = inactive_plan_report(actions, users_doc, state_doc, resolved)
         self.assertEqual(report["command"], "sync-users")
-        self.assertEqual(report["risk"], INACTIVE_LOCAL_ONLY_RISK)
+        self.assertEqual(report["risk"], INACTIVE_ARCHIVE_RISK)
+        self.assertIn(INACTIVE_LOCAL_ONLY_RISK, report["risks"])
         self.assertEqual(report["operation_hash"], report_again["operation_hash"])
         self.assertEqual(report["inactive_users"][0]["username"], "ssn-test-inactive")
         self.assertTrue(report["inactive_users"][0]["fixture_apply_allowed"])
+        self.assertTrue(report["inactive_users"][0]["backup_required"])
+
+    def test_inactive_backup_required_blocks_without_hook_before_mutation(self) -> None:
+        resolved = resolve_profile("gpu-bisect-quadro-p620", ROOT)
+        users_doc = {
+            "schema_version": 1,
+            "groups": {},
+            "users": {
+                "ssn-test-prod": {
+                    "status": "inactive",
+                    "tier": "standard",
+                    "groups": [],
+                    "ssh_keys": None,
+                }
+            },
+        }
+        actions = plan_user_sync(users_doc, {"schema_version": 1, "users": {}}, resolved)
+        with (
+            mock.patch("os.geteuid", return_value=0),
+            mock.patch("ssn.users._user_exists", return_value=True),
+            mock.patch("ssn.users._archive_compressor", return_value="/usr/bin/7zz"),
+            mock.patch("ssn.users._backup_hook_report", return_value={"directory": "/hooks", "required": True, "executable_hooks": []}),
+            mock.patch("ssn.users._run") as run_mock,
+            self.assertRaisesRegex(ValueError, "requires an executable backup hook"),
+        ):
+            apply_user_actions(
+                actions,
+                users_doc,
+                resolved,
+                state_doc={"schema_version": 1, "users": {}},
+                allow_inactive_fixture=True,
+            )
+        run_mock.assert_not_called()
 
     def test_inactive_prune_manifest_is_allowlisted_and_symlink_safe(self) -> None:
         resolved = resolve_profile("gpu-bisect-quadro-p620", ROOT)

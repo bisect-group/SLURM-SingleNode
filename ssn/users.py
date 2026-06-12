@@ -22,7 +22,11 @@ from .yamlutil import dump_yaml, load_yaml
 
 VALID_STATUSES = {"active", "suspended", "inactive"}
 INACTIVE_FIXTURE_USER = "ssn-test-inactive"
+INACTIVE_FIXTURE_PREFIX = "ssn-test-"
+INACTIVE_ARCHIVE_RISK = "inactive_archive_apply"
 INACTIVE_LOCAL_ONLY_RISK = "inactive_local_only_archive"
+DEFAULT_ARCHIVE_HOOK_DIR = "/etc/slurm-single-node/archive-hooks.d"
+DEFAULT_ARCHIVE_HOOK_TIMEOUT_SECONDS = 300
 INACTIVE_ARCHIVE_STATES = {
     "archive_pending",
     "archive_running",
@@ -68,6 +72,15 @@ STATE_USER_KEYS = {
     "archive_operation_hash",
     "archive_local_only",
     "archive_last_error",
+    "archive_backup_required",
+    "archive_backup_status",
+    "archive_backup_hook",
+    "archive_backup_rc",
+    "archive_backup_stdout",
+    "archive_backup_stderr",
+    "archive_backup_started_at",
+    "archive_backup_finished_at",
+    "archive_backup_attempts",
     "inactive_at",
     "tombstoned_at",
     "home_dir",
@@ -490,6 +503,11 @@ def inactive_plan_report(
     inactive = inactive_actions(actions)
     payload = _inactive_operation_payload(inactive, users_doc, state_doc, resolved)
     operation_hash = config_hash({"inactive_lifecycle": payload})
+    archive_policy = resolved["resolved_policies"]["storage"].get("inactive_archive") or {}
+    backup = _backup_hook_report(resolved)
+    risks = [INACTIVE_ARCHIVE_RISK]
+    if (archive_policy.get("backup_hook") or {}).get("local_only_override") == "reviewed_token":
+        risks.append(INACTIVE_LOCAL_ONLY_RISK)
     planned_users = [
         _inactive_user_plan(action.username, users_doc, state_doc, resolved, operation_hash)
         for action in inactive
@@ -499,11 +517,14 @@ def inactive_plan_report(
         "command": "sync-users",
         "profile": resolved.get("profile"),
         "config_hash": config_hash(resolved),
-        "risk": INACTIVE_LOCAL_ONLY_RISK,
+        "risk": INACTIVE_ARCHIVE_RISK,
+        "risks": risks,
         "operation_hash": operation_hash,
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "mode": "dry_run",
-        "fixture_only_user": INACTIVE_FIXTURE_USER,
+        "fixture_prefix": INACTIVE_FIXTURE_PREFIX,
+        "legacy_fixture_user": INACTIVE_FIXTURE_USER,
+        "backup": backup,
         "inactive_users": planned_users,
         "actions": action_dicts(inactive),
     }
@@ -538,10 +559,14 @@ def _inactive_operation_payload(
         "users": payload_users,
         "archive_policy": {
             "compression": archive_policy.get("compression"),
+            "removal_requires_backup_success": archive_policy.get("removal_requires_backup_success"),
+            "backup_hook_required": (archive_policy.get("backup_hook") or {}).get("required_for_durability"),
+            "backup_hook_directory": _backup_hook_dir(resolved),
             "local_only_override": (archive_policy.get("backup_hook") or {}).get("local_only_override"),
             "removal_override": archive_policy.get("removal_override"),
         },
-        "fixture_only_user": INACTIVE_FIXTURE_USER,
+        "backup_hook_report": _backup_hook_report(resolved),
+        "fixture_prefix": INACTIVE_FIXTURE_PREFIX,
     }
 
 
@@ -559,7 +584,7 @@ def _inactive_user_plan(
     return {
         "username": username,
         "current_archive_state": previous.get("archive_state"),
-        "fixture_apply_allowed": username == INACTIVE_FIXTURE_USER,
+        "fixture_apply_allowed": username.startswith(INACTIVE_FIXTURE_PREFIX),
         "uid": _current_uid(username) or previous.get("uid") or previous.get("original_uid"),
         "gid": _current_gid(username) or previous.get("gid") or previous.get("original_gid"),
         "original_uid": previous.get("original_uid") or _current_uid(username),
@@ -568,7 +593,8 @@ def _inactive_user_plan(
         "data_dir": _data_dir(resolved, username),
         "scratch_dir": _scratch_dir(resolved, username),
         "archive_path": str(archive_path),
-        "local_only_override_required": True,
+        "backup_required": _backup_required(resolved),
+        "local_only_override_available": (resolved["resolved_policies"]["storage"].get("inactive_archive") or {}).get("backup_hook", {}).get("local_only_override") == "reviewed_token",
         "prune_manifest": prune,
         "next_action": _inactive_next_action(previous.get("archive_state")),
     }
@@ -678,6 +704,7 @@ def apply_user_actions(
     *,
     state_doc: dict[str, Any] | None = None,
     allow_inactive_fixture: bool = False,
+    inactive_local_only_override: bool = False,
 ) -> dict[str, Any]:
     if os.geteuid() != 0:
         raise PermissionError("user sync apply must run as root")
@@ -722,6 +749,7 @@ def apply_user_actions(
                 resolved,
                 state_doc,
                 allow_fixture=allow_inactive_fixture,
+                local_only_override=inactive_local_only_override,
             )
             continue
         _update_state_for_user(state_doc, action.username, users.get(action.username), resolved)
@@ -735,11 +763,12 @@ def _apply_inactive_lifecycle(
     state_doc: dict[str, Any],
     *,
     allow_fixture: bool,
+    local_only_override: bool,
 ) -> None:
     if not allow_fixture:
         raise ValueError(f"{username}: inactive lifecycle apply requires a reviewed plan token")
-    if username != INACTIVE_FIXTURE_USER:
-        raise ValueError(f"{username}: inactive apply is fixture-limited to {INACTIVE_FIXTURE_USER}")
+    if not username.startswith(INACTIVE_FIXTURE_PREFIX):
+        raise ValueError(f"{username}: inactive apply is fixture-limited to {INACTIVE_FIXTURE_PREFIX}* users in this round")
     state_users = state_doc.setdefault("users", {})
     previous = state_users.get(username) or {}
     if previous.get("archive_state") == "tombstoned" and not _user_exists(username):
@@ -752,6 +781,13 @@ def _apply_inactive_lifecycle(
     compressor = _archive_compressor()
     if compressor is None:
         raise ValueError("7zz or 7z is required for inactive archive apply")
+    backup_required = _backup_required(resolved)
+    hook_report = _backup_hook_report(resolved)
+    if backup_required and not local_only_override and not hook_report["executable_hooks"]:
+        raise ValueError(
+            f"{username}: inactive lifecycle requires an executable backup hook under "
+            f"{hook_report['directory']} or a reviewed local-only override token"
+        )
 
     entry = pwd.getpwnam(username)
     operation_payload = _inactive_operation_payload(
@@ -782,7 +818,10 @@ def _apply_inactive_lifecycle(
             "archive_state": "archive_pending",
             "archive_path": str(archive_path),
             "archive_operation_hash": operation_hash,
-            "archive_local_only": True,
+            "archive_local_only": bool(local_only_override or not backup_required),
+            "archive_backup_required": backup_required,
+            "archive_backup_status": "not_required" if not backup_required else "pending",
+            "archive_backup_attempts": int(previous.get("archive_backup_attempts") or 0),
             "inactive_at": previous.get("inactive_at", now),
             "updated_at": now,
             "archive_last_error": None,
@@ -805,12 +844,49 @@ def _apply_inactive_lifecycle(
             state_doc,
             username,
             {
-                "archive_state": "archived_local_only",
+                "archive_state": "archived_local_only" if (local_only_override or not backup_required) else "archive_running",
                 "archive_path": str(archive_path),
-                "archive_local_only": True,
+                "archive_local_only": bool(local_only_override or not backup_required),
                 "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
             },
         )
+        if backup_required and not local_only_override:
+            backup_result = _run_archive_backup_hooks(username, archive_path, state_doc, resolved)
+            if not backup_result["ok"]:
+                _set_state_user_fields(
+                    state_doc,
+                    username,
+                    {
+                        "archive_state": "backup_failed",
+                        "archive_backup_status": "failed",
+                        "archive_backup_hook": backup_result.get("hook"),
+                        "archive_backup_rc": backup_result.get("rc"),
+                        "archive_backup_stdout": backup_result.get("stdout"),
+                        "archive_backup_stderr": backup_result.get("stderr"),
+                        "archive_backup_started_at": backup_result.get("started_at"),
+                        "archive_backup_finished_at": backup_result.get("finished_at"),
+                        "archive_backup_attempts": int(previous.get("archive_backup_attempts") or 0) + 1,
+                        "archive_last_error": backup_result.get("error") or "backup hook failed",
+                        "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    },
+                )
+                return
+            _set_state_user_fields(
+                state_doc,
+                username,
+                {
+                    "archive_state": "backup_complete",
+                    "archive_backup_status": "complete",
+                    "archive_backup_hook": backup_result.get("hook"),
+                    "archive_backup_rc": backup_result.get("rc"),
+                    "archive_backup_stdout": backup_result.get("stdout"),
+                    "archive_backup_stderr": backup_result.get("stderr"),
+                    "archive_backup_started_at": backup_result.get("started_at"),
+                    "archive_backup_finished_at": backup_result.get("finished_at"),
+                    "archive_backup_attempts": int(previous.get("archive_backup_attempts") or 0) + 1,
+                    "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                },
+            )
         _set_state_user_fields(
             state_doc,
             username,
@@ -844,6 +920,97 @@ def _apply_inactive_prune(home_dir: Path, resolved: dict[str, Any]) -> None:
     for entry in manifest.get("delete_candidates", []):
         path = Path(entry["path"])
         _remove_prune_candidate(home_dir, path)
+
+
+def _backup_required(resolved: dict[str, Any]) -> bool:
+    policy = resolved["resolved_policies"]["storage"].get("inactive_archive") or {}
+    hook = policy.get("backup_hook") or {}
+    return bool(policy.get("removal_requires_backup_success") and hook.get("required_for_durability"))
+
+
+def _backup_hook_dir(resolved: dict[str, Any]) -> str:
+    hook = (resolved["resolved_policies"]["storage"].get("inactive_archive") or {}).get("backup_hook") or {}
+    return str(hook.get("directory") or DEFAULT_ARCHIVE_HOOK_DIR)
+
+
+def _backup_hook_report(resolved: dict[str, Any]) -> dict[str, Any]:
+    directory = Path(_backup_hook_dir(resolved))
+    hooks = []
+    if directory.is_dir():
+        for path in sorted(directory.iterdir()):
+            if not path.is_file() or path.name.startswith("."):
+                continue
+            hooks.append(
+                {
+                    "path": str(path),
+                    "executable": os.access(path, os.X_OK),
+                }
+            )
+    executable = [hook for hook in hooks if hook["executable"]]
+    return {
+        "directory": str(directory),
+        "exists": directory.is_dir(),
+        "required": _backup_required(resolved),
+        "missing_hook_action": ((resolved["resolved_policies"]["storage"].get("inactive_archive") or {}).get("backup_hook") or {}).get("missing_hook_action"),
+        "local_only_override": ((resolved["resolved_policies"]["storage"].get("inactive_archive") or {}).get("backup_hook") or {}).get("local_only_override"),
+        "hooks": hooks,
+        "executable_hooks": executable,
+    }
+
+
+def _run_archive_backup_hooks(
+    username: str,
+    archive_path: Path,
+    state_doc: dict[str, Any],
+    resolved: dict[str, Any],
+) -> dict[str, Any]:
+    report = _backup_hook_report(resolved)
+    hooks = report.get("executable_hooks") or []
+    if not hooks:
+        return {"ok": False, "error": "no executable backup hook"}
+    hook_path = hooks[0]["path"]
+    env = os.environ.copy()
+    state_entry = (state_doc.get("users") or {}).get(username) or {}
+    env.update(
+        {
+            "SSN_ARCHIVE_USER": username,
+            "SSN_ARCHIVE_UID": str(state_entry.get("original_uid") or state_entry.get("uid") or ""),
+            "SSN_ARCHIVE_GID": str(state_entry.get("original_gid") or state_entry.get("gid") or ""),
+            "SSN_ARCHIVE_PATH": str(archive_path),
+            "SSN_ARCHIVE_STATE": str(state_entry.get("archive_state") or ""),
+            "SSN_ARCHIVE_OPERATION_HASH": str(state_entry.get("archive_operation_hash") or ""),
+            "SSN_ARCHIVE_PROFILE": str(resolved.get("profile") or ""),
+            "SSN_ARCHIVE_HOOK_DIR": report["directory"],
+        }
+    )
+    started = dt.datetime.now(dt.timezone.utc).isoformat()
+    try:
+        proc = subprocess.run(
+            [hook_path],
+            text=True,
+            capture_output=True,
+            env=env,
+            timeout=DEFAULT_ARCHIVE_HOOK_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "hook": hook_path,
+            "error": f"backup hook timed out after {DEFAULT_ARCHIVE_HOOK_TIMEOUT_SECONDS}s",
+            "stdout": (exc.stdout or "")[-4000:] if isinstance(exc.stdout, str) else "",
+            "stderr": (exc.stderr or "")[-4000:] if isinstance(exc.stderr, str) else "",
+            "started_at": started,
+            "finished_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        }
+    return {
+        "ok": proc.returncode == 0,
+        "hook": hook_path,
+        "rc": proc.returncode,
+        "stdout": proc.stdout[-4000:],
+        "stderr": proc.stderr[-4000:],
+        "started_at": started,
+        "finished_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
 
 
 def _remove_prune_candidate(home_dir: Path, path: Path) -> None:

@@ -11,13 +11,19 @@ SSN renders both controller-side and client-side submit filters:
 - `CliFilterPlugins=cli_filter/lua`
 - `CliFilterParameters=cli_filter_lua_path=/etc/slurm/cli_filter.lua`
 
-The client filter rejects `--no-requeue`, `--requeue=0`, `--requeue=no`, and
-`--requeue=false` for normal users. The existing `/usr/local/bin/sbatch`
-wrapper remains as a friendly fallback.
+The client filter rejects `--no-requeue` for normal users, including script
+directives. The existing `/usr/local/bin/sbatch` wrapper remains as a friendly
+fallback and also rejects `--requeue=0`, `--requeue=no`, and
+`--requeue=false`.
 
 Slurm documents `cli_filter` as bypassable by alternate client configuration,
 so it is a policy/UX gate, not a security boundary. Keep QOS/TRES/cgroup
 settings as the authoritative enforcement layer.
+
+Live Quadro testing found that absolute `/usr/bin/sbatch --requeue=0` is
+normalized by Slurm 25.11.2 to a positive `requeue` option before Lua sees it,
+so that exact absolute-binary spelling is a documented client-filter
+limitation.
 
 ## Verification
 

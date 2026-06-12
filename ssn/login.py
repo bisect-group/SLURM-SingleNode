@@ -16,6 +16,7 @@ from .units import memory_to_mb
 
 
 DEFAULT_FIXTURE_PREFIX = "ssn-test-"
+DEFAULT_TARGET_SCOPE = "fixture_only"
 LOGIN_STATE_PATH = Path("/etc/slurm-single-node/login-isolation.json")
 GPU_MODE_PATH = Path("/etc/slurm-single-node/gpu-isolation-mode")
 GPU_STATUS_SNAPSHOT = Path("/run/slurm-single-node/gpu-status.json")
@@ -27,15 +28,29 @@ def login_isolation_report(
     resolved: dict[str, Any],
     *,
     fixture_prefix: str = DEFAULT_FIXTURE_PREFIX,
+    target_scope: str = DEFAULT_TARGET_SCOPE,
+    allow_users: list[str] | None = None,
+    allow_prefixes: list[str] | None = None,
     mode: str = "cgroup",
 ) -> dict[str, Any]:
-    targets = _login_targets(users_doc, state_doc, resolved, fixture_prefix=fixture_prefix)
+    targets = _login_targets(
+        users_doc,
+        state_doc,
+        resolved,
+        fixture_prefix=fixture_prefix,
+        target_scope=target_scope,
+        allow_users=allow_users,
+        allow_prefixes=allow_prefixes,
+    )
     return {
         "schema_version": 1,
         "command": "login-isolation",
         "profile": resolved["profile"],
         "mode": mode,
+        "target_scope": target_scope,
         "fixture_prefix": fixture_prefix,
+        "allow_users": sorted(allow_users or []),
+        "allow_prefixes": sorted(allow_prefixes or []),
         "generated_at": _now(),
         "limits": _login_limits(resolved),
         "gpu": {
@@ -53,6 +68,9 @@ def apply_login_isolation(
     resolved: dict[str, Any],
     *,
     fixture_prefix: str = DEFAULT_FIXTURE_PREFIX,
+    target_scope: str = DEFAULT_TARGET_SCOPE,
+    allow_users: list[str] | None = None,
+    allow_prefixes: list[str] | None = None,
     mode: str = "cgroup",
     report_path: str | Path = LOGIN_STATE_PATH,
 ) -> dict[str, Any]:
@@ -66,6 +84,9 @@ def apply_login_isolation(
         state_doc,
         resolved,
         fixture_prefix=fixture_prefix,
+        target_scope=target_scope,
+        allow_users=allow_users,
+        allow_prefixes=allow_prefixes,
         mode=mode,
     )
     report["applied_at"] = _now()
@@ -76,6 +97,9 @@ def apply_login_isolation(
         gpu_mode = "acl" if mode == "acl" else "cgroup" if mode == "cgroup" else "disabled"
 
     for target in report["targets"]:
+        if target.get("status") != "targeted":
+            report["actions"].append({"user": target.get("user"), "action": "skip_target", "reason": target.get("status")})
+            continue
         dropin = Path(target["dropin"])
         dropin.parent.mkdir(parents=True, exist_ok=True)
         content = _slice_dropin_content(resolved, gpu_mode=gpu_mode, enabled=enabled)
@@ -105,12 +129,18 @@ def login_isolation_status(
     resolved: dict[str, Any],
     *,
     fixture_prefix: str = DEFAULT_FIXTURE_PREFIX,
+    target_scope: str = DEFAULT_TARGET_SCOPE,
+    allow_users: list[str] | None = None,
+    allow_prefixes: list[str] | None = None,
 ) -> dict[str, Any]:
     report = login_isolation_report(
         users_doc,
         state_doc,
         resolved,
         fixture_prefix=fixture_prefix,
+        target_scope=target_scope,
+        allow_users=allow_users,
+        allow_prefixes=allow_prefixes,
         mode=_read_text(GPU_MODE_PATH).strip() or "unknown",
     )
     report["status"] = []
@@ -233,18 +263,31 @@ def _login_targets(
     resolved: dict[str, Any],
     *,
     fixture_prefix: str,
+    target_scope: str,
+    allow_users: list[str] | None = None,
+    allow_prefixes: list[str] | None = None,
 ) -> list[dict[str, Any]]:
+    if target_scope not in {"fixture_only", "managed_allowlist", "all_managed_non_admin"}:
+        raise ValueError(f"invalid login isolation target scope: {target_scope}")
     admins = set((resolved.get("admins") or {}).get("users") or [])
+    allow_users_set = set(allow_users or [])
+    allow_prefixes = list(allow_prefixes or [])
     targets = []
     for username, user in sorted((users_doc.get("users") or {}).items()):
         state = (state_doc.get("users") or {}).get(username) or {}
-        if not username.startswith(fixture_prefix):
-            continue
         if user.get("status") != "active":
             continue
         if username in admins:
             continue
         if not state.get("managed"):
+            continue
+        if not _target_scope_matches(
+            username,
+            target_scope=target_scope,
+            fixture_prefix=fixture_prefix,
+            allow_users=allow_users_set,
+            allow_prefixes=allow_prefixes,
+        ):
             continue
         try:
             entry = pwd.getpwnam(username)
@@ -262,6 +305,21 @@ def _login_targets(
             }
         )
     return targets
+
+
+def _target_scope_matches(
+    username: str,
+    *,
+    target_scope: str,
+    fixture_prefix: str,
+    allow_users: set[str],
+    allow_prefixes: list[str],
+) -> bool:
+    if target_scope == "all_managed_non_admin":
+        return True
+    if target_scope == "fixture_only":
+        return username.startswith(fixture_prefix)
+    return username in allow_users or any(username.startswith(prefix) for prefix in allow_prefixes)
 
 
 def _login_limits(resolved: dict[str, Any]) -> dict[str, Any]:

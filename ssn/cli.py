@@ -21,6 +21,7 @@ from .gpu import (
 )
 from .login import (
     DEFAULT_FIXTURE_PREFIX as DEFAULT_LOGIN_FIXTURE_PREFIX,
+    DEFAULT_TARGET_SCOPE as DEFAULT_LOGIN_TARGET_SCOPE,
     collect_gpu_status_snapshot,
     apply_login_isolation,
     login_isolation_report,
@@ -50,8 +51,10 @@ from .storage import (
     scratch_health_report,
     write_scratch_health_state,
 )
+from .safety import RETENTION_DELETE_RISK, apply_test_retention_cleanup, retention_cleanup_report
 from .units import duration_to_seconds
 from .users import (
+    INACTIVE_ARCHIVE_RISK,
     INACTIVE_LOCAL_ONLY_RISK,
     action_dicts,
     apply_user_actions,
@@ -91,6 +94,7 @@ def main(argv: list[str] | None = None, prog: str | None = None) -> int:
         "ssn-login-status": login_status_cmd,
         "ssn-archive-status": archive_status_cmd,
         "ssn-scratch-cleanup": scratch_cleanup_cmd,
+        "ssn-retention-cleanup": retention_cleanup_cmd,
         "ssn-scratch-health": scratch_health_cmd,
         "ssn-plan-token": plan_token_cmd,
     }
@@ -111,6 +115,7 @@ def main(argv: list[str] | None = None, prog: str | None = None) -> int:
     sub.add_parser("login-status")
     sub.add_parser("archive-status")
     sub.add_parser("scratch-cleanup")
+    sub.add_parser("retention-cleanup")
     sub.add_parser("scratch-health")
     sub.add_parser("plan-token")
     ns, rest = parser.parse_known_args(argv)
@@ -127,6 +132,7 @@ def main(argv: list[str] | None = None, prog: str | None = None) -> int:
         "login-status": login_status_cmd,
         "archive-status": archive_status_cmd,
         "scratch-cleanup": scratch_cleanup_cmd,
+        "retention-cleanup": retention_cleanup_cmd,
         "scratch-health": scratch_health_cmd,
         "plan-token": plan_token_cmd,
     }[ns.command](rest)
@@ -449,18 +455,50 @@ def sync_users_cmd(argv: list[str]) -> int:
             print(f"{flag:5s} {action.username:20s} {action.action:28s} {action.detail}")
         if inactive_report_path:
             print(f"Inactive lifecycle plan: {inactive_report_path}")
-            print(f"Inactive lifecycle risk: {INACTIVE_LOCAL_ONLY_RISK}")
+            print(f"Inactive lifecycle risks: {', '.join(inactive_report.get('risks') or [inactive_report.get('risk')])}")
+            backup = inactive_report.get("backup") or {}
+            print(
+                "Inactive backup hooks: "
+                f"required={backup.get('required')} "
+                f"dir={backup.get('directory')} "
+                f"executable={len(backup.get('executable_hooks') or [])}"
+            )
     if args.apply:
+        inactive_local_only_override = False
         if inactive:
             if not args.plan_token:
                 print("ERROR: inactive lifecycle apply requires --plan-token", file=sys.stderr)
                 print(f"Inactive lifecycle plan: {inactive_report_path}", file=sys.stderr)
                 return 2
+            token_risk = None
+            try:
+                validate_plan_token(args.plan_token, inactive_report or {}, risk=INACTIVE_ARCHIVE_RISK, store_root=args.token_store, mark_used=False)
+                token_risk = INACTIVE_ARCHIVE_RISK
+            except Exception as exc:
+                try:
+                    validate_plan_token(args.plan_token, inactive_report or {}, risk=INACTIVE_LOCAL_ONLY_RISK, store_root=args.token_store, mark_used=False)
+                    token_risk = INACTIVE_LOCAL_ONLY_RISK
+                    inactive_local_only_override = True
+                except Exception:
+                    print(f"ERROR: {exc}", file=sys.stderr)
+                    return 2
+            backup = (inactive_report or {}).get("backup") or {}
+            if (
+                token_risk == INACTIVE_ARCHIVE_RISK
+                and backup.get("required")
+                and not backup.get("executable_hooks")
+            ):
+                print(
+                    "ERROR: inactive lifecycle requires an executable backup hook "
+                    f"under {backup.get('directory')} or a reviewed local-only override token",
+                    file=sys.stderr,
+                )
+                return 2
             try:
                 validate_plan_token(
                     args.plan_token,
                     inactive_report or {},
-                    risk=INACTIVE_LOCAL_ONLY_RISK,
+                    risk=token_risk or INACTIVE_ARCHIVE_RISK,
                     store_root=args.token_store,
                 )
             except Exception as exc:
@@ -479,6 +517,7 @@ def sync_users_cmd(argv: list[str]) -> int:
             resolved,
             state_doc=state_doc,
             allow_inactive_fixture=bool(inactive),
+            inactive_local_only_override=inactive_local_only_override,
         )
         state_path = Path(args.state)
         state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -837,6 +876,13 @@ def login_isolation_cmd(argv: list[str]) -> int:
     parser.add_argument("--users", default=DEFAULT_USERS)
     parser.add_argument("--state", default=DEFAULT_STATE)
     parser.add_argument("--fixture-prefix", default=DEFAULT_LOGIN_FIXTURE_PREFIX)
+    parser.add_argument(
+        "--target-scope",
+        choices=["fixture_only", "managed_allowlist", "all_managed_non_admin"],
+        default="managed_allowlist",
+    )
+    parser.add_argument("--allow-user", action="append", default=[])
+    parser.add_argument("--allow-prefix", action="append", default=None)
     parser.add_argument("--mode", choices=["cgroup", "acl", "limits", "disabled"], default="cgroup")
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--report", default="/etc/slurm-single-node/login-isolation.json")
@@ -847,6 +893,7 @@ def login_isolation_cmd(argv: list[str]) -> int:
         resolved = resolve_profile(args.profile, repo_root(args.repo))
         users_doc = load_users(args.users)
         state_doc = load_state(args.state)
+        allow_prefixes = args.allow_prefix if args.allow_prefix is not None else ([] if args.allow_user else [DEFAULT_LOGIN_FIXTURE_PREFIX])
         errors = [*validate_state(state_doc), *validate_users(users_doc, resolved, state_doc=state_doc)]
         if errors:
             raise ValueError("; ".join(errors))
@@ -856,6 +903,9 @@ def login_isolation_cmd(argv: list[str]) -> int:
                 state_doc,
                 resolved,
                 fixture_prefix=args.fixture_prefix,
+                target_scope=args.target_scope,
+                allow_users=args.allow_user,
+                allow_prefixes=allow_prefixes,
                 mode=args.mode,
                 report_path=args.report,
             )
@@ -865,6 +915,9 @@ def login_isolation_cmd(argv: list[str]) -> int:
                 state_doc,
                 resolved,
                 fixture_prefix=args.fixture_prefix,
+                target_scope=args.target_scope,
+                allow_users=args.allow_user,
+                allow_prefixes=allow_prefixes,
                 mode=args.mode,
             )
         )
@@ -876,7 +929,10 @@ def login_isolation_cmd(argv: list[str]) -> int:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
         action = "Applied" if args.apply else "Planned"
-        print(f"{action} login isolation mode={args.mode} targets={len(report.get('targets') or [])}")
+        print(
+            f"{action} login isolation mode={args.mode} "
+            f"target_scope={args.target_scope} targets={len(report.get('targets') or [])}"
+        )
         if args.apply:
             print(f"Report: {args.report}")
         for target in report.get("targets", []):
@@ -891,6 +947,13 @@ def login_status_cmd(argv: list[str]) -> int:
     parser.add_argument("--users", default=DEFAULT_USERS)
     parser.add_argument("--state", default=DEFAULT_STATE)
     parser.add_argument("--fixture-prefix", default=DEFAULT_LOGIN_FIXTURE_PREFIX)
+    parser.add_argument(
+        "--target-scope",
+        choices=["fixture_only", "managed_allowlist", "all_managed_non_admin"],
+        default=DEFAULT_LOGIN_TARGET_SCOPE,
+    )
+    parser.add_argument("--allow-user", action="append", default=[])
+    parser.add_argument("--allow-prefix", action="append", default=[])
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
@@ -906,6 +969,9 @@ def login_status_cmd(argv: list[str]) -> int:
             state_doc,
             resolved,
             fixture_prefix=args.fixture_prefix,
+            target_scope=args.target_scope,
+            allow_users=args.allow_user,
+            allow_prefixes=args.allow_prefix,
         )
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -913,7 +979,7 @@ def login_status_cmd(argv: list[str]) -> int:
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
-        print(f"Login isolation mode: {report.get('mode')}")
+        print(f"Login isolation mode: {report.get('mode')} target_scope={report.get('target_scope')}")
         snapshot = report.get("snapshot") or {}
         print(
             "GPU snapshot: "
@@ -950,6 +1016,10 @@ def archive_status_cmd(argv: list[str]) -> int:
                     "archive_state": archive_state,
                     "archive_path": entry.get("archive_path"),
                     "local_only": entry.get("archive_local_only"),
+                    "backup_required": entry.get("archive_backup_required"),
+                    "backup_status": entry.get("archive_backup_status"),
+                    "backup_hook": entry.get("archive_backup_hook"),
+                    "backup_rc": entry.get("archive_backup_rc"),
                     "last_error": entry.get("archive_last_error"),
                     "next_action": _archive_next_action(archive_state),
                 }
@@ -962,10 +1032,12 @@ def archive_status_cmd(argv: list[str]) -> int:
         found = True
         print(
             f"{row['username']:20s} {row['archive_state']:20s} "
-            f"local_only={row['local_only']} next={row['next_action']}"
+            f"local_only={row['local_only']} backup={row.get('backup_status')} next={row['next_action']}"
         )
         if row.get("archive_path"):
             print(f"{'':20s} archive={row['archive_path']}")
+        if row.get("backup_hook"):
+            print(f"{'':20s} hook={row['backup_hook']} rc={row.get('backup_rc')}")
         if row.get("last_error"):
             print(f"{'':20s} error={row['last_error']}")
     if not found:
@@ -1095,6 +1167,71 @@ def scratch_cleanup_cmd(argv: list[str]) -> int:
     report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     print(f"Scratch cleanup report written: {report_path}")
     print(f"Eligible top-level scratch paths: {report['candidate_count']}")
+    return 0
+
+
+def retention_cleanup_cmd(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="ssn-retention-cleanup")
+    parser.add_argument("--profile", default=None)
+    parser.add_argument("--repo", default=None)
+    parser.add_argument("--root", required=True)
+    parser.add_argument("--older-than-days", type=int, default=90)
+    parser.add_argument("--report", required=True)
+    parser.add_argument("--apply", action="store_true", help="delete eligible SSN test artifacts")
+    parser.add_argument("--yes-delete", action="store_true", help="required with --apply")
+    parser.add_argument("--plan-token", default=None, help="reviewed token required with --apply")
+    parser.add_argument("--token-store", default=DEFAULT_TOKEN_STORE)
+    parser.add_argument("--fixture-prefix", default=DEFAULT_FIXTURE_PREFIX)
+    args = parser.parse_args(argv)
+
+    if args.apply and not args.yes_delete:
+        print("ERROR: --apply requires --yes-delete", file=sys.stderr)
+        return 2
+    if args.apply and not args.plan_token:
+        print("ERROR: --apply requires --plan-token", file=sys.stderr)
+        return 2
+
+    report_path = Path(args.report)
+    if args.apply:
+        try:
+            report = json.loads(report_path.read_text())
+            validate_plan_token(
+                args.plan_token,
+                report,
+                risk=RETENTION_DELETE_RISK,
+                store_root=args.token_store,
+            )
+            applied = apply_test_retention_cleanup(report, fixture_prefix=args.fixture_prefix)
+            report_path.write_text(json.dumps(applied, indent=2, sort_keys=True) + "\n")
+        except Exception as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+        print(f"Retention cleanup applied from reviewed report: {report_path}")
+        for item in applied.get("deletion_results", []):
+            print(f"RETENTION {item['status']:8s} {item['path']} {item.get('reason', '')}")
+        return 0
+
+    profile = None
+    config_hash_value = None
+    if args.profile:
+        try:
+            resolved = resolve_profile(args.profile, repo_root(args.repo))
+            profile = resolved["profile"]
+            config_hash_value = config_hash(resolved)
+        except Exception as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+    report = retention_cleanup_report(
+        args.root,
+        older_than_days=args.older_than_days,
+        profile=profile,
+        config_hash_value=config_hash_value,
+    )
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    print(f"Retention cleanup report written: {report_path}")
+    print(f"Risk: {RETENTION_DELETE_RISK}")
+    print(f"Eligible old items: {report['candidate_count']}")
     return 0
 
 

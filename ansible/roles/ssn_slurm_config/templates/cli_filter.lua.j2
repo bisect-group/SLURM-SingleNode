@@ -6,7 +6,7 @@ local function value_blocks_requeue(value)
     return false
   end
   local text = string.lower(tostring(value))
-  return text == "0" or text == "false" or text == "no" or text == "off"
+  return text == "0" or text == "false" or text == "no" or text == "off" or text == "no-requeue" or text == "no_requeue"
 end
 
 local function argv_blocks_requeue(options)

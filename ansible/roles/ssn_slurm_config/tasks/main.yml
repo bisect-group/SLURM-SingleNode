@@ -175,6 +175,63 @@
     - "'Already existing' not in (ssn_default_account.stderr | default(''))"
     - "'Nothing new added' not in (ssn_default_account.stdout | default(''))"
 
+- name: Add inactive archive Slurm account
+  ansible.builtin.command: >
+    sacctmgr -i add account {{ ssn.resolved_policies.storage.inactive_archive.slurm_account }}
+    Description="Slurm Single-Node archive service account"
+    Organization={{ ssn.identity.cluster_name }}
+  register: ssn_archive_account
+  changed_when:
+    - ssn_archive_account.rc == 0
+    - "'already exists' not in (ssn_archive_account.stdout | default(''))"
+    - "'Already existing' not in (ssn_archive_account.stdout | default(''))"
+    - "'Nothing new added' not in (ssn_archive_account.stdout | default(''))"
+  failed_when:
+    - ssn_archive_account.rc != 0
+    - "'already exists' not in (ssn_archive_account.stdout | default(''))"
+    - "'already exists' not in (ssn_archive_account.stderr | default(''))"
+    - "'Already existing' not in (ssn_archive_account.stdout | default(''))"
+    - "'Already existing' not in (ssn_archive_account.stderr | default(''))"
+    - "'Nothing new added' not in (ssn_archive_account.stdout | default(''))"
+  when: ssn.resolved_policies.storage.inactive_archive.slurm_account is defined
+
+- name: Add inactive archive QoS
+  ansible.builtin.command: >
+    sacctmgr -i add qos {{ ssn.resolved_policies.storage.inactive_archive.qos }}
+    Priority=100000
+    Flags=DenyOnLimit
+  register: ssn_archive_qos_add
+  changed_when:
+    - ssn_archive_qos_add.rc == 0
+    - "'already exists' not in (ssn_archive_qos_add.stdout | default(''))"
+    - "'Already existing' not in (ssn_archive_qos_add.stdout | default(''))"
+    - "'Nothing new added' not in (ssn_archive_qos_add.stdout | default(''))"
+  failed_when:
+    - ssn_archive_qos_add.rc != 0
+    - "'already exists' not in (ssn_archive_qos_add.stdout | default(''))"
+    - "'already exists' not in (ssn_archive_qos_add.stderr | default(''))"
+    - "'Already existing' not in (ssn_archive_qos_add.stdout | default(''))"
+    - "'Already existing' not in (ssn_archive_qos_add.stderr | default(''))"
+    - "'Nothing new added' not in (ssn_archive_qos_add.stdout | default(''))"
+  when: ssn.resolved_policies.storage.inactive_archive.qos is defined
+
+- name: Update inactive archive QoS
+  ansible.builtin.command: >
+    sacctmgr -i modify qos {{ ssn.resolved_policies.storage.inactive_archive.qos }} set
+    Priority=100000
+    Flags=DenyOnLimit
+  changed_when: false
+  when: ssn.resolved_policies.storage.inactive_archive.qos is defined
+
+- name: Allow inactive archive QoS on archive account
+  ansible.builtin.command: >
+    sacctmgr -i modify account {{ ssn.resolved_policies.storage.inactive_archive.slurm_account }} set
+    QOS={{ ssn.resolved_policies.storage.inactive_archive.qos }}
+  changed_when: false
+  when:
+    - ssn.resolved_policies.storage.inactive_archive.slurm_account is defined
+    - ssn.resolved_policies.storage.inactive_archive.qos is defined
+
 - name: Add tier QoS entries
   ansible.builtin.command: >
     sacctmgr -i add qos {{ item.qos }}

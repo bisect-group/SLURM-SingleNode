@@ -35,6 +35,7 @@
     - ssn-plan-token
     - ssn-archive-status
     - ssn-scratch-cleanup
+    - ssn-retention-cleanup
     - ssn-scratch-health
     - ssn-gpu-collector
     - ssn-gpu-recovery

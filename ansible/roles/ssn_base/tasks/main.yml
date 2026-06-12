@@ -93,6 +93,7 @@
     - { path: /var/lib/slurm-single-node/plans, mode: "0750" }
     - { path: /var/backups/slurm-single-node/users, mode: "0750" }
     - { path: /usr/local/lib/slurm-single-node, mode: "0755", group: root }
+    - { path: "{{ ssn.resolved_policies.storage.inactive_archive.backup_hook.directory | default('/etc/slurm-single-node/archive-hooks.d') }}", mode: "0750" }
 
 - name: Create runtime directory for SSN health markers
   ansible.builtin.file:

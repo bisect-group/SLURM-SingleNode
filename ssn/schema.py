@@ -189,6 +189,7 @@ POLICY_REQUIRED: dict[str, list[tuple[str, ...]]] = {
         ("inactive_archive", "removal_requires_backup_success"),
         ("inactive_archive", "removal_override"),
         ("inactive_archive", "backup_hook", "required_for_durability"),
+        ("inactive_archive", "backup_hook", "directory"),
         ("inactive_archive", "backup_hook", "missing_hook_action"),
         ("inactive_archive", "backup_hook", "local_only_override"),
         ("inactive_archive", "slurm_unavailable"),
@@ -639,6 +640,7 @@ def _expected_type(path: str) -> str | None:
         "removal_override",
         "missing_hook_action",
         "local_only_override",
+        "directory",
         "slurm_unavailable",
         "compression",
         "symlinks",
@@ -1009,6 +1011,7 @@ POLICY_SCHEMAS: dict[str, dict[str, Any]] = {
             "removal_requires_backup_success": None,
             "removal_override": None,
             "backup_hook": {
+                "directory": None,
                 "required_for_durability": None,
                 "missing_hook_action": None,
                 "local_only_override": None,

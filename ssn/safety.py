@@ -3,11 +3,15 @@ from __future__ import annotations
 import base64
 import datetime as dt
 import hashlib
+import shutil
 from pathlib import Path
 from typing import Any
 
+from .config import config_hash
+
 
 SECRET_KEY_PARTS = ("password", "passwd", "secret", "token", "private_key")
+RETENTION_DELETE_RISK = "retention_delete"
 
 
 def mask_email(value: str) -> str:
@@ -70,3 +74,82 @@ def retention_candidates(root: str | Path, *, older_than_days: int) -> list[dict
             }
         )
     return candidates
+
+
+def retention_operation_hash(report: dict[str, Any]) -> str:
+    payload = {
+        "root": report.get("root"),
+        "older_than_days": report.get("older_than_days"),
+        "candidates": report.get("candidates") or [],
+    }
+    return config_hash({"retention_cleanup": payload})
+
+
+def retention_cleanup_report(
+    root: str | Path,
+    *,
+    older_than_days: int,
+    profile: str | None = None,
+    config_hash_value: str | None = None,
+) -> dict[str, Any]:
+    root = Path(root).resolve()
+    report: dict[str, Any] = {
+        "schema_version": 1,
+        "command": "retention-cleanup",
+        "profile": profile,
+        "config_hash": config_hash_value,
+        "risk": RETENTION_DELETE_RISK,
+        "mode": "report_only",
+        "root": str(root),
+        "older_than_days": older_than_days,
+        "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "candidates": retention_candidates(root, older_than_days=older_than_days),
+    }
+    report["candidate_count"] = len(report["candidates"])
+    report["operation_hash"] = retention_operation_hash(report)
+    return report
+
+
+def apply_test_retention_cleanup(
+    report: dict[str, Any],
+    *,
+    fixture_prefix: str = "ssn-test-",
+) -> dict[str, Any]:
+    if report.get("operation_hash") != retention_operation_hash(report):
+        raise ValueError("retention report operation_hash does not match candidates")
+    root = Path(str(report.get("root", ""))).resolve()
+    results = []
+    for candidate in report.get("candidates") or []:
+        raw_path = Path(str(candidate.get("path", "")))
+        try:
+            parent = raw_path.parent.resolve()
+        except OSError:
+            parent = raw_path.parent
+        display_path = str(raw_path)
+        if parent != root:
+            results.append({"path": display_path, "status": "skipped", "reason": "outside retention root"})
+            continue
+        if raw_path.is_symlink():
+            results.append({"path": display_path, "status": "skipped", "reason": "symlink"})
+            continue
+        if not _safe_retention_test_path(raw_path, fixture_prefix=fixture_prefix):
+            results.append({"path": display_path, "status": "skipped", "reason": "not an allowed SSN test artifact"})
+            continue
+        if not raw_path.exists():
+            results.append({"path": display_path, "status": "skipped", "reason": "already absent"})
+            continue
+        if raw_path.is_dir():
+            shutil.rmtree(raw_path)
+        else:
+            raw_path.unlink()
+        results.append({"path": display_path, "status": "deleted"})
+    applied = dict(report)
+    applied["mode"] = "test_artifact_apply"
+    applied["deletion_results"] = results
+    return applied
+
+
+def _safe_retention_test_path(path: Path, *, fixture_prefix: str) -> bool:
+    if path.name.startswith(fixture_prefix) or path.name.startswith("tmp-ssn-test-"):
+        return True
+    return False

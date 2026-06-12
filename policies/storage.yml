@@ -36,6 +36,7 @@ policies:
       removal_requires_backup_success: false
       removal_override: explicit_admin_token
       backup_hook:
+        directory: /etc/slurm-single-node/archive-hooks.d
         required_for_durability: false
         missing_hook_action: warn_local_only
         local_only_override: not_required_for_dev
@@ -134,6 +135,7 @@ policies:
       removal_requires_backup_success: true
       removal_override: explicit_admin_token
       backup_hook:
+        directory: /etc/slurm-single-node/archive-hooks.d
         required_for_durability: true
         missing_hook_action: fail_transition
         local_only_override: reviewed_token

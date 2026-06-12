@@ -6,7 +6,14 @@ import time
 import unittest
 from pathlib import Path
 
-from ssn.safety import mask_email, redact_for_plan, retention_candidates
+from ssn.safety import (
+    apply_test_retention_cleanup,
+    mask_email,
+    redact_for_plan,
+    retention_candidates,
+    retention_cleanup_report,
+    retention_operation_hash,
+)
 
 
 class SafetyTests(unittest.TestCase):
@@ -34,6 +41,63 @@ class SafetyTests(unittest.TestCase):
             candidates = retention_candidates(tmp, older_than_days=1)
             self.assertEqual(len(candidates), 1)
             self.assertTrue(path.exists())
+
+    def test_retention_cleanup_deletes_only_test_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            test_path = root / "ssn-test-retention-old"
+            real_path = root / "install-20200101000000"
+            test_path.mkdir()
+            real_path.mkdir()
+            old_time = time.time() - 10 * 86400
+            os.utime(test_path, (old_time, old_time))
+            os.utime(real_path, (old_time, old_time))
+            report = retention_cleanup_report(root, older_than_days=1)
+            applied = apply_test_retention_cleanup(report)
+            results = {Path(item["path"]).name: item["status"] for item in applied["deletion_results"]}
+            self.assertEqual(results["ssn-test-retention-old"], "deleted")
+            self.assertEqual(results["install-20200101000000"], "skipped")
+            self.assertFalse(test_path.exists())
+            self.assertTrue(real_path.exists())
+
+    def test_retention_cleanup_skips_symlink_before_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "root"
+            outside_root = Path(tmp) / "outside"
+            root.mkdir()
+            outside_root.mkdir()
+            target = outside_root / "ssn-test-retention-target"
+            link = root / "ssn-test-retention-link"
+            target.mkdir()
+            link.symlink_to(target, target_is_directory=True)
+            old_time = time.time() - 10 * 86400
+            os.utime(target, (old_time, old_time), follow_symlinks=False)
+            os.utime(link, (old_time, old_time), follow_symlinks=False)
+            report = retention_cleanup_report(root, older_than_days=1)
+            applied = apply_test_retention_cleanup(report)
+            results = {Path(item["path"]).name: item for item in applied["deletion_results"]}
+            self.assertEqual(results["ssn-test-retention-link"]["status"], "skipped")
+            self.assertEqual(results["ssn-test-retention-link"]["reason"], "symlink")
+            self.assertTrue(link.is_symlink())
+            self.assertTrue(target.exists())
+
+    def test_retention_cleanup_skips_candidate_outside_report_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "root"
+            outside_root = Path(tmp) / "outside"
+            root.mkdir()
+            outside_root.mkdir()
+            outside = outside_root / "ssn-test-retention-outside"
+            outside.mkdir()
+            old_time = time.time() - 10 * 86400
+            os.utime(outside, (old_time, old_time))
+            report = retention_cleanup_report(root, older_than_days=1)
+            report["candidates"] = [{"path": str(outside), "mtime": "old", "type": "directory"}]
+            report["operation_hash"] = retention_operation_hash(report)
+            applied = apply_test_retention_cleanup(report)
+            self.assertEqual(applied["deletion_results"][0]["status"], "skipped")
+            self.assertEqual(applied["deletion_results"][0]["reason"], "outside retention root")
+            self.assertTrue(outside.exists())
 
 
 if __name__ == "__main__":

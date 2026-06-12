@@ -44,6 +44,36 @@ class LoginIsolationTests(unittest.TestCase):
         self.assertEqual(report["limits"]["cpu_quota"], "200%")
         self.assertEqual(report["limits"]["memory_max"], "4096M")
 
+    def test_login_isolation_managed_allowlist_targets_only_allowed_users(self) -> None:
+        resolved = resolve_profile("gpu-bisect-quadro-p620", ROOT)
+        users_doc = {
+            "schema_version": 1,
+            "groups": {},
+            "users": {
+                "ssn-test-standard": {"status": "active", "tier": "standard"},
+                "ssn-test-priority": {"status": "active", "tier": "priority"},
+                "realuser": {"status": "active", "tier": "standard"},
+            },
+        }
+        state_doc = {
+            "schema_version": 1,
+            "users": {
+                "ssn-test-standard": {"managed": True},
+                "ssn-test-priority": {"managed": True},
+                "realuser": {"managed": True},
+            },
+        }
+        with mock.patch("ssn.login.pwd.getpwnam", return_value=SimpleNamespace(pw_uid=1003, pw_gid=1003)):
+            report = login_isolation_report(
+                users_doc,
+                state_doc,
+                resolved,
+                target_scope="managed_allowlist",
+                allow_users=["realuser"],
+            )
+        self.assertEqual([target["user"] for target in report["targets"]], ["realuser"])
+        self.assertEqual(report["target_scope"], "managed_allowlist")
+
     def test_cgroup_dropin_includes_login_limits_and_device_closure(self) -> None:
         resolved = resolve_profile("gpu-bisect-quadro-p620", ROOT)
         content = _slice_dropin_content(resolved, gpu_mode="cgroup", enabled=True)

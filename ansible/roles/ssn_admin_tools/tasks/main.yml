@@ -36,6 +36,7 @@
     - ssn-archive-status
     - ssn-scratch-cleanup
     - ssn-retention-cleanup
+    - ssn-storage-quotas
     - ssn-scratch-health
     - ssn-gpu-collector
     - ssn-gpu-recovery

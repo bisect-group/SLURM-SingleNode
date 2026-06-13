@@ -44,11 +44,16 @@ from .ops import (
 )
 from .storage import (
     DEFAULT_FIXTURE_PREFIX,
+    STORAGE_QUOTA_ENABLE_RISK,
     apply_fixture_quotas,
     apply_fixture_scratch_cleanup,
+    enable_storage_quotas,
+    parse_fixture_quota_overrides,
     quota_capability_report,
     scratch_cleanup_report,
     scratch_health_report,
+    storage_quota_plan,
+    storage_quota_status,
     write_scratch_health_state,
 )
 from .safety import RETENTION_DELETE_RISK, apply_test_retention_cleanup, retention_cleanup_report
@@ -95,6 +100,7 @@ def main(argv: list[str] | None = None, prog: str | None = None) -> int:
         "ssn-archive-status": archive_status_cmd,
         "ssn-scratch-cleanup": scratch_cleanup_cmd,
         "ssn-retention-cleanup": retention_cleanup_cmd,
+        "ssn-storage-quotas": storage_quotas_cmd,
         "ssn-scratch-health": scratch_health_cmd,
         "ssn-plan-token": plan_token_cmd,
     }
@@ -116,6 +122,7 @@ def main(argv: list[str] | None = None, prog: str | None = None) -> int:
     sub.add_parser("archive-status")
     sub.add_parser("scratch-cleanup")
     sub.add_parser("retention-cleanup")
+    sub.add_parser("storage-quotas")
     sub.add_parser("scratch-health")
     sub.add_parser("plan-token")
     ns, rest = parser.parse_known_args(argv)
@@ -133,6 +140,7 @@ def main(argv: list[str] | None = None, prog: str | None = None) -> int:
         "archive-status": archive_status_cmd,
         "scratch-cleanup": scratch_cleanup_cmd,
         "retention-cleanup": retention_cleanup_cmd,
+        "storage-quotas": storage_quotas_cmd,
         "scratch-health": scratch_health_cmd,
         "plan-token": plan_token_cmd,
     }[ns.command](rest)
@@ -417,6 +425,13 @@ def sync_users_cmd(argv: list[str]) -> int:
         help="apply quotas only for users matching --quota-fixture-prefix when quotas are already active",
     )
     parser.add_argument("--quota-fixture-prefix", default=DEFAULT_FIXTURE_PREFIX)
+    parser.add_argument(
+        "--fixture-quota",
+        action="append",
+        default=[],
+        metavar="LABEL=SIZE",
+        help="fixture-only quota override, for example home=64MB data=64MB scratch=128MB",
+    )
     args = parser.parse_args(argv)
 
     root = repo_root(args.repo)
@@ -432,6 +447,9 @@ def sync_users_cmd(argv: list[str]) -> int:
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)
         return 2
+    quota_requested = args.quota_report or args.apply_fixture_quotas
+    if quota_requested and not args.apply and not args.dry_run:
+        return _sync_users_quota_request(args, users_doc, resolved)
     actions = plan_user_sync(users_doc, state_doc, resolved, single_user=args.user)
     inactive = inactive_actions(actions)
     inactive_report = None
@@ -440,7 +458,6 @@ def sync_users_cmd(argv: list[str]) -> int:
         inactive_report = inactive_plan_report(actions, users_doc, state_doc, resolved)
         inactive_report_path = Path(args.plan_output) if args.plan_output else _default_sync_plan_path("inactive-plan.json")
         write_protected_json(inactive_report_path, inactive_report, group=resolved["derived"]["admin_group"])
-    quota_requested = args.quota_report or args.apply_fixture_quotas
     if args.json and not args.apply and not quota_requested:
         payload = {"actions": action_dicts(actions)}
         if inactive_report:
@@ -537,34 +554,145 @@ def sync_users_cmd(argv: list[str]) -> int:
                 f"{retention['candidate_count']} item(s) older than {args.retention_days} days under {args.backup_root}"
             )
     if args.quota_report or args.apply_fixture_quotas:
-        try:
-            quota = (
-                apply_fixture_quotas(users_doc, resolved, fixture_prefix=args.quota_fixture_prefix)
-                if args.apply_fixture_quotas
-                else quota_capability_report(users_doc, resolved, fixture_prefix=args.quota_fixture_prefix)
+        return _sync_users_quota_request(args, users_doc, resolved)
+    return 0
+
+
+def _sync_users_quota_request(args: argparse.Namespace, users_doc: dict[str, Any], resolved: dict[str, Any]) -> int:
+    try:
+        quota_overrides = parse_fixture_quota_overrides(args.fixture_quota)
+        quota = (
+            apply_fixture_quotas(
+                users_doc,
+                resolved,
+                fixture_prefix=args.quota_fixture_prefix,
+                quota_overrides=quota_overrides,
             )
+            if args.apply_fixture_quotas
+            else quota_capability_report(
+                users_doc,
+                resolved,
+                fixture_prefix=args.quota_fixture_prefix,
+                quota_overrides=quota_overrides,
+            )
+        )
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps({"quota": quota}, indent=2, sort_keys=True))
+    else:
+        print(
+            f"Quota {quota['mode']}: fixtures={len(quota.get('fixture_users', []))} "
+            f"mounts={','.join(sorted(quota.get('mounts', {}))) or 'none'}"
+        )
+        for action in quota.get("actions", []):
+            print(
+                f"QUOTA {action.get('user', '-'):20s} "
+                f"{action.get('mount', '-'):8s} {action.get('status')} "
+                f"{action.get('reason') or action.get('path') or ''}"
+            )
+    return 0
+
+
+def storage_quotas_cmd(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="ssn-storage-quotas")
+    sub = parser.add_subparsers(dest="command", required=True)
+    for name in ("plan", "status"):
+        command = sub.add_parser(name)
+        command.add_argument("--profile", default="cpu-dev-local")
+        command.add_argument("--repo", default=None)
+        command.add_argument("--mount", action="append", choices=["home", "data", "scratch"], default=[])
+        command.add_argument("--fstab", default="/etc/fstab")
+        command.add_argument("--report", default=None)
+        command.add_argument("--json", action="store_true")
+    enable = sub.add_parser("enable")
+    enable.add_argument("--plan", required=True)
+    enable.add_argument("--plan-token", required=True)
+    enable.add_argument("--token-store", default=DEFAULT_TOKEN_STORE)
+    enable.add_argument("--fstab", default="/etc/fstab")
+    enable.add_argument("--backup-root", default="/var/backups/slurm-single-node/fstab")
+    enable.add_argument("--report", default=None)
+    enable.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+
+    if args.command in {"plan", "status"}:
+        try:
+            resolved = resolve_profile(args.profile, repo_root(args.repo))
+            labels = args.mount or None
+            report = (
+                storage_quota_plan(resolved, labels=labels, fstab_path=args.fstab)
+                if args.command == "plan"
+                else storage_quota_status(resolved, labels=labels, fstab_path=args.fstab)
+            )
+            report_path = Path(args.report) if args.report else _default_plan_path(
+                "storage-quotas",
+                "storage-quota-plan.json" if args.command == "plan" else "storage-quota-status.json"
+            )
+            if args.command == "plan" or args.report:
+                _write_json_report(report_path, report, group=resolved["derived"]["admin_group"])
         except Exception as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 2
         if args.json:
-            print(json.dumps({"quota": quota}, indent=2, sort_keys=True))
+            print(json.dumps(report, indent=2, sort_keys=True))
         else:
-            print(
-                f"Quota {quota['mode']}: fixtures={len(quota.get('fixture_users', []))} "
-                f"mounts={','.join(sorted(quota.get('mounts', {}))) or 'none'}"
-            )
-            for action in quota.get("actions", []):
+            print(f"Storage quota {args.command}: profile={report['profile']} mounts={','.join(report['mount_labels']) or 'none'}")
+            if args.command == "plan" or args.report:
+                print(f"Report: {report_path}")
+            if args.command == "plan":
+                print(f"Risk: {STORAGE_QUOTA_ENABLE_RISK}")
+            for label, mount in report.get("mounts", {}).items():
+                active = "active" if mount.get("active_user_quota") and mount.get("active_group_quota") else "inactive"
                 print(
-                    f"QUOTA {action.get('user', '-'):20s} "
-                    f"{action.get('mount', '-'):8s} {action.get('status')} "
-                    f"{action.get('reason') or action.get('path') or ''}"
+                    f"{label:8s} path={mount.get('path')} mount={mount.get('mountpoint')} "
+                    f"fstype={mount.get('fstype')} quota={active} can_enable={mount.get('can_enable')}"
                 )
+        return 0
+
+    try:
+        report_path = Path(args.plan)
+        plan = json.loads(report_path.read_text())
+        validate_plan_token(
+            args.plan_token,
+            plan,
+            risk=STORAGE_QUOTA_ENABLE_RISK,
+            store_root=args.token_store,
+        )
+        applied = enable_storage_quotas(plan, fstab_path=args.fstab, backup_root=args.backup_root)
+        output_path = Path(args.report) if args.report else report_path.with_name("storage-quota-enable.json")
+        _write_json_report(output_path, applied)
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(applied, indent=2, sort_keys=True))
+    else:
+        print(f"Storage quota enable status: {applied.get('status')}")
+        print(f"Report: {output_path}")
+        print(f"fstab backup: {applied.get('fstab_backup')}")
+        if applied.get("status") != "enabled":
+            for command in applied.get("recovery_commands") or []:
+                print(f"RECOVERY {command}")
+            return 1
     return 0
 
 
 def _default_sync_plan_path(filename: str) -> Path:
+    return _default_plan_path("user-sync", filename)
+
+
+def _default_plan_path(prefix: str, filename: str) -> Path:
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d%H%M%S")
-    return Path("/var/lib/slurm-single-node/plans") / f"user-sync-{stamp}" / filename
+    return Path("/var/lib/slurm-single-node/plans") / f"{prefix}-{stamp}" / filename
+
+
+def _write_json_report(path: Path, report: dict[str, Any], *, group: str = "slurm_admins") -> None:
+    if os.geteuid() == 0:
+        write_protected_json(path, report, group=group)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
 
 
 def gpu_status_cmd(argv: list[str]) -> int:

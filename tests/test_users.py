@@ -10,6 +10,7 @@ from ssn.users import (
     INACTIVE_ARCHIVE_RISK,
     INACTIVE_LOCAL_ONLY_RISK,
     _allowed_qos_for_tier,
+    _create_unix_user,
     apply_user_actions,
     inactive_plan_report,
     inactive_prune_manifest,
@@ -259,6 +260,66 @@ class UserTests(unittest.TestCase):
         }
         actions = plan_user_sync(users_doc, state_doc, resolved)
         self.assertTrue(any(action.action == "validation_error" for action in actions))
+
+    def test_validate_users_rejects_tombstoned_uid_gid_for_new_user(self) -> None:
+        resolved = resolve_profile("cpu-dev-local", ROOT)
+        users_doc = {
+            "schema_version": 1,
+            "groups": {},
+            "users": {
+                "ssntest": {
+                    "status": "active",
+                    "tier": "standard",
+                    "groups": [],
+                    "ssh_keys": None,
+                    "uid": 55555,
+                    "gid": 55556,
+                }
+            },
+        }
+        state_doc = {
+            "schema_version": 1,
+            "users": {
+                "olduser": {
+                    "managed": True,
+                    "status": "inactive",
+                    "archive_state": "tombstoned",
+                    "original_uid": 55555,
+                    "original_gid": 55556,
+                }
+            },
+        }
+        errors = validate_users(users_doc, resolved, state_doc=state_doc)
+        self.assertTrue(any("uid is reserved" in error for error in errors))
+        self.assertTrue(any("gid is reserved" in error for error in errors))
+
+    def test_create_unix_user_auto_ids_skip_tombstones(self) -> None:
+        commands: list[list[str]] = []
+        state_doc = {
+            "schema_version": 1,
+            "users": {
+                "olduser": {
+                    "archive_state": "tombstoned",
+                    "original_uid": 1001,
+                    "original_gid": 1002,
+                }
+            },
+        }
+
+        def fake_run(command: list[str], **_kwargs: object) -> None:
+            commands.append(command)
+
+        with (
+            mock.patch("ssn.users._used_uids", return_value={1000}),
+            mock.patch("ssn.users._used_gids", return_value={1000, 1001}),
+            mock.patch("ssn.users.grp.getgrnam", side_effect=KeyError),
+            mock.patch("ssn.users._run", side_effect=fake_run),
+        ):
+            _create_unix_user("ssntest", {"status": "active", "tier": "standard"}, state_doc)
+
+        self.assertIn(["groupadd", "-g", "1003", "ssntest"], commands)
+        self.assertIn("-u", commands[-1])
+        self.assertIn("1002", commands[-1])
 
     def test_inactive_plan_report_is_token_bindable(self) -> None:
         resolved = resolve_profile("gpu-bisect-quadro-p620", ROOT)

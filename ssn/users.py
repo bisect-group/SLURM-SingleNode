@@ -719,7 +719,7 @@ def apply_user_actions(
     for action in actions:
         user = users.get(action.username, {})
         if action.action == "create_unix_user":
-            _create_unix_user(action.username, user)
+            _create_unix_user(action.username, user, state_doc)
         elif action.action == "ensure_private_primary_group":
             _ensure_private_primary_group(action.username)
         elif action.action == "ensure_unlocked":
@@ -1157,10 +1157,19 @@ def _validate_local_identity_conflicts(
     state_users = state_doc.get("users") or {}
     previous = state_users.get(username) or {}
     exists = _user_exists(username)
+    reserved_uids, reserved_gids = _reserved_tombstone_ids(state_doc, exclude_username=username)
     if exists and not previous.get("managed") and not user.get("adopt_existing"):
         errors.append(f"users.{username}: existing unmanaged local user requires adopt_existing: true")
+    if exists:
+        entry = pwd.getpwnam(username)
+        if entry.pw_uid in reserved_uids:
+            errors.append(f"users.{username}: current uid {entry.pw_uid} is reserved by an inactive tombstone")
+        if entry.pw_gid in reserved_gids:
+            errors.append(f"users.{username}: current gid {entry.pw_gid} is reserved by an inactive tombstone")
     uid = user.get("uid")
     if uid is not None:
+        if int(uid) in reserved_uids:
+            errors.append(f"users.{username}.uid is reserved by an inactive tombstone")
         try:
             entry = pwd.getpwuid(int(uid))
         except KeyError:
@@ -1170,6 +1179,8 @@ def _validate_local_identity_conflicts(
                 errors.append(f"users.{username}.uid conflicts with existing user {entry.pw_name}")
     gid = user.get("gid")
     if gid is not None:
+        if int(gid) in reserved_gids:
+            errors.append(f"users.{username}.gid is reserved by an inactive tombstone")
         try:
             group = grp.getgrgid(int(gid))
         except KeyError:
@@ -1308,7 +1319,7 @@ def _run(
     return subprocess.run(cmd, text=True, capture_output=True, check=check, cwd=cwd)
 
 
-def _create_unix_user(username: str, user: dict[str, Any]) -> None:
+def _create_unix_user(username: str, user: dict[str, Any], state_doc: dict[str, Any]) -> None:
     cmd = ["useradd", "-m", "-s", "/bin/bash"]
     gid = user.get("gid")
     if gid is not None:
@@ -1320,19 +1331,62 @@ def _create_unix_user(username: str, user: dict[str, Any]) -> None:
         cmd.extend(["-g", group_name])
     else:
         try:
-            grp.getgrnam(username)
+            group = grp.getgrnam(username)
         except KeyError:
-            cmd.append("-U")
+            reserved_uids, reserved_gids = _reserved_tombstone_ids(state_doc, exclude_username=username)
+            gid = _next_free_id(_used_gids(), reserved_gids)
+            _run(["groupadd", "-g", str(gid), username])
+            cmd.extend(["-g", username])
         else:
+            if group.gr_gid in _reserved_tombstone_ids(state_doc, exclude_username=username)[1]:
+                raise ValueError(f"group {username} uses tombstoned gid {group.gr_gid}")
             cmd.extend(["-g", username])
     uid = user.get("uid")
     if uid is not None:
         cmd.extend(["-u", str(uid)])
+    else:
+        reserved_uids, _reserved_gids = _reserved_tombstone_ids(state_doc, exclude_username=username)
+        cmd.extend(["-u", str(_next_free_id(_used_uids(), reserved_uids))])
     full_name = user.get("full_name")
     if full_name:
         cmd.extend(["-c", str(full_name)])
     cmd.append(username)
     _run(cmd)
+
+
+def _reserved_tombstone_ids(state_doc: dict[str, Any], *, exclude_username: str | None = None) -> tuple[set[int], set[int]]:
+    reserved_uids: set[int] = set()
+    reserved_gids: set[int] = set()
+    for username, entry in (state_doc.get("users") or {}).items():
+        if username == exclude_username:
+            continue
+        if entry.get("archive_state") != "tombstoned":
+            continue
+        for source, target in (("original_uid", reserved_uids), ("uid", reserved_uids), ("original_gid", reserved_gids), ("gid", reserved_gids)):
+            value = entry.get(source)
+            if value is None:
+                continue
+            try:
+                target.add(int(value))
+            except (TypeError, ValueError):
+                continue
+    return reserved_uids, reserved_gids
+
+
+def _used_uids() -> set[int]:
+    return {entry.pw_uid for entry in pwd.getpwall()}
+
+
+def _used_gids() -> set[int]:
+    return {entry.gr_gid for entry in grp.getgrall()}
+
+
+def _next_free_id(used: set[int], reserved: set[int], *, start: int = 1000, stop: int = 60000) -> int:
+    blocked = used | reserved
+    for value in range(start, stop + 1):
+        if value not in blocked:
+            return value
+    raise ValueError("no free UID/GID available in managed range")
 
 
 def _ensure_private_primary_group(username: str) -> None:

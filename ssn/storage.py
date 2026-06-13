@@ -7,6 +7,7 @@ import pwd
 import shutil
 import stat
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,8 @@ from .units import memory_to_mb
 DEFAULT_HEALTH_REPORT = Path("/run/slurm-single-node/scratch-health.json")
 DEFAULT_UNHEALTHY_MARKER = Path("/run/slurm-single-node/scratch-unhealthy")
 DEFAULT_FIXTURE_PREFIX = "ssn-test-"
+DEFAULT_QUOTA_LABELS = ("home", "data", "scratch")
+STORAGE_QUOTA_ENABLE_RISK = "storage_quota_enable"
 
 
 def command_stdout(cmd: list[str]) -> str | None:
@@ -30,14 +33,21 @@ def command_rc(cmd: list[str]) -> int:
     return subprocess.run(cmd, text=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
 
 
+def command_result(cmd: list[str]) -> dict[str, Any]:
+    proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return {"cmd": cmd, "rc": proc.returncode, "stdout": proc.stdout.strip(), "stderr": proc.stderr.strip()}
+
+
 def quota_capability_report(
     users_doc: dict[str, Any],
     resolved: dict[str, Any],
     *,
     fixture_prefix: str = DEFAULT_FIXTURE_PREFIX,
+    quota_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     paths = resolved["derived"].get("paths") or {}
     quotas = resolved["resolved_policies"]["storage"].get("quotas") or {}
+    quota_overrides = quota_overrides or {}
     users = users_doc.get("users") or {}
     report: dict[str, Any] = {
         "schema_version": 1,
@@ -55,9 +65,9 @@ def quota_capability_report(
         "mounts": {},
         "fixture_users": sorted(name for name in users if name.startswith(fixture_prefix)),
     }
-    for label in ("data", "scratch"):
+    for label in DEFAULT_QUOTA_LABELS:
         path = paths.get(label)
-        limit = quotas.get(label)
+        limit = quota_overrides.get(label, quotas.get(label))
         if not path or not limit:
             continue
         report["mounts"][label] = _quota_mount_capability(str(path), limit)
@@ -69,14 +79,23 @@ def apply_fixture_quotas(
     resolved: dict[str, Any],
     *,
     fixture_prefix: str = DEFAULT_FIXTURE_PREFIX,
+    quota_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if os.geteuid() != 0:
         raise PermissionError("fixture quota apply must run as root")
-    report = quota_capability_report(users_doc, resolved, fixture_prefix=fixture_prefix)
+    report = quota_capability_report(
+        users_doc,
+        resolved,
+        fixture_prefix=fixture_prefix,
+        quota_overrides=quota_overrides,
+    )
     report["mode"] = "fixture_quota_apply"
     actions = []
     users = users_doc.get("users") or {}
     for username in report["fixture_users"]:
+        if not username.startswith(fixture_prefix) or not fixture_prefix.startswith("ssn-test-"):
+            actions.append({"user": username, "status": "skipped", "reason": "not an allowed fixture user"})
+            continue
         if username not in users or not _user_exists(username):
             actions.append({"user": username, "status": "skipped", "reason": "fixture user does not exist"})
             continue
@@ -92,18 +111,188 @@ def apply_fixture_quotas(
                 )
                 continue
             hard_kb = int(mount["hard_kb"])
-            rc = command_rc(["setquota", "-u", username, "0", str(hard_kb), "0", "0", mount["path"]])
+            quota_target = mount.get("mountpoint") or mount["path"]
+            rc = command_rc(["setquota", "-u", username, "0", str(hard_kb), "0", "0", quota_target])
             actions.append(
                 {
                     "user": username,
                     "mount": label,
-                    "path": mount["path"],
+                    "path": quota_target,
                     "hard_kb": hard_kb,
                     "status": "applied" if rc == 0 else "failed",
                     "rc": rc,
                 }
             )
     report["actions"] = actions
+    return report
+
+
+def parse_fixture_quota_overrides(values: list[str] | None) -> dict[str, str]:
+    overrides: dict[str, str] = {}
+    for raw in values or []:
+        label, separator, value = raw.partition("=")
+        if separator != "=" or not label or not value:
+            raise ValueError(f"invalid fixture quota override: {raw}")
+        if label not in DEFAULT_QUOTA_LABELS:
+            raise ValueError(f"unsupported fixture quota label: {label}")
+        memory_to_mb(value)
+        overrides[label] = value
+    return overrides
+
+
+def storage_quota_operation_hash(report: dict[str, Any]) -> str:
+    payload = {
+        "profile": report.get("profile"),
+        "mount_labels": report.get("mount_labels") or [],
+        "fstab_path": report.get("fstab_path"),
+        "mounts": {
+            label: {
+                "path": mount.get("path"),
+                "mountpoint": mount.get("mountpoint"),
+                "source": mount.get("source"),
+                "fstype": mount.get("fstype"),
+                "fstab": mount.get("fstab"),
+                "proposed_options": mount.get("proposed_options"),
+            }
+            for label, mount in sorted((report.get("mounts") or {}).items())
+        },
+    }
+    return config_hash({"storage_quota_enable": payload})
+
+
+def storage_quota_plan(
+    resolved: dict[str, Any],
+    *,
+    labels: list[str] | None = None,
+    fstab_path: str | Path = "/etc/fstab",
+) -> dict[str, Any]:
+    labels = _selected_quota_labels(resolved, labels)
+    report = _storage_quota_report(resolved, labels=labels, fstab_path=fstab_path, mode="plan")
+    report["risk"] = STORAGE_QUOTA_ENABLE_RISK
+    report["operation_hash"] = storage_quota_operation_hash(report)
+    return report
+
+
+def storage_quota_status(
+    resolved: dict[str, Any],
+    *,
+    labels: list[str] | None = None,
+    fstab_path: str | Path = "/etc/fstab",
+) -> dict[str, Any]:
+    labels = _selected_quota_labels(resolved, labels)
+    report = _storage_quota_report(resolved, labels=labels, fstab_path=fstab_path, mode="status")
+    report["operation_hash"] = storage_quota_operation_hash(report)
+    return report
+
+
+def enable_storage_quotas(
+    plan: dict[str, Any],
+    *,
+    fstab_path: str | Path = "/etc/fstab",
+    backup_root: str | Path = "/var/backups/slurm-single-node/fstab",
+) -> dict[str, Any]:
+    if os.geteuid() != 0:
+        raise PermissionError("storage quota enable must run as root")
+    if plan.get("operation_hash") != storage_quota_operation_hash(plan):
+        raise ValueError("storage quota plan operation_hash does not match selected mounts")
+    if plan.get("risk") != STORAGE_QUOTA_ENABLE_RISK:
+        raise ValueError("storage quota plan has the wrong risk")
+    fstab_path = Path(fstab_path)
+    backup_root = Path(backup_root)
+    before = fstab_path.read_text()
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d%H%M%S")
+    backup_dir = backup_root / stamp
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup_path = backup_dir / "fstab"
+    backup_path.write_text(before)
+    backup_path.chmod(0o640)
+
+    report = dict(plan)
+    report["mode"] = "enable"
+    report["started_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+    report["fstab_backup"] = str(backup_path)
+    report["actions"] = []
+    report["recovery_commands"] = []
+    mounts = plan.get("mounts") or {}
+    skipped_mounts = [
+        {"label": label, "mountpoint": mount.get("mountpoint"), "reason": "already active" if not mount.get("enable_needed") else "cannot enable"}
+        for label, mount in mounts.items()
+        if not mount.get("enable_needed") or not mount.get("can_enable")
+    ]
+    selected_mounts = _dedupe_mountpoints(
+        mount.get("mountpoint")
+        for mount in mounts.values()
+        if mount.get("enable_needed") and mount.get("can_enable")
+    )
+    activation_mounts = _dedupe_mountpoints(
+        mount.get("mountpoint")
+        for mount in mounts.values()
+        if (
+            mount.get("enable_needed")
+            and mount.get("can_enable")
+            and not (mount.get("active_user_quota") and mount.get("active_group_quota"))
+        )
+    )
+    for skipped in skipped_mounts:
+        report["actions"].append({"action": "skip", **skipped})
+    try:
+        cannot_enable = [item for item in skipped_mounts if item.get("reason") == "cannot enable"]
+        if cannot_enable:
+            labels = ", ".join(str(item.get("label")) for item in cannot_enable)
+            raise RuntimeError(f"cannot enable quotas for selected mount(s): {labels}")
+        updated, changed_mounts = _fstab_with_quota_options(before, selected_mounts)
+        if updated != before:
+            _atomic_write(fstab_path, updated)
+            report["actions"].append({"action": "update_fstab", "status": "changed", "mounts": changed_mounts})
+        else:
+            report["actions"].append({"action": "update_fstab", "status": "ok", "mounts": []})
+        for mountpoint in selected_mounts:
+            for command in (["mount", "-o", "remount", mountpoint],):
+                result = command_result(command)
+                report["actions"].append({"action": command[0], "mountpoint": mountpoint, **result})
+                if result["rc"] != 0:
+                    raise RuntimeError(f"{' '.join(command)} failed: {result['stderr'] or result['stdout']}")
+        for mountpoint in activation_mounts:
+            for command in (["quotacheck", "-cugm", mountpoint], ["quotaon", "-ug", mountpoint]):
+                result = command_result(command)
+                report["actions"].append({"action": command[0], "mountpoint": mountpoint, **result})
+                if result["rc"] != 0:
+                    raise RuntimeError(f"{' '.join(command)} failed: {result['stderr'] or result['stdout']}")
+        report["status"] = "enabled"
+    except Exception as exc:
+        report["status"] = "failed"
+        report["error"] = str(exc)
+        active_after_failure = [
+            mountpoint
+            for mountpoint in selected_mounts
+            if _quota_active_for_mount(mountpoint).get("active_user_quota") or _quota_active_for_mount(mountpoint).get("active_group_quota")
+        ]
+        report["active_after_failure"] = active_after_failure
+        if not active_after_failure:
+            try:
+                fstab_path.write_text(before)
+                for mountpoint in selected_mounts:
+                    command_result(["mount", "-o", "remount", mountpoint])
+                report["rollback"] = "restored_fstab_backup"
+            except Exception as rollback_exc:
+                report["rollback"] = f"failed: {rollback_exc}"
+        else:
+            report["rollback"] = "skipped_partial_quota_activation"
+        report["recovery_commands"] = [
+            f"cp {backup_path} {fstab_path}",
+            *[f"mount -o remount {mountpoint}" for mountpoint in selected_mounts],
+            *[f"quotaoff -ug {mountpoint}" for mountpoint in active_after_failure],
+        ]
+    report["finished_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+    report["post_status"] = {
+        label: _quota_mount_capability(
+            str(mount.get("path")),
+            mount.get("policy_quota"),
+            fstab_path=fstab_path,
+        )
+        for label, mount in mounts.items()
+        if mount.get("path") and mount.get("policy_quota")
+    }
     return report
 
 
@@ -264,23 +453,213 @@ def apply_fixture_scratch_cleanup(
     return applied
 
 
-def _quota_mount_capability(path: str, limit: Any) -> dict[str, Any]:
+def _quota_mount_capability(path: str, limit: Any, *, fstab_path: str | Path = "/etc/fstab") -> dict[str, Any]:
     limit_mb = memory_to_mb(limit)
+    mount_info = _findmnt_info(path)
+    mountpoint = mount_info.get("target") or path
+    fstab = _find_fstab_entry(mountpoint, fstab_path=fstab_path)
+    quota = _quota_active_for_mount(mountpoint)
+    proposed_options = _options_with_quota((fstab or {}).get("options", ""))
     mount = {
         "path": path,
+        "mountpoint": mountpoint,
+        "source": mount_info.get("source"),
+        "fstype": mount_info.get("fstype"),
+        "options": mount_info.get("options"),
         "policy_quota": limit,
         "hard_kb": limit_mb * 1024,
-        "findmnt": command_stdout(["findmnt", "-no", "TARGET,SOURCE,FSTYPE,OPTIONS", path]),
-        "quotaon": command_stdout(["quotaon", "-p", path]),
-        "repquota_rc": command_rc(["repquota", "-u", path]) if shutil.which("repquota") else 127,
+        "findmnt": mount_info.get("raw"),
+        "quotaon": quota.get("quotaon"),
+        "repquota_user_rc": quota.get("repquota_user_rc"),
+        "repquota_group_rc": quota.get("repquota_group_rc"),
         "setquota": shutil.which("setquota"),
+        "fstab": fstab,
+        "proposed_options": proposed_options,
+        "quota_files": {
+            "user": str(Path(mountpoint) / "aquota.user"),
+            "group": str(Path(mountpoint) / "aquota.group"),
+            "user_exists": (Path(mountpoint) / "aquota.user").exists(),
+            "group_exists": (Path(mountpoint) / "aquota.group").exists(),
+        },
     }
-    active = (mount["quotaon"] is not None and "user quota" in str(mount["quotaon"]).lower()) or mount["repquota_rc"] == 0
-    mount["active_user_quota"] = active
-    mount["can_apply"] = bool(mount["setquota"] and active)
+    mount["active_user_quota"] = quota.get("active_user_quota")
+    mount["active_group_quota"] = quota.get("active_group_quota")
+    mount["quota_options_present"] = _has_quota_options((fstab or {}).get("options", ""))
+    mount["enable_needed"] = not (
+        mount["active_user_quota"]
+        and mount["active_group_quota"]
+        and mount["quota_options_present"]
+    )
+    mount["can_enable"] = bool(mount_info.get("fstype") == "ext4" and fstab and shutil.which("quotacheck") and shutil.which("quotaon"))
+    mount["can_apply"] = bool(mount["setquota"] and mount["active_user_quota"])
     if not mount["can_apply"]:
         mount["reason"] = "user quota is not active or setquota is missing"
     return mount
+
+
+def _selected_quota_labels(resolved: dict[str, Any], labels: list[str] | None) -> list[str]:
+    paths = resolved["derived"].get("paths") or {}
+    quotas = resolved["resolved_policies"]["storage"].get("quotas") or {}
+    selected = labels or list(DEFAULT_QUOTA_LABELS)
+    result = []
+    for label in selected:
+        if label not in DEFAULT_QUOTA_LABELS:
+            raise ValueError(f"unsupported quota mount label: {label}")
+        if paths.get(label) and quotas.get(label):
+            result.append(label)
+    return result
+
+
+def _storage_quota_report(
+    resolved: dict[str, Any],
+    *,
+    labels: list[str],
+    fstab_path: str | Path,
+    mode: str,
+) -> dict[str, Any]:
+    paths = resolved["derived"].get("paths") or {}
+    quotas = resolved["resolved_policies"]["storage"].get("quotas") or {}
+    return {
+        "schema_version": 1,
+        "command": "storage-quotas",
+        "profile": resolved["profile"],
+        "config_hash": config_hash(resolved),
+        "mode": mode,
+        "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "fstab_path": str(fstab_path),
+        "mount_labels": labels,
+        "commands": {
+            "quotacheck": shutil.which("quotacheck"),
+            "quotaon": shutil.which("quotaon"),
+            "quotaoff": shutil.which("quotaoff"),
+            "setquota": shutil.which("setquota"),
+            "repquota": shutil.which("repquota"),
+            "findmnt": shutil.which("findmnt"),
+            "mount": shutil.which("mount"),
+        },
+        "mounts": {
+            label: _quota_mount_capability(str(paths[label]), quotas[label], fstab_path=fstab_path)
+            for label in labels
+        },
+    }
+
+
+def _findmnt_info(path: str) -> dict[str, Any]:
+    raw = command_stdout(["findmnt", "-T", path, "-J", "-o", "TARGET,SOURCE,FSTYPE,OPTIONS"])
+    if raw:
+        try:
+            filesystems = json.loads(raw).get("filesystems") or []
+        except json.JSONDecodeError:
+            filesystems = []
+        if filesystems:
+            info = filesystems[0]
+            return {
+                "target": info.get("target"),
+                "source": info.get("source"),
+                "fstype": info.get("fstype"),
+                "options": info.get("options"),
+                "raw": raw,
+            }
+    fallback = command_stdout(["findmnt", "-T", path, "-no", "TARGET,SOURCE,FSTYPE,OPTIONS"])
+    if not fallback:
+        return {"raw": None}
+    parts = fallback.split(None, 3)
+    while len(parts) < 4:
+        parts.append(None)
+    return {"target": parts[0], "source": parts[1], "fstype": parts[2], "options": parts[3], "raw": fallback}
+
+
+def _quota_active_for_mount(mountpoint: str) -> dict[str, Any]:
+    quotaon = command_stdout(["quotaon", "-p", mountpoint]) if shutil.which("quotaon") else None
+    repquota_user_rc = command_rc(["repquota", "-u", mountpoint]) if shutil.which("repquota") else 127
+    repquota_group_rc = command_rc(["repquota", "-g", mountpoint]) if shutil.which("repquota") else 127
+    text = str(quotaon or "").lower()
+    return {
+        "quotaon": quotaon,
+        "repquota_user_rc": repquota_user_rc,
+        "repquota_group_rc": repquota_group_rc,
+        "active_user_quota": ("user quota" in text and " is on" in text) or repquota_user_rc == 0,
+        "active_group_quota": ("group quota" in text and " is on" in text) or repquota_group_rc == 0,
+    }
+
+
+def _find_fstab_entry(mountpoint: str, *, fstab_path: str | Path = "/etc/fstab") -> dict[str, Any] | None:
+    path = Path(fstab_path)
+    if not path.exists():
+        return None
+    for index, line in enumerate(path.read_text().splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        parts = stripped.split()
+        if len(parts) < 4:
+            continue
+        if parts[1] == mountpoint:
+            return {
+                "line": index,
+                "spec": parts[0],
+                "mountpoint": parts[1],
+                "fstype": parts[2],
+                "options": parts[3],
+                "dump": parts[4] if len(parts) > 4 else "0",
+                "pass": parts[5] if len(parts) > 5 else "0",
+            }
+    return None
+
+
+def _options_with_quota(options: str) -> str:
+    parts = [part for part in str(options or "defaults").split(",") if part]
+    for required in ("usrquota", "grpquota"):
+        if required not in parts:
+            parts.append(required)
+    return ",".join(parts)
+
+
+def _has_quota_options(options: str) -> bool:
+    parts = set(str(options or "").split(","))
+    return "usrquota" in parts and "grpquota" in parts
+
+
+def _fstab_with_quota_options(text: str, mountpoints: list[str]) -> tuple[str, list[str]]:
+    wanted = set(mountpoints)
+    changed: list[str] = []
+    output = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            output.append(line)
+            continue
+        parts = stripped.split()
+        if len(parts) < 4 or parts[1] not in wanted:
+            output.append(line)
+            continue
+        proposed = _options_with_quota(parts[3])
+        if proposed != parts[3]:
+            parts[3] = proposed
+            changed.append(parts[1])
+        output.append("\t".join(parts))
+    suffix = "\n" if text.endswith("\n") else ""
+    return "\n".join(output) + suffix, changed
+
+
+def _dedupe_mountpoints(values: Any) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        if not value or value in result:
+            continue
+        result.append(str(value))
+    return result
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    original = path.stat()
+    with tempfile.NamedTemporaryFile("w", dir=str(path.parent), delete=False) as handle:
+        handle.write(content)
+        temp_path = Path(handle.name)
+    temp_path.chmod(stat.S_IMODE(original.st_mode))
+    if os.geteuid() == 0:
+        os.chown(temp_path, original.st_uid, original.st_gid)
+    temp_path.replace(path)
 
 
 def _scratch_report(resolved: dict[str, Any], checks: list[dict[str, str]]) -> dict[str, Any]:

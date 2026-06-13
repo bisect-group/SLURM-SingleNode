@@ -126,6 +126,12 @@ def collect_capabilities(resolved: dict[str, Any], *, mode: str) -> dict[str, An
         "slurmd",
         "lua5.3",
         "nvidia-smi",
+        "findmnt",
+        "mount",
+        "quotacheck",
+        "quotaon",
+        "setquota",
+        "repquota",
     ]
     paths = resolved.get("derived", {}).get("paths") or {}
     mount_paths = dict.fromkeys(
@@ -210,6 +216,18 @@ def validate_feature_gates(resolved: dict[str, Any], *, mode: str, capabilities:
                 errors.append(f"required storage path is not mounted: {label}={path}")
             if path and detail.get("exists") and not detail.get("writable"):
                 errors.append(f"required storage path is not writable: {label}={path}")
+    if storage.get("quotas", {}).get("fail_if_unavailable") and mode in {"apply", "install"}:
+        from .storage import quota_capability_report
+
+        quota = quota_capability_report({"schema_version": 1, "groups": {}, "users": {}}, resolved)
+        for label, mount in quota.get("mounts", {}).items():
+            if label == "scratch" and not paths.get("scratch"):
+                continue
+            if not mount.get("active_user_quota"):
+                errors.append(
+                    f"required user quota is inactive for {label}={mount.get('path')} "
+                    f"(mount {mount.get('mountpoint')})"
+                )
     if resolved["derived"]["has_gpus"]:
         if capabilities.get("commands", {}).get("nvidia-smi") is None:
             errors.append("GPU profile requires nvidia-smi")

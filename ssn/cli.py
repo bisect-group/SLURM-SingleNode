@@ -72,6 +72,8 @@ from .users import (
     load_state,
     load_users,
     plan_user_sync,
+    run_archive_runner_payload,
+    validate_lifecycle_apply_scope,
     validate_state,
     validate_users,
     write_users,
@@ -100,6 +102,7 @@ def main(argv: list[str] | None = None, prog: str | None = None) -> int:
         "ssn-login-status": login_status_cmd,
         "ssn-modules": modules_cmd,
         "ssn-archive-status": archive_status_cmd,
+        "ssn-archive-runner": archive_runner_cmd,
         "ssn-scratch-cleanup": scratch_cleanup_cmd,
         "ssn-retention-cleanup": retention_cleanup_cmd,
         "ssn-storage-quotas": storage_quotas_cmd,
@@ -123,6 +126,7 @@ def main(argv: list[str] | None = None, prog: str | None = None) -> int:
     sub.add_parser("login-status")
     sub.add_parser("modules")
     sub.add_parser("archive-status")
+    sub.add_parser("archive-runner")
     sub.add_parser("scratch-cleanup")
     sub.add_parser("retention-cleanup")
     sub.add_parser("storage-quotas")
@@ -142,6 +146,7 @@ def main(argv: list[str] | None = None, prog: str | None = None) -> int:
         "login-status": login_status_cmd,
         "modules": modules_cmd,
         "archive-status": archive_status_cmd,
+        "archive-runner": archive_runner_cmd,
         "scratch-cleanup": scratch_cleanup_cmd,
         "retention-cleanup": retention_cleanup_cmd,
         "storage-quotas": storage_quotas_cmd,
@@ -427,6 +432,12 @@ def sync_users_cmd(argv: list[str]) -> int:
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--plan-output", default=None, help="write inactive lifecycle plan report to this path")
     parser.add_argument("--plan-token", default=None, help="reviewed token required for inactive lifecycle apply")
+    parser.add_argument(
+        "--allow-lifecycle-user",
+        action="append",
+        default=[],
+        help="exact non-fixture username allowed for destructive inactive lifecycle apply",
+    )
     parser.add_argument("--token-store", default=DEFAULT_TOKEN_STORE)
     parser.add_argument("--backup-root", default="/var/backups/slurm-single-node/users")
     parser.add_argument("--retention-days", type=int, default=90)
@@ -495,6 +506,17 @@ def sync_users_cmd(argv: list[str]) -> int:
     if args.apply:
         inactive_local_only_override = False
         if inactive:
+            inactive_usernames = [action.username for action in inactive]
+            try:
+                validate_lifecycle_apply_scope(
+                    inactive_usernames,
+                    resolved,
+                    allowed_lifecycle_users=set(args.allow_lifecycle_user or []),
+                )
+            except Exception as exc:
+                print(f"ERROR: {exc}", file=sys.stderr)
+                print(f"Inactive lifecycle plan: {inactive_report_path}", file=sys.stderr)
+                return 2
             if not args.plan_token:
                 print("ERROR: inactive lifecycle apply requires --plan-token", file=sys.stderr)
                 print(f"Inactive lifecycle plan: {inactive_report_path}", file=sys.stderr)
@@ -546,7 +568,9 @@ def sync_users_cmd(argv: list[str]) -> int:
             resolved,
             state_doc=state_doc,
             allow_inactive_fixture=bool(inactive),
+            allowed_lifecycle_users=set(args.allow_lifecycle_user or []),
             inactive_local_only_override=inactive_local_only_override,
+            state_path=args.state,
         )
         state_path = Path(args.state)
         state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1204,6 +1228,12 @@ def archive_status_cmd(argv: list[str]) -> int:
                     "backup_status": entry.get("archive_backup_status"),
                     "backup_hook": entry.get("archive_backup_hook"),
                     "backup_rc": entry.get("archive_backup_rc"),
+                    "job_id": entry.get("archive_job_id"),
+                    "job_state": entry.get("archive_job_state"),
+                    "service_account": entry.get("archive_service_account"),
+                    "qos": entry.get("archive_qos"),
+                    "runner_payload": entry.get("archive_runner_payload"),
+                    "runner_result": entry.get("archive_runner_result"),
                     "last_error": entry.get("archive_last_error"),
                     "next_action": _archive_next_action(archive_state),
                 }
@@ -1222,6 +1252,11 @@ def archive_status_cmd(argv: list[str]) -> int:
             print(f"{'':20s} archive={row['archive_path']}")
         if row.get("backup_hook"):
             print(f"{'':20s} hook={row['backup_hook']} rc={row.get('backup_rc')}")
+        if row.get("job_id"):
+            print(
+                f"{'':20s} job={row['job_id']} state={row.get('job_state')} "
+                f"account={row.get('service_account')} qos={row.get('qos')}"
+            )
         if row.get("last_error"):
             print(f"{'':20s} error={row['last_error']}")
     if not found:
@@ -1243,6 +1278,16 @@ def _archive_next_action(archive_state: str) -> str:
     if archive_state == "backup_failed":
         return "retry_backup_or_local_override"
     return "unknown"
+
+
+def archive_runner_cmd(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="ssn-archive-runner")
+    parser.add_argument("--payload", required=True)
+    parser.add_argument("--result", required=True)
+    args = parser.parse_args(argv)
+    result = run_archive_runner_payload(args.payload, args.result)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if result.get("ok") else 1
 
 
 def scratch_health_cmd(argv: list[str]) -> int:

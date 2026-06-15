@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import unittest
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from ssn.config import resolve_profile
@@ -16,7 +18,9 @@ from ssn.users import (
     inactive_prune_manifest,
     parse_authorized_key,
     plan_user_sync,
+    run_archive_runner_payload,
     validate_state,
+    validate_lifecycle_apply_scope,
     validate_users,
 )
 
@@ -418,7 +422,7 @@ class UserTests(unittest.TestCase):
         self.assertEqual(delete_paths[".pixi/envs"]["symlink_action"], "remove_link_only")
         self.assertIn("project/node_modules", report_only)
 
-    def test_inactive_apply_is_fixture_limited(self) -> None:
+    def test_inactive_apply_nonfixture_requires_exact_allowlist(self) -> None:
         resolved = resolve_profile("cpu-dev-local", ROOT)
         users_doc = {
             "schema_version": 1,
@@ -435,7 +439,7 @@ class UserTests(unittest.TestCase):
         actions = plan_user_sync(users_doc, {"schema_version": 1, "users": {}}, resolved)
         with (
             mock.patch("os.geteuid", return_value=0),
-            self.assertRaisesRegex(ValueError, "fixture-limited"),
+            self.assertRaisesRegex(ValueError, "requires exact --allow-lifecycle-user someone"),
         ):
             apply_user_actions(
                 actions,
@@ -444,6 +448,92 @@ class UserTests(unittest.TestCase):
                 state_doc={"schema_version": 1, "users": {}},
                 allow_inactive_fixture=True,
             )
+
+    def test_lifecycle_apply_refuses_protected_users_even_when_allowlisted(self) -> None:
+        resolved = resolve_profile("cpu-dev-local", ROOT)
+        with self.assertRaisesRegex(ValueError, "protected/admin"):
+            validate_lifecycle_apply_scope({"adhil"}, resolved, allowed_lifecycle_users={"adhil"})
+
+    def test_inactive_apply_nonfixture_allowlist_uses_slurm_archive_runner(self) -> None:
+        resolved = resolve_profile("cpu-dev-local", ROOT)
+        users_doc = {
+            "schema_version": 1,
+            "groups": {},
+            "users": {
+                "ssn-lifecycle-local": {
+                    "status": "inactive",
+                    "tier": "standard",
+                    "groups": [],
+                    "ssh_keys": None,
+                }
+            },
+        }
+        state_doc = {"schema_version": 1, "users": {"ssn-lifecycle-local": {"managed": True, "status": "active"}}}
+        actions = plan_user_sync(users_doc, state_doc, resolved)
+        archive_result = {"ok": True, "archive_created": True, "archive_path": "/data/_archive/x.7z", "job_id": "42", "job_state": "COMPLETED"}
+        fake_entry = SimpleNamespace(pw_uid=2501, pw_gid=2501, pw_dir="/home/ssn-lifecycle-local")
+        with (
+            mock.patch("os.geteuid", return_value=0),
+            mock.patch("ssn.users._user_exists", return_value=True),
+            mock.patch("ssn.users.pwd.getpwnam", return_value=fake_entry),
+            mock.patch("ssn.users._archive_compressor", return_value="/usr/bin/7zz"),
+            mock.patch("ssn.users._backup_hook_report", return_value={"directory": "/hooks", "required": False, "executable_hooks": []}),
+            mock.patch("ssn.users._run_archive_job_via_slurm", return_value=archive_result) as archive_mock,
+            mock.patch("ssn.users._run") as run_mock,
+        ):
+            next_state = apply_user_actions(
+                actions,
+                users_doc,
+                resolved,
+                state_doc=state_doc,
+                allow_inactive_fixture=True,
+                allowed_lifecycle_users={"ssn-lifecycle-local"},
+                inactive_local_only_override=True,
+            )
+        archive_mock.assert_called_once()
+        self.assertTrue(any(call.args[0][0] == "userdel" for call in run_mock.call_args_list))
+        self.assertEqual(next_state["users"]["ssn-lifecycle-local"]["archive_state"], "tombstoned")
+
+    def test_archive_runner_payload_archives_and_runs_hook(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home_root = root / "home"
+            home = home_root / "ssn-lifecycle-hooksuccess"
+            home.mkdir(parents=True)
+            (home / ".cache").mkdir()
+            (home / ".cache" / "item").write_text("cache")
+            (home / "keep.txt").write_text("keep")
+            hook = root / "hook.sh"
+            hook.write_text("#!/bin/sh\necho hook:$SSN_ARCHIVE_USER\n")
+            hook.chmod(0o755)
+            payload = {
+                "schema_version": 1,
+                "username": "ssn-lifecycle-hooksuccess",
+                "home_dir": str(home),
+                "archive_path": str(root / "archive.7z"),
+                "operation_hash": "abc123",
+                "prune_manifest": {
+                    "delete_candidates": [{"path": str(home / ".cache")}],
+                    "report_only": [],
+                },
+                "backup_required": True,
+                "local_only": False,
+                "backup_hooks": [{"path": str(hook), "executable": True}],
+                "hook_env": {"SSN_ARCHIVE_USER": "ssn-lifecycle-hooksuccess"},
+                "hook_timeout_seconds": 5,
+            }
+            payload_path = root / "payload.json"
+            result_path = root / "result.json"
+            payload_path.write_text(json.dumps(payload))
+            with (
+                mock.patch("ssn.users._archive_compressor", return_value="/usr/bin/7zz"),
+                mock.patch("ssn.users._run") as run_mock,
+            ):
+                result = run_archive_runner_payload(payload_path, result_path)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["backup_result"]["ok"])
+        self.assertFalse((home / ".cache").exists())
+        run_mock.assert_called_once()
 
 
 if __name__ == "__main__":

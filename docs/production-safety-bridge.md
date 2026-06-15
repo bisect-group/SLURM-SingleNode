@@ -1,8 +1,8 @@
 # Production Safety Bridge Ops Note
 
 This note covers the fixture-tested bridge features added before broad
-production rollout: inactive archive hooks, managed-user isolation allowlists,
-and tokenized retention cleanup.
+production rollout: inactive archive hooks, Slurm-backed archive execution,
+managed-user isolation allowlists, and tokenized retention cleanup.
 
 ## Inactive Archive Hooks
 
@@ -34,6 +34,46 @@ Status:
 ```bash
 sudo ssn-archive-status
 ```
+
+## Non-Fixture Lifecycle Allowlist
+
+Destructive inactive apply for users outside the `ssn-test-*` fixture prefix
+requires an exact reviewed user allowlist:
+
+```bash
+sudo ssn-sync-users --profile gpu-bisect-quadro-p620 \
+  --user ssn-lifecycle-hooksuccess \
+  --dry-run \
+  --plan-output /var/lib/slurm-single-node/plans/<plan>/inactive-plan.json
+
+sudo ssn-plan-token create \
+  --plan /var/lib/slurm-single-node/plans/<plan>/inactive-plan.json \
+  --risk inactive_archive_apply \
+  --reason "reviewed fake lifecycle hook-success archive"
+
+sudo ssn-sync-users --profile gpu-bisect-quadro-p620 \
+  --user ssn-lifecycle-hooksuccess \
+  --apply \
+  --plan-output /var/lib/slurm-single-node/plans/<plan>/inactive-plan.json \
+  --plan-token <token> \
+  --allow-lifecycle-user ssn-lifecycle-hooksuccess
+```
+
+For local-only test archives, use the same flow with risk
+`inactive_local_only_archive`. SSN refuses protected users such as `root`,
+configured admins, `adhil`, and `roshan`, even if they are allowlisted. It also
+refuses unmanaged users and users not present in the reviewed inactive plan.
+
+Archive work is submitted through the protected Slurm archive account/QoS from
+the storage policy. On the Quadro test profile this is `slurm-admin` with
+`archive-admin`. The internal runner is `/usr/local/sbin/ssn-archive-runner`;
+operators should call `ssn-sync-users`, not the runner, during normal use.
+
+`ssn-archive-status` reports the archive job id/state, service account, QoS,
+runner payload path, runner result path, hook result, archive path, and next
+action. When submitting manual fixture evidence jobs from a root shell, prefer
+safe output paths such as `--chdir=/tmp --output=/tmp/<name>-%j.out` so test
+jobs do not fail writing into `/root`.
 
 ## Login/GPU Isolation Rollout
 

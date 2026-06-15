@@ -232,6 +232,44 @@
     - ssn.resolved_policies.storage.inactive_archive.slurm_account is defined
     - ssn.resolved_policies.storage.inactive_archive.qos is defined
 
+- name: Add root association on inactive archive account
+  ansible.builtin.command: >
+    sacctmgr -i add user root
+    Account={{ ssn.resolved_policies.storage.inactive_archive.slurm_account }}
+    AdminLevel=Administrator
+    QOS={{ ssn.resolved_policies.storage.inactive_archive.qos }}
+  register: ssn_archive_root_user
+  changed_when:
+    - ssn_archive_root_user.rc == 0
+    - "'already exists' not in (ssn_archive_root_user.stdout | default(''))"
+    - "'Already existing' not in (ssn_archive_root_user.stdout | default(''))"
+    - "'Nothing new added' not in (ssn_archive_root_user.stdout | default(''))"
+    - "'Nothing added' not in (ssn_archive_root_user.stdout | default(''))"
+    - "'Request didn' not in (ssn_archive_root_user.stdout | default(''))"
+  failed_when:
+    - ssn_archive_root_user.rc != 0
+    - "'already exists' not in (ssn_archive_root_user.stdout | default(''))"
+    - "'already exists' not in (ssn_archive_root_user.stderr | default(''))"
+    - "'Already existing' not in (ssn_archive_root_user.stdout | default(''))"
+    - "'Already existing' not in (ssn_archive_root_user.stderr | default(''))"
+    - "'Nothing new added' not in (ssn_archive_root_user.stdout | default(''))"
+    - "'Nothing added' not in (ssn_archive_root_user.stdout | default(''))"
+    - "'Request didn' not in (ssn_archive_root_user.stdout | default(''))"
+  when:
+    - ssn.resolved_policies.storage.inactive_archive.slurm_account is defined
+    - ssn.resolved_policies.storage.inactive_archive.qos is defined
+
+- name: Update root association on inactive archive account
+  ansible.builtin.command: >
+    sacctmgr -i modify user root
+    where account={{ ssn.resolved_policies.storage.inactive_archive.slurm_account }}
+    set AdminLevel=Administrator QOS={{ ssn.resolved_policies.storage.inactive_archive.qos }}
+  changed_when: false
+  failed_when: false
+  when:
+    - ssn.resolved_policies.storage.inactive_archive.slurm_account is defined
+    - ssn.resolved_policies.storage.inactive_archive.qos is defined
+
 - name: Add tier QoS entries
   ansible.builtin.command: >
     sacctmgr -i add qos {{ item.qos }}

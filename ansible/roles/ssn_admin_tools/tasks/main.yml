@@ -42,6 +42,7 @@
     - ssn-gpu-recovery
     - ssn-login-isolation
     - ssn-login-status
+    - ssn-modules
 
 - name: Install user-facing GPU status wrapper
   ansible.builtin.template:

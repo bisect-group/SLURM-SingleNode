@@ -15,6 +15,7 @@ from typing import Any
 from .config import config_hash, render_profile, repo_root, resolve_profile, summary_text
 from .gpu import gpu_verification_errors, gpu_verification_report
 from .login import login_isolation_status_for_report
+from .modules import modules_verify_errors, modules_verify_report
 from .ops import (
     collect_capabilities,
     drain_node,
@@ -168,6 +169,7 @@ class Installer:
                     if gpu_errors:
                         raise RuntimeError("GPU verification failed: " + "; ".join(gpu_errors))
                     self._record_phase("gpu_verification", "ok", {})
+                self._record_module_verification(resolved)
                 self._record_phase("apply", "ok", {})
 
             if self.args.dry_run:
@@ -243,6 +245,17 @@ class Installer:
         self._validate_required_mounts(resolved)
         self._validate_no_jobs_before_apply(resolved)
         return resolved
+
+    def _record_module_verification(self, resolved: dict[str, Any]) -> None:
+        modules_policy = resolved.get("resolved_policies", {}).get("modules") or {}
+        if not modules_policy.get("lmod"):
+            return
+        modules_report = modules_verify_report(resolved)
+        self.report["modules_verification"] = modules_report
+        module_errors = modules_verify_errors(modules_report)
+        if module_errors:
+            raise RuntimeError("module verification failed: " + "; ".join(module_errors))
+        self._record_phase("modules_verification", "ok", {})
 
     def _validate_no_jobs_before_apply(self, resolved: dict[str, Any]) -> None:
         if self.args.dry_run or self.args.check:

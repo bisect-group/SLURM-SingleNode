@@ -90,6 +90,25 @@
       changed_when: false
       failed_when: ssn_check_cgroup.stdout != "cgroup2fs"
 
+    - name: Verify validate-only modules
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -m
+          - ssn.cli
+          - modules
+          - verify
+          - --profile
+          - "{{ ssn.profile }}"
+          - --repo
+          - "{{ playbook_dir }}/.."
+          - --json
+      environment:
+        PYTHONPATH: "{{ playbook_dir }}/.."
+      register: ssn_check_modules
+      changed_when: false
+      when: ssn.resolved_policies.modules.lmod | bool
+
     - name: Show summary
       ansible.builtin.debug:
         msg:
@@ -100,3 +119,4 @@
           - "slurmd={{ ssn_check_slurmd.stdout }}"
           - "sinfo={{ ssn_check_sinfo.stdout_lines }}"
           - "node={{ ssn_check_node.stdout_lines }}"
+          - "modules={{ ssn_check_modules.stdout | default('not enabled') }}"

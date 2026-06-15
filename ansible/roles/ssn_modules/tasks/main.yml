@@ -14,6 +14,78 @@
     mode: "0755"
   loop: "{{ ssn.resolved_policies.modules.roots | dict2items }}"
 
+- name: Create core module tree
+  ansible.builtin.file:
+    path: "{{ ssn.resolved_policies.modules.roots.modules }}/Core"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: ssn.resolved_policies.modules.lmod | bool
+
+- name: Detect validate-only shared software modules
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -m
+      - ssn.cli
+      - modules
+      - status
+      - --profile
+      - "{{ ssn.profile }}"
+      - --repo
+      - "{{ playbook_dir }}/.."
+      - --json
+  environment:
+    PYTHONPATH: "{{ playbook_dir }}/.."
+  register: ssn_modules_status_cmd
+  changed_when: false
+  check_mode: false
+  when: ssn.resolved_policies.modules.lmod | bool
+
+- name: Store module detection fact
+  ansible.builtin.set_fact:
+    ssn_modules_status: "{{ ssn_modules_status_cmd.stdout | from_json }}"
+  when: ssn.resolved_policies.modules.lmod | bool
+
+- name: Persist module detection report
+  ansible.builtin.copy:
+    content: "{{ ssn_modules_status | to_nice_json }}\n"
+    dest: /etc/slurm-single-node/modules-status.json
+    owner: root
+    group: "{{ ssn.derived.admin_group }}"
+    mode: "0640"
+  when: ssn.resolved_policies.modules.lmod | bool
+
+- name: Ensure modulefile directories exist
+  ansible.builtin.file:
+    path: "{{ item.path | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop: "{{ ssn_modules_status.modulefiles | default([]) }}"
+  when: ssn.resolved_policies.modules.lmod | bool
+
+- name: Render detected validate-only modulefiles
+  ansible.builtin.copy:
+    content: "{{ item.content }}"
+    dest: "{{ item.path }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ ssn_modules_status.modulefiles | default([]) }}"
+  when: ssn.resolved_policies.modules.lmod | bool
+
+- name: Install SSN module path profile snippet
+  ansible.builtin.template:
+    src: ssn-modules.sh.j2
+    dest: /etc/profile.d/ssn-modules.sh
+    owner: root
+    group: root
+    mode: "0644"
+  when: ssn.resolved_policies.modules.lmod | bool
+
 - name: Report shared environment base
   ansible.builtin.debug:
     msg:

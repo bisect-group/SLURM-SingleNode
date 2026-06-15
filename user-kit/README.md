@@ -54,6 +54,29 @@ If admins place the node into CPU-only recovery, GPU submissions will be
 rejected until GPU service is restored. CPU jobs should continue to run through
 the normal `compute` partition.
 
+## Shared Modules
+
+Sites may expose shared software through Lmod modules:
+
+```bash
+module avail
+module load cuda
+module load miniconda3
+```
+
+CUDA modules are validate-only in SSN. If admins installed a CUDA toolkit under
+`/usr/local/cuda` or `/usr/local/cuda-<version>`, the site may provide `cuda`
+and `cuda/<version>` modules. If no toolkit is installed, CUDA module commands
+will simply not appear; GPU jobs can still use the NVIDIA driver with tools
+such as `nvidia-smi`.
+
+Use modules inside Slurm jobs the same way you use them in a shell:
+
+```bash
+module load cuda
+srun --gres=gpu:1 nvidia-smi
+```
+
 ## Storage
 
 Profiles may expose:

@@ -132,6 +132,8 @@ def collect_capabilities(resolved: dict[str, Any], *, mode: str) -> dict[str, An
         "quotaon",
         "setquota",
         "repquota",
+        "lmod",
+        "modulecmd",
     ]
     paths = resolved.get("derived", {}).get("paths") or {}
     mount_paths = dict.fromkeys(
@@ -148,12 +150,14 @@ def collect_capabilities(resolved: dict[str, Any], *, mode: str) -> dict[str, An
         "munge",
         "lua5.3",
         "liblua5.3-dev",
+        "lmod",
     ]
     versions = {
         "slurm": command_stdout(["sinfo", "--version"]),
         "mariadb": command_stdout(["mariadb", "--version"]),
         "lua": command_stdout(["lua5.3", "-v"]),
         "nvidia_smi": command_stdout(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"]),
+        "lmod": command_stdout(["bash", "-lc", "source /usr/share/lmod/lmod/init/bash 2>/dev/null && module --version 2>&1 | head -n 1"]),
     }
     capabilities: dict[str, Any] = {
         "mode": mode,

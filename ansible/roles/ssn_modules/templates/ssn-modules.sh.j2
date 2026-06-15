@@ -1,0 +1,19 @@
+# Slurm Single-Node shared module path.
+
+if [ -n "${BASH_VERSION:-}" ] && [ -r /usr/share/lmod/lmod/init/bash ]; then
+    # shellcheck disable=SC1091
+    . /usr/share/lmod/lmod/init/bash
+elif [ -r /usr/share/lmod/lmod/init/sh ]; then
+    # shellcheck disable=SC1091
+    . /usr/share/lmod/lmod/init/sh
+elif [ -n "${BASH_VERSION:-}" ] && [ -r /usr/share/modules/init/bash ]; then
+    # shellcheck disable=SC1091
+    . /usr/share/modules/init/bash
+elif [ -r /usr/share/modules/init/sh ]; then
+    # shellcheck disable=SC1091
+    . /usr/share/modules/init/sh
+fi
+
+if type module >/dev/null 2>&1; then
+    module use "{{ ssn.resolved_policies.modules.roots.modules }}/Core" >/dev/null 2>&1 || true
+fi

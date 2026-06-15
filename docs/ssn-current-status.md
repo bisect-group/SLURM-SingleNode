@@ -47,7 +47,14 @@ on the Quadro `/`, `/data`, and `/scratch` ext4 mounts, applied tiny fixture
 quotas to `ssn-test-quota`, verified over-quota writes fail on home/data/scratch,
 and re-ran drained install plus CPU/GPU/scratch/no-requeue/GPU-recovery
 regression smoke. That round also found and fixed a fixture UID/GID tombstone
-reuse bug during live testing.
+reuse bug during live testing. The modules/CUDA foundation then added
+validate-only Lmod module discovery, status/verify commands, detected-software
+modulefile rendering, `/etc/profile.d/ssn-modules.sh`, install/apply module
+verification reports, an ops note, and user-kit module guidance. Live Quadro
+testing verified Lmod initialization and `/tools/modules/Core` visibility for
+root and `ssn-test-standard`; CUDA toolkit and Miniconda were absent and
+reported as clean skips while CPU/GPU/scratch regression smoke continued to
+pass.
 
 Status buckets:
 
@@ -71,17 +78,20 @@ cgroup limits, hard direct-GPU denial for fixture login sessions, managed-user
 allowlist rollout controls, root GPU status snapshots, Slurm client-side
 no-requeue filtering, structured GPU verification, fixture-scoped CPU-only
 recovery, fixture-tested inactive backup hooks, and token-gated filesystem
-quota enablement on the disposable Quadro host. User sync is now
-current-state-aware enough for the managed Quadro fixtures to produce a clean
-no-op dry-run after repair, and the inactive lifecycle has a fixture-scoped
-end-to-end implementation with reviewed local-only archive tokens,
-backup-hook-gated archive removal, and UID/GID reactivation checks.
+quota enablement on the disposable Quadro host. Validate-only module/CUDA
+plumbing is now in place: Lmod is configured, module status/verify commands
+exist, and CUDA/Miniconda modulefiles are rendered only when detected. User
+sync is now current-state-aware enough for the managed Quadro fixtures to
+produce a clean no-op dry-run after repair, and the inactive lifecycle has a
+fixture-scoped end-to-end implementation with reviewed local-only archive
+tokens, backup-hook-gated archive removal, and UID/GID reactivation checks.
 
 The largest remaining gaps are real-user quota rollout beyond fixture testing,
 production-wide login/GPU isolation beyond fixtures, multi-GPU topology/NVML/CUDA
 ordering health gates, production inactive archive jobs through Slurm service
 QoS, real external backup hook integration beyond dummy fixture hooks,
-CUDA/module management, and production-grade user docs.
+managed CUDA/module update workflows, CUDA toolkit live-module testing on a
+host with a toolkit installed, and production-grade user docs.
 
 ## Generalization Model
 
@@ -253,11 +263,11 @@ CUDA/module management, and production-grade user docs.
 
 | Decision / Requirement | Current Code State | Status Bucket | Evidence | Follow-up Needed |
 |---|---|---|---|---|
-| Use Lmod. | Installed when enabled; roots created. | Implemented partially | `ssn_modules` role | Create actual modulefiles and loader behavior. |
+| Use Lmod. | Installed when enabled; roots created; `/etc/profile.d/ssn-modules.sh` initializes Lmod and adds `/tools/modules/Core`. Live Quadro verified `module avail` and `MODULEPATH=/tools/modules/Core:...` for root and `ssn-test-standard`. | Implemented correctly | `ssn_modules` role, `ssn/modules.py`, live Quadro module shell tests | Add more production docs as module catalog grows. |
 | Shared roots under `/tools`. | Implemented. | Implemented correctly | `ssn_modules` role | None. |
-| Miniconda default shared base. | Policy records Miniconda root; role does not install/manage it. | Yet to be implemented | `policies/modules.yml`, `ssn_modules` role | Add validate-only or managed Miniconda workflow. |
-| CUDA validate-only by default, versioned modules when detected. | Policy-only. No CUDA module detection/rendering. | Yet to be implemented | `policies/modules.yml` | Implement CUDA detection, modulefiles, smoke checks. |
-| Admin-run updates, smoke checks, rollback targets. | Policy-only. | Yet to be implemented | `policies/modules.yml` | Build update workflow. |
+| Miniconda default shared base. | Validate-only detection exists for `/tools/miniconda3/bin/conda`; if present, SSN renders a `miniconda3` module and verifies `conda --version`. Live Quadro had no Miniconda and reported a clean skip. No managed Miniconda install exists. | Implemented partially | `ssn/modules.py`, `ssn-modules`, `ssn_modules` role, live Quadro `ssn-modules verify` | Add managed or documented admin-installed Miniconda workflow if desired, then live-test on a host with Miniconda. |
+| CUDA validate-only by default, versioned modules when detected. | Validate-only CUDA discovery checks `/usr/local/cuda` and `/usr/local/cuda-*`, renders `cuda` plus `cuda/<version>` when a reviewed default exists, renders versioned modules only when multiple toolkits need default review, and verifies load/unload, `nvidia-smi`, optional `nvcc`, library path, and optional sample compile/run. Live Quadro had no CUDA toolkit and reported a clean skip while Slurm GPU jobs still worked through the driver. | Implemented partially | `ssn/modules.py`, `ssn-modules`, `ssn_modules` role, `docs/modules-cuda.md`, live Quadro module status/verify | Live-test on a host with an installed CUDA toolkit; deepen CUDA ordering checks in GPU health. |
+| Admin-run updates, smoke checks, rollback targets. | Validate-only smoke checks now exist, and no unattended updates occur. There is still no admin-run update/rollback workflow for changing shared software defaults. | Implemented partially | `ssn/modules.py`, `policies/modules.yml` | Build update/rollback workflow once managed shared software is in scope. |
 | Optional Apptainer and `/tools/containers`. | Root exists; Apptainer install/config absent. | Implemented partially | `ssn_modules` role | Add optional profile-controlled Apptainer role. |
 
 ## Project Groups
@@ -279,14 +289,14 @@ CUDA/module management, and production-grade user docs.
 | `policies/tiers.yml` shape. | Policy exists and drives QoS/rendered tiers. | Implemented correctly | `policies/tiers.yml`, `ssn/config.py` | Add tests for all tier variants. |
 | `policies/storage.yml` shape. | Policy exists; directory creation, per-job scratch, scratch health marker gating, token-gated quota enablement, fixture quota apply, fixture-only cleanup apply, archive hook directory, and fixture backup-hook lifecycle are active. Real-user quota rollout and production cleanup deletion remain incomplete. | Implemented partially | `policies/storage.yml`, `ssn/storage.py`, `ssn/users.py`, storage role, live Quadro quota test | Implement real-user quota rollout/cleanup enforcement and Slurm-submitted archive jobs after policy signoff. |
 | `policies/cache.yml` shape. | Policy exists and is injected into login shells and Slurm jobs as defaults. | Implemented correctly | `policies/cache.yml`, `ssn-profile.sh.j2`, `ssn-job-env-task-prolog.j2`, live `--export=NONE` job | Add profile-specific cache extensions only when needed. |
-| `policies/modules.yml` shape. | Policy exists; roots only. | Implemented partially | `policies/modules.yml`, modules role | Implement module/CUDA behavior. |
+| `policies/modules.yml` shape. | Policy drives Lmod enablement, shared roots, validate-only CUDA behavior, Miniconda root detection, smoke-check expectations, and no-unattended-update defaults. Modulefile rendering is active for detected CUDA/Miniconda. Managed installs and updates remain out of scope. | Implemented partially | `policies/modules.yml`, `ssn/modules.py`, modules role, live Quadro module verification | Live-test with real CUDA/Miniconda installs and add update/rollback workflow if needed. |
 | `policies/login.yml` shape. | Policy exists; conservative limits/banner are active, and fixture-scoped systemd login-slice enforcement plus GPU cgroup denial are implemented through explicit admin commands. Production-wide policy application remains incomplete. | Implemented partially | `policies/login.yml`, `ssn_user_policy` role, `ssn/login.py`, live Quadro tests | Generalize and harden login/GPU isolation beyond fixtures. |
 
 ## User-Facing Docs And Examples
 
 | Decision / Requirement | Current Code State | Status Bucket | Evidence | Follow-up Needed |
 |---|---|---|---|---|
-| New `user-kit/` docs and examples. | Basic docs and CPU/GPU examples exist. The README now explains constrained login, direct GPU denial, `ssn-gpu-status`, and Slurm GPU workflow. | Implemented partially | `user-kit/README.md`, `user-kit/examples/` | Generate/profile-check examples and expand guidance. |
+| New `user-kit/` docs and examples. | Basic docs and CPU/GPU examples exist. The README now explains constrained login, direct GPU denial, `ssn-gpu-status`, Slurm GPU workflow, and validate-only shared modules/CUDA expectations. | Implemented partially | `user-kit/README.md`, `user-kit/examples/` | Generate/profile-check examples and expand guidance. |
 | Remove missing `gpu-shell`/`gpu-jupyter` helper model. | New docs use `sbatch`/`srun`; old `SLURM-user-kit` still exists for reference. | Implemented correctly | `user-kit/` | Decide when to archive/remove old user kit. |
 | Interactive workflows examples only. | `20-interactive-srun.sh` exists; no helper command added. | Implemented correctly | `user-kit/examples/20-interactive-srun.sh` | Add caveats around preemption/cancellation. |
 
@@ -301,7 +311,7 @@ CUDA/module management, and production-grade user docs.
 | Resumable apply/sync workflows. | Partial user state update exists; install reports phases. Not truly resumable. | Yet to be implemented | `ssn/install.py`, `ssn/users.py` | Add staged reconciliation and repair plans. |
 | GPU verification tests include login denial and Slurm GPU access. | Fixture-scoped login denial and Slurm GPU access by the same user were live-tested on Quadro in the prior round. This round added structured GPU health verification and CPU-only recovery testing. Multi-GPU mapping and production-wide rollout remain incomplete. | Implemented partially | `ssn/gpu.py`, live Quadro login/GPU tests, `ssn-verify`, recovery test | Add multi-GPU verification suite and production rollout tests. |
 | Scratch-unhealthy, archive, hook, tombstone tests. | Scratch happy path, per-job cleanup, and unhealthy marker/job rejection were live-tested. Fixture inactive dry-plan, local archive, tombstone, token reuse, job cancellation, reactivation, no-hook refusal, failing backup hook, successful backup hook, and account-removal-after-backup were live-tested. Real external backup hooks remain untested. | Implemented partially | `ssn/storage.py`, `ssn/users.py`, live Quadro scratch and inactive lifecycle tests | Add real backup-hook success/failure tests before production inactive rollout. |
-| Static tests. | Unit tests, compileall, shell syntax, render checks, `git diff --check`, and remote static tests pass. Tests now include schema validation, capability gates, cli-filter capability checks, drain wait timeout behavior, user-sync idempotence, quota report/enable/fixture-apply safety, tombstone-aware UID/GID allocation, scratch health, cleanup operation hashes, fixture cleanup safety, retention test-artifact cleanup safety, inactive plan reports, backup hook gating, prune manifests, fixture-limited inactive apply, GPU verification parsing, and recovery plan safety. | Implemented correctly | `tests/`, live session notes | Add CI entrypoint when repo is ready. |
+| Static tests. | Unit tests, compileall, shell syntax, render checks, `git diff --check`, and remote static tests pass. Tests now include schema validation, capability gates, cli-filter capability checks, drain wait timeout behavior, user-sync idempotence, quota report/enable/fixture-apply safety, tombstone-aware UID/GID allocation, scratch health, cleanup operation hashes, fixture cleanup safety, retention test-artifact cleanup safety, inactive plan reports, backup hook gating, prune manifests, fixture-limited inactive apply, GPU verification parsing, recovery plan safety, and module/CUDA validate-only detection/rendering. | Implemented correctly | `tests/`, live session notes | Add CI entrypoint when repo is ready. |
 
 ## Implemented Extra
 
@@ -325,6 +335,7 @@ CUDA/module management, and production-grade user docs.
 | Explicit drain workflow. | `ssn-install` and `ssn-apply --run` support `--drain`, `--drain-timeout`, and `--drain-reason`; live tests covered success, timeout safe resume, and drained reinstall idempotence. | `ssn/install.py`, `ssn/cli.py`, `ssn/ops.py`, live Quadro reports | Keep; consider pending-job hold semantics only if future workflows need it. |
 | Fixture-scoped login isolation commands. | Added `ssn-login-isolation` and `ssn-login-status` for cgroup/ACL/disabled modes and per-user slice reporting. Live cgroup mode succeeded; ACL fallback code exists but was not needed live. | `ssn/login.py`, `bin/ssn-login-isolation`, `bin/ssn-login-status`, live Quadro tests | Keep fixture-scoped until wider rollout is approved. |
 | Root GPU status collector. | Added `ssn-gpu-collector` plus `ssn-gpu-status.service/timer`; live snapshot and single-GPU job mapping passed. | `ssn/login.py`, `bin/ssn-gpu-collector`, admin tools role, live Quadro tests | Harden multi-GPU mapping. |
+| Validate-only modules workflow. | Added `ssn-modules status/verify`, Lmod module path setup, detected-software modulefile rendering under `/tools/modules/Core`, install/apply module verification reports, and module/CUDA ops docs. Live Quadro verified Lmod path setup for root and `ssn-test-standard`; CUDA and Miniconda were absent and skipped cleanly. | `ssn/modules.py`, `bin/ssn-modules`, `ssn_modules` role, `docs/modules-cuda.md`, live Quadro module tests | Live-test CUDA and Miniconda modulefiles on a host with those toolkits installed. |
 | Fixture inactive lifecycle. | Added token-gated inactive dry-plan/apply for fixtures, including prune manifest, local archive, backup-hooked archive path, backup failure/success states, tombstone, and reactivation validation. Live Quadro tested both `ssn-test-inactive` and `ssn-test-inactive-prod`. | `ssn/users.py`, `ssn/cli.py`, live Quadro inactive tests | Keep non-fixture production removal disabled until real backup hooks and approvals are ready. |
 | Slurm `cli_filter/lua` no-requeue filter. | Added managed `CliFilterPlugins=cli_filter/lua`, `CliFilterParameters=cli_filter_lua_path=/etc/slurm/cli_filter.lua`, and `cli_filter.lua` to reject no-requeue client options and script directives. Live tests verified absolute `/usr/bin/sbatch --no-requeue` and script `#SBATCH --no-requeue` rejection. This Slurm build normalizes absolute `/usr/bin/sbatch --requeue=0` to `requeue`, so that exact spelling is only rejected by the managed wrapper, not by the absolute binary. | `policies/slurm-core.yml`, `slurm.conf.j2`, `cli_filter.lua.j2`, live Quadro no-requeue tests | Keep the documented Slurm bypass/normalization caveat in admin/user docs. |
 | Managed `sbatch` no-requeue wrapper. | Kept `/usr/local/bin/sbatch` wrapper as friendly fallback after adding `cli_filter/lua`; it rejects `--no-requeue`, script directives, and `--requeue=0/no/false`. Live Quadro confirmed wrapper `--requeue=0` rejection after finding the absolute-binary normalization limitation. | `sbatch-wrapper.j2`, `cli_filter.lua.j2`, live Quadro no-requeue test | Keep unless broader Slurm client filtering makes it unnecessary. |
@@ -386,6 +397,7 @@ CUDA/module management, and production-grade user docs.
   multi-GPU status mapping, login denial evidence, and Slurm job access.
 - Broaden CPU-only recovery from fixture-scoped operator workflow to a
   production-reviewed workflow for real GPU failures.
-- Add CUDA/toolkit/module validation and smoke-check workflow.
+- Live-test CUDA and Miniconda modulefiles on a host where those toolkits are
+  installed, then add managed module update/rollback workflow if needed.
 - Expand `user-kit/` into profile-accurate production docs and examples.
 - Validate DGX/V100 render and behavior parity before replacing Tesla tooling.

@@ -28,6 +28,7 @@ from .login import (
     login_isolation_status,
     login_isolation_status_for_report,
 )
+from .modules import modules_status_report, modules_verify_errors, modules_verify_report
 from .ops import (
     collect_capabilities,
     create_plan_token,
@@ -97,6 +98,7 @@ def main(argv: list[str] | None = None, prog: str | None = None) -> int:
         "ssn-gpu-recovery": gpu_recovery_cmd,
         "ssn-login-isolation": login_isolation_cmd,
         "ssn-login-status": login_status_cmd,
+        "ssn-modules": modules_cmd,
         "ssn-archive-status": archive_status_cmd,
         "ssn-scratch-cleanup": scratch_cleanup_cmd,
         "ssn-retention-cleanup": retention_cleanup_cmd,
@@ -119,6 +121,7 @@ def main(argv: list[str] | None = None, prog: str | None = None) -> int:
     sub.add_parser("gpu-recovery")
     sub.add_parser("login-isolation")
     sub.add_parser("login-status")
+    sub.add_parser("modules")
     sub.add_parser("archive-status")
     sub.add_parser("scratch-cleanup")
     sub.add_parser("retention-cleanup")
@@ -137,6 +140,7 @@ def main(argv: list[str] | None = None, prog: str | None = None) -> int:
         "gpu-recovery": gpu_recovery_cmd,
         "login-isolation": login_isolation_cmd,
         "login-status": login_status_cmd,
+        "modules": modules_cmd,
         "archive-status": archive_status_cmd,
         "scratch-cleanup": scratch_cleanup_cmd,
         "retention-cleanup": retention_cleanup_cmd,
@@ -345,6 +349,14 @@ def apply_cmd(argv: list[str]) -> int:
                 if gpu_errors:
                     raise RuntimeError("GPU verification failed: " + "; ".join(gpu_errors))
                 report["phases"].append({"name": "gpu_verification", "status": "ok", "time": dt.datetime.now(dt.timezone.utc).isoformat()})
+            modules_policy = resolved.get("resolved_policies", {}).get("modules") or {}
+            if modules_policy.get("lmod"):
+                modules_report = modules_verify_report(resolved)
+                report["modules_verification"] = modules_report
+                module_errors = modules_verify_errors(modules_report)
+                if module_errors:
+                    raise RuntimeError("module verification failed: " + "; ".join(module_errors))
+                report["phases"].append({"name": "modules_verification", "status": "ok", "time": dt.datetime.now(dt.timezone.utc).isoformat()})
             if drain_info and drain_info.get("initiated_by_ssn"):
                 resume_node(resolved["identity"]["node_name"])
                 report["phases"].append({"name": "node_resume", "status": "ok", "time": dt.datetime.now(dt.timezone.utc).isoformat()})
@@ -1127,6 +1139,50 @@ def login_status_cmd(argv: list[str]) -> int:
     return 0
 
 
+def modules_cmd(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="ssn-modules")
+    sub = parser.add_subparsers(dest="command", required=True)
+    for name in ("status", "verify"):
+        child = sub.add_parser(name)
+        child.add_argument("--profile", default="cpu-dev-local")
+        child.add_argument("--repo", default=None)
+        child.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+
+    try:
+        resolved = resolve_profile(args.profile, repo_root(args.repo))
+        report = modules_status_report(resolved) if args.command == "status" else modules_verify_report(resolved)
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    elif args.command == "status":
+        cuda = report.get("cuda") or {}
+        miniconda = report.get("miniconda") or {}
+        lmod = report.get("lmod") or {}
+        print(f"Modules status: profile={report.get('profile')}")
+        print(f"Lmod init: {lmod.get('init_bash') or 'missing'}")
+        print(f"CUDA: {cuda.get('status')} ({cuda.get('reason')})")
+        for toolkit in cuda.get("toolkits") or []:
+            print(
+                f"CUDA_TOOLKIT root={toolkit.get('root')} "
+                f"version={toolkit.get('version') or '-'} "
+                f"nvcc={toolkit.get('has_nvcc')}"
+            )
+        print(f"Miniconda: {miniconda.get('status')} ({miniconda.get('reason')})")
+        for modulefile in report.get("modulefiles") or []:
+            print(f"MODULE {modulefile.get('name')} -> {modulefile.get('path')}")
+    else:
+        print(f"Modules verify: profile={report.get('profile')} healthy={report.get('healthy')}")
+        for check in report.get("checks") or []:
+            print(f"{check['status']:4s} {check['name']}: {check['detail']}")
+    if args.command == "verify":
+        return 1 if modules_verify_errors(report) else 0
+    return 0
+
+
 def archive_status_cmd(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="ssn-archive-status")
     parser.add_argument("--state", default=DEFAULT_STATE)
@@ -1410,6 +1466,11 @@ def verify_local(resolved: dict[str, Any]) -> list[dict[str, str]]:
         report = gpu_verification_report(resolved)
         for check in report.get("checks", []):
             checks.append({"name": f"gpu_{check['name']}", "status": check["status"], "detail": check["detail"]})
+    modules_policy = resolved.get("resolved_policies", {}).get("modules") or {}
+    if modules_policy.get("lmod"):
+        report = modules_verify_report(resolved)
+        for check in report.get("checks", []):
+            checks.append({"name": f"modules_{check['name']}", "status": check["status"], "detail": check["detail"]})
     return checks
 
 

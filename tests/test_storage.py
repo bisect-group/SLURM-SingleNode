@@ -9,9 +9,11 @@ from unittest import mock
 
 from ssn.config import resolve_profile
 from ssn.storage import (
+    SCRATCH_CLEANUP_RISK,
     STORAGE_QUOTA_ENABLE_RISK,
     apply_fixture_scratch_cleanup,
     apply_fixture_quotas,
+    apply_user_scratch_cleanup,
     cleanup_operation_hash,
     enable_storage_quotas,
     parse_fixture_quota_overrides,
@@ -77,6 +79,34 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(report["mounts"]["home"]["mountpoint"], "/")
         self.assertEqual(report["mounts"]["home"]["hard_kb"], 64 * 1024)
         self.assertEqual(report["mounts"]["scratch"]["hard_kb"], 128 * 1024)
+
+    def test_quota_report_all_managed_is_report_only(self) -> None:
+        resolved = resolve_profile("gpu-bisect-quadro-p620", ROOT)
+        users_doc = {
+            "schema_version": 1,
+            "groups": {},
+            "users": {
+                "ssn-test-quota": {"status": "active", "tier": "standard"},
+                "realuser": {"status": "active", "tier": "standard"},
+                "suspended": {"status": "suspended", "tier": "standard"},
+            },
+        }
+
+        with (
+            mock.patch("ssn.storage._findmnt_info", return_value={"target": "/data", "source": "dev", "fstype": "ext4", "options": "rw", "raw": "raw"}),
+            mock.patch("ssn.storage._find_fstab_entry", return_value={"options": "defaults"}),
+            mock.patch(
+                "ssn.storage._quota_active_for_mount",
+                return_value={"quotaon": "user quota is on", "repquota_user_rc": 0, "repquota_group_rc": 0, "active_user_quota": True, "active_group_quota": True},
+            ),
+            mock.patch("ssn.storage.shutil.which", return_value="/usr/sbin/tool"),
+            mock.patch("ssn.storage._pwd_entry", return_value=None),
+        ):
+            report = quota_capability_report(users_doc, resolved, scope="all_managed")
+
+        self.assertEqual(report["scope"], "all_managed")
+        self.assertEqual(report["managed_users"], ["realuser", "ssn-test-quota"])
+        self.assertTrue(all(not user["apply_allowed"] for user in report["users"]))
 
     def test_apply_fixture_quotas_uses_overrides_and_fixture_users_only(self) -> None:
         resolved = resolve_profile("gpu-bisect-quadro-p620", ROOT)
@@ -248,6 +278,45 @@ class StorageTests(unittest.TestCase):
         applied = apply_fixture_scratch_cleanup(report)
         self.assertEqual(applied["deletion_results"][0]["status"], "skipped")
         self.assertEqual(applied["deletion_results"][0]["reason"], "already absent")
+
+    def test_user_scratch_cleanup_requires_cache_or_tmp_allowlist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "scratch"
+            jobs = root / "jobs"
+            old_file = root / "ssn-test-storage-cleanup" / "cache" / "old.bin"
+            unsafe = root / "ssn-test-storage-cleanup" / "other" / "old.bin"
+            old_file.parent.mkdir(parents=True)
+            unsafe.parent.mkdir(parents=True)
+            jobs.mkdir(parents=True)
+            old_file.write_text("x")
+            unsafe.write_text("x")
+            report = {
+                "schema_version": 1,
+                "command": "scratch-cleanup",
+                "mode": "report_only",
+                "risk": SCRATCH_CLEANUP_RISK,
+                "root": str(root),
+                "jobs_root_excluded": str(jobs),
+                "age_days": 30,
+                "cleanup_users": ["ssn-test-storage-cleanup"],
+                "candidates": [
+                    {"path": str(old_file), "type": "file", "username": "ssn-test-storage-cleanup"},
+                    {"path": str(unsafe), "type": "file", "username": "ssn-test-storage-cleanup"},
+                ],
+            }
+            report["operation_hash"] = cleanup_operation_hash(report)
+            with mock.patch("ssn.storage._user_has_active_slurm_job", return_value=False):
+                applied = apply_user_scratch_cleanup(
+                    report,
+                    allowed_users={"ssn-test-storage-cleanup"},
+                    require_scratch_root=False,
+                )
+
+            results = {Path(item["path"]).name + ":" + Path(item["path"]).parent.name: item["status"] for item in applied["deletion_results"]}
+            self.assertEqual(results["old.bin:cache"], "deleted")
+            self.assertEqual(results["old.bin:other"], "skipped")
+            self.assertFalse(old_file.exists())
+            self.assertTrue(unsafe.exists())
 
 
 if __name__ == "__main__":

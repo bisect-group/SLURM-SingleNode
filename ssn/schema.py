@@ -432,6 +432,7 @@ def _expected_type(path: str) -> str | None:
         "run_after_boot",
         "run_after_apply",
         "health_gate",
+        "nondurable_data",
         "admins_exempt",
         "applies_to_slurm_jobs",
         "slurm_job_cgroups_owned_by_slurm",
@@ -498,6 +499,7 @@ def _expected_type(path: str) -> str | None:
         "users_state_yml",
         "gpu_verification",
         "recovery",
+        "storage_acknowledgements",
         "overrides",
         "requires",
         "injection",
@@ -807,6 +809,9 @@ PROFILE_SCHEMA: dict[str, Any] = {
                 "cpu_jobs": None,
             },
             "checks": None,
+        },
+        "storage_acknowledgements": {
+            "nondurable_data": None,
         },
     },
     "overrides": {

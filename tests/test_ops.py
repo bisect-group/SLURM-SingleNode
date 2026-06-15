@@ -195,6 +195,41 @@ class FeatureGateTests(unittest.TestCase):
         errors = validate_feature_gates(resolved, mode="apply", capabilities=capabilities)
         self.assertTrue(any("cli_filter/lua" in error for error in errors))
 
+    def test_feature_gate_requires_nondurable_storage_ack_on_apply(self) -> None:
+        resolved = {
+            "derived": {"has_gpus": False, "paths": {}},
+            "operations": {},
+            "resolved_policies": {
+                "storage": {
+                    "durability": {"nondurable_ack_required": True},
+                    "quotas": {},
+                    "job_scratch": {},
+                },
+                "slurm_core": {"submit_filter": {"client_filter": {"enabled": False}}},
+            },
+        }
+        capabilities = {
+            "cgroup_fs": "cgroup2fs",
+            "commands": {
+                "ansible-playbook": "/usr/bin/ansible-playbook",
+                "lua5.3": "/usr/bin/lua5.3",
+                "scontrol": "/usr/bin/scontrol",
+                "squeue": "/usr/bin/squeue",
+                "slurmd": "/usr/sbin/slurmd",
+                "sacctmgr": "/usr/bin/sacctmgr",
+                "sinfo": "/usr/bin/sinfo",
+                "sbatch": "/usr/bin/sbatch",
+            },
+            "mounts": {},
+            "slurm": {"accounting_cluster": "ssn", "cli_filter_lua_plugin": "/usr/lib/slurm/cli_filter_lua.so"},
+        }
+        errors = validate_feature_gates(resolved, mode="apply", capabilities=capabilities)
+        self.assertTrue(any("nondurable_data acknowledgment" in error for error in errors))
+
+        resolved["operations"] = {"storage_acknowledgements": {"nondurable_data": True}}
+        errors = validate_feature_gates(resolved, mode="apply", capabilities=capabilities)
+        self.assertFalse(any("nondurable_data acknowledgment" in error for error in errors))
+
 
 if __name__ == "__main__":
     unittest.main()

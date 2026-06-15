@@ -109,15 +109,25 @@ sudo ssn-login-isolation --profile gpu-bisect-quadro-p620 \
 
 ## Retention Cleanup
 
-Production retention is still report-only. `ssn-retention-cleanup` can delete
-only explicit SSN test artifacts after a reviewed `retention_delete` token.
-Candidates whose names do not start with `ssn-test-` or `tmp-ssn-test-` are
-skipped, even with a token. Apply also skips symlinks and candidates outside
-the reviewed report root.
+`ssn-retention-cleanup` can now trial production-shaped deletion under
+SSN-owned retention roots after a reviewed `retention_delete` token. The
+allowed production roots are:
+
+- `/var/lib/slurm-single-node/plans`
+- `/var/backups/slurm-single-node/users`
+- `/var/backups/slurm-single-node/fstab`
+
+Apply requires `--allow-production-roots`, `--yes-delete`, a matching
+operation hash, and a single-use token. It only considers direct children of
+the reviewed root, skips symlinks, skips path-traversal candidates, and applies
+root-specific name allowlists such as `install-*`, `apply-*`,
+`storage-quotas-*`, `users.yml.*`, and `users-state.yml.*`. Test-artifact names
+starting with `ssn-test-` or `tmp-ssn-test-` remain allowed for disposable live
+tests.
 
 ```bash
 sudo ssn-retention-cleanup --profile gpu-bisect-quadro-p620 \
-  --root /tmp/ssn-retention-bridge-root \
+  --root /var/lib/slurm-single-node/plans \
   --older-than-days 1 \
   --report /var/lib/slurm-single-node/plans/ssn-test-retention/report.json
 
@@ -127,10 +137,27 @@ sudo ssn-plan-token create \
   --reason "reviewed SSN test retention cleanup"
 
 sudo ssn-retention-cleanup --apply --yes-delete \
-  --root /tmp/ssn-retention-bridge-root \
+  --allow-production-roots \
+  --root /var/lib/slurm-single-node/plans \
   --report /var/lib/slurm-single-node/plans/ssn-test-retention/report.json \
   --plan-token <token>
 ```
+
+## Scratch Cleanup
+
+Production-shaped scratch cleanup is also tokenized and exact-user allowlisted.
+Reports can scan aged children under `/scratch/$USER/cache` and
+`/scratch/$USER/tmp`:
+
+```bash
+sudo ssn-scratch-cleanup --profile gpu-bisect-quadro-p620 \
+  --allow-cleanup-user ssn-test-storage-cleanup \
+  --report /var/lib/slurm-single-node/plans/ssn-test-scratch-cleanup/report.json
+```
+
+Apply requires `--allow-cleanup-user USER`, `--yes-delete`, and a reviewed
+`scratch_cleanup` token. It skips `/scratch/jobs`, symlinks, cache/tmp roots
+themselves, non-allowlisted users, and users with active Slurm jobs.
 
 ## No-Requeue Caveat
 

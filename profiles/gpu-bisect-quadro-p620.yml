@@ -37,3 +37,7 @@ overrides:
     tiers: starter-single-gpu-small
     storage: standard-three-area
     cache: broad-dev
+
+operations:
+  storage_acknowledgements:
+    nondurable_data: true

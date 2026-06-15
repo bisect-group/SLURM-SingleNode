@@ -215,6 +215,9 @@ def validate_users(
         if not _valid_username(username):
             errors.append(f"users.{username}: invalid username")
             continue
+        if username in PROTECTED_LIFECYCLE_USERS:
+            errors.append(f"users.{username}: protected local user cannot be managed by users.yml")
+            continue
         if not isinstance(user, dict):
             errors.append(f"users.{username}: user entry must be a map")
             continue

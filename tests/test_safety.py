@@ -7,6 +7,8 @@ import unittest
 from pathlib import Path
 
 from ssn.safety import (
+    ALLOWED_RETENTION_ROOTS,
+    apply_retention_cleanup,
     apply_test_retention_cleanup,
     mask_email,
     redact_for_plan,
@@ -98,6 +100,42 @@ class SafetyTests(unittest.TestCase):
             self.assertEqual(applied["deletion_results"][0]["status"], "skipped")
             self.assertEqual(applied["deletion_results"][0]["reason"], "outside retention root")
             self.assertTrue(outside.exists())
+
+    def test_retention_cleanup_production_root_requires_explicit_allow(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "plans"
+            root.mkdir()
+            old_plan = root / "install-20200101000000"
+            old_plan.mkdir()
+            old_time = time.time() - 10 * 86400
+            os.utime(old_plan, (old_time, old_time))
+            report = retention_cleanup_report(root, older_than_days=1)
+            report["root"] = "/var/lib/slurm-single-node/plans"
+            report["candidates"][0]["path"] = "/var/lib/slurm-single-node/plans/install-20200101000000"
+            report["operation_hash"] = retention_operation_hash(report)
+
+            with self.assertRaisesRegex(ValueError, "requires --allow-production-roots"):
+                apply_retention_cleanup(report)
+
+    def test_retention_cleanup_production_root_allows_known_prefixes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_root = Path(tmp) / "plans"
+            fake_root.mkdir()
+            old_plan = fake_root / "install-20200101000000"
+            old_plan.mkdir()
+            old_time = time.time() - 10 * 86400
+            os.utime(old_plan, (old_time, old_time))
+            report = retention_cleanup_report(fake_root, older_than_days=1)
+            report["root"] = str(fake_root)
+            ALLOWED_RETENTION_ROOTS[str(fake_root)] = ("install-",)
+            report["operation_hash"] = retention_operation_hash(report)
+            try:
+                applied = apply_retention_cleanup(report, allow_production_roots=True)
+            finally:
+                ALLOWED_RETENTION_ROOTS.pop(str(fake_root), None)
+
+            self.assertEqual(applied["deletion_results"][0]["status"], "deleted")
+            self.assertFalse(old_plan.exists())
 
 
 if __name__ == "__main__":

@@ -45,9 +45,12 @@ from .ops import (
 )
 from .storage import (
     DEFAULT_FIXTURE_PREFIX,
+    FIXTURE_SCRATCH_CLEANUP_RISK,
+    SCRATCH_CLEANUP_RISK,
     STORAGE_QUOTA_ENABLE_RISK,
     apply_fixture_quotas,
     apply_fixture_scratch_cleanup,
+    apply_user_scratch_cleanup,
     enable_storage_quotas,
     parse_fixture_quota_overrides,
     quota_capability_report,
@@ -57,7 +60,7 @@ from .storage import (
     storage_quota_status,
     write_scratch_health_state,
 )
-from .safety import RETENTION_DELETE_RISK, apply_test_retention_cleanup, retention_cleanup_report
+from .safety import RETENTION_DELETE_RISK, apply_retention_cleanup, retention_cleanup_report
 from .units import duration_to_seconds
 from .users import (
     INACTIVE_ARCHIVE_RISK,
@@ -441,7 +444,13 @@ def sync_users_cmd(argv: list[str]) -> int:
     parser.add_argument("--token-store", default=DEFAULT_TOKEN_STORE)
     parser.add_argument("--backup-root", default="/var/backups/slurm-single-node/users")
     parser.add_argument("--retention-days", type=int, default=90)
-    parser.add_argument("--quota-report", action="store_true", help="report quota capability for fixture users")
+    parser.add_argument("--quota-report", action="store_true", help="report quota capability")
+    parser.add_argument(
+        "--quota-scope",
+        choices=["fixture", "all_managed"],
+        default="fixture",
+        help="quota report scope; all_managed is report-only",
+    )
     parser.add_argument(
         "--apply-fixture-quotas",
         action="store_true",
@@ -597,6 +606,8 @@ def sync_users_cmd(argv: list[str]) -> int:
 def _sync_users_quota_request(args: argparse.Namespace, users_doc: dict[str, Any], resolved: dict[str, Any]) -> int:
     try:
         quota_overrides = parse_fixture_quota_overrides(args.fixture_quota)
+        if args.apply_fixture_quotas and args.quota_scope != "fixture":
+            raise ValueError("--apply-fixture-quotas only supports --quota-scope fixture")
         quota = (
             apply_fixture_quotas(
                 users_doc,
@@ -609,6 +620,7 @@ def _sync_users_quota_request(args: argparse.Namespace, users_doc: dict[str, Any
                 users_doc,
                 resolved,
                 fixture_prefix=args.quota_fixture_prefix,
+                scope=args.quota_scope,
                 quota_overrides=quota_overrides,
             )
         )
@@ -619,7 +631,8 @@ def _sync_users_quota_request(args: argparse.Namespace, users_doc: dict[str, Any
         print(json.dumps({"quota": quota}, indent=2, sort_keys=True))
     else:
         print(
-            f"Quota {quota['mode']}: fixtures={len(quota.get('fixture_users', []))} "
+            f"Quota {quota['mode']}: scope={quota.get('scope')} users={len(quota.get('managed_users', []))} "
+            f"fixtures={len(quota.get('fixture_users', []))} "
             f"mounts={','.join(sorted(quota.get('mounts', {}))) or 'none'}"
         )
         for action in quota.get("actions", []):
@@ -1339,6 +1352,12 @@ def scratch_cleanup_cmd(argv: list[str]) -> int:
     parser.add_argument("--plan-token", default=None, help="reviewed token required with --apply")
     parser.add_argument("--token-store", default="/var/lib/slurm-single-node/plan-tokens")
     parser.add_argument("--fixture-prefix", default=DEFAULT_FIXTURE_PREFIX)
+    parser.add_argument(
+        "--allow-cleanup-user",
+        action="append",
+        default=[],
+        help="exact username whose /scratch/USER/cache and /scratch/USER/tmp candidates may be deleted",
+    )
     args = parser.parse_args(argv)
 
     root = Path(args.root).resolve()
@@ -1362,13 +1381,18 @@ def scratch_cleanup_cmd(argv: list[str]) -> int:
     if args.apply:
         try:
             report = json.loads(report_path.read_text())
+            risk = SCRATCH_CLEANUP_RISK if args.allow_cleanup_user else FIXTURE_SCRATCH_CLEANUP_RISK
             validate_plan_token(
                 args.plan_token,
                 report,
-                risk="fixture_scratch_cleanup",
+                risk=risk,
                 store_root=args.token_store,
             )
-            applied = apply_fixture_scratch_cleanup(report, fixture_prefix=args.fixture_prefix)
+            applied = (
+                apply_user_scratch_cleanup(report, allowed_users=set(args.allow_cleanup_user))
+                if args.allow_cleanup_user
+                else apply_fixture_scratch_cleanup(report, fixture_prefix=args.fixture_prefix)
+            )
             report_path.write_text(json.dumps(applied, indent=2, sort_keys=True) + "\n")
         except Exception as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
@@ -1391,11 +1415,13 @@ def scratch_cleanup_cmd(argv: list[str]) -> int:
         age_days=args.age_days,
         profile=args.profile,
         resolved=resolved,
+        cleanup_users=args.allow_cleanup_user,
     )
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     print(f"Scratch cleanup report written: {report_path}")
-    print(f"Eligible top-level scratch paths: {report['candidate_count']}")
+    print(f"Eligible scratch paths: {report['candidate_count']}")
+    print(f"Risk: {report['risk']}")
     return 0
 
 
@@ -1411,6 +1437,11 @@ def retention_cleanup_cmd(argv: list[str]) -> int:
     parser.add_argument("--plan-token", default=None, help="reviewed token required with --apply")
     parser.add_argument("--token-store", default=DEFAULT_TOKEN_STORE)
     parser.add_argument("--fixture-prefix", default=DEFAULT_FIXTURE_PREFIX)
+    parser.add_argument(
+        "--allow-production-roots",
+        action="store_true",
+        help="allow reviewed deletion under SSN-owned retention roots",
+    )
     args = parser.parse_args(argv)
 
     if args.apply and not args.yes_delete:
@@ -1430,7 +1461,11 @@ def retention_cleanup_cmd(argv: list[str]) -> int:
                 risk=RETENTION_DELETE_RISK,
                 store_root=args.token_store,
             )
-            applied = apply_test_retention_cleanup(report, fixture_prefix=args.fixture_prefix)
+            applied = apply_retention_cleanup(
+                report,
+                fixture_prefix=args.fixture_prefix,
+                allow_production_roots=args.allow_production_roots,
+            )
             report_path.write_text(json.dumps(applied, indent=2, sort_keys=True) + "\n")
         except Exception as exc:
             print(f"ERROR: {exc}", file=sys.stderr)

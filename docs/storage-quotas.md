@@ -48,6 +48,20 @@ repquota -u / /data /scratch
 
 ## Fixture Quotas
 
+Report the intended quota state for every active managed user without changing
+the system:
+
+```bash
+sudo ssn-sync-users --profile gpu-bisect-quadro-p620 \
+  --quota-report \
+  --quota-scope all_managed \
+  --json
+```
+
+The all-managed scope is report-only. It shows the target quota for each active
+managed user, mount evidence, current quota evidence where `repquota` can read
+it, drift, and whether an apply path is allowed.
+
 Fixture tests can use tiny quotas without changing policy defaults:
 
 ```bash
@@ -60,6 +74,45 @@ sudo ssn-sync-users --profile gpu-bisect-quadro-p620 \
 
 This path only applies to users matching the configured fixture prefix,
 defaulting to `ssn-test-*`.
+
+## Storage Acknowledgment
+
+Profiles using nondurable `/data` storage must explicitly acknowledge that
+active data and inactive archives require external backup or replication before
+install/apply can proceed. The Quadro test profile sets this acknowledgment
+because the host is disposable. Generic production profiles should add the
+acknowledgment only after site review.
+
+```yaml
+operations:
+  storage_acknowledgements:
+    nondurable_data: true
+```
+
+## Scratch Cleanup
+
+Scratch cleanup is report-only by default. Production-shaped deletion requires
+a reviewed token and exact user allowlist. Candidates are limited to aged
+children of `/scratch/$USER/cache` and `/scratch/$USER/tmp`; SSN skips
+symlinks, `/scratch/jobs`, protected cache/tmp roots themselves, and users with
+active Slurm jobs.
+
+```bash
+sudo ssn-scratch-cleanup --profile gpu-bisect-quadro-p620 \
+  --allow-cleanup-user ssn-test-storage-cleanup \
+  --age-days 30 \
+  --report /var/lib/slurm-single-node/plans/ssn-test-storage-cleanup/scratch-cleanup.json
+
+sudo ssn-plan-token create \
+  --plan /var/lib/slurm-single-node/plans/ssn-test-storage-cleanup/scratch-cleanup.json \
+  --risk scratch_cleanup \
+  --reason "reviewed scratch cleanup"
+
+sudo ssn-scratch-cleanup --apply --yes-delete \
+  --allow-cleanup-user ssn-test-storage-cleanup \
+  --report /var/lib/slurm-single-node/plans/ssn-test-storage-cleanup/scratch-cleanup.json \
+  --plan-token <token>
+```
 
 ## Recovery
 

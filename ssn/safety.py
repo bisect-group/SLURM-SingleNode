@@ -12,6 +12,11 @@ from .config import config_hash
 
 SECRET_KEY_PARTS = ("password", "passwd", "secret", "token", "private_key")
 RETENTION_DELETE_RISK = "retention_delete"
+ALLOWED_RETENTION_ROOTS = {
+    "/var/lib/slurm-single-node/plans": ("apply-", "install-", "storage-quotas-", "gpu-recovery-", "ssn-test-", "tmp-ssn-test-"),
+    "/var/backups/slurm-single-node/users": ("users.yml.", "users-state.yml.", "ssn-test-", "tmp-ssn-test-"),
+    "/var/backups/slurm-single-node/fstab": ("ssn-test-", "tmp-ssn-test-"),
+}
 
 
 def mask_email(value: str) -> str:
@@ -101,6 +106,7 @@ def retention_cleanup_report(
         "risk": RETENTION_DELETE_RISK,
         "mode": "report_only",
         "root": str(root),
+        "production_root_allowed": str(root) in ALLOWED_RETENTION_ROOTS,
         "older_than_days": older_than_days,
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "candidates": retention_candidates(root, older_than_days=older_than_days),
@@ -115,9 +121,27 @@ def apply_test_retention_cleanup(
     *,
     fixture_prefix: str = "ssn-test-",
 ) -> dict[str, Any]:
+    return apply_retention_cleanup(
+        report,
+        fixture_prefix=fixture_prefix,
+        allow_production_roots=False,
+    )
+
+
+def apply_retention_cleanup(
+    report: dict[str, Any],
+    *,
+    fixture_prefix: str = "ssn-test-",
+    allow_production_roots: bool = False,
+) -> dict[str, Any]:
     if report.get("operation_hash") != retention_operation_hash(report):
         raise ValueError("retention report operation_hash does not match candidates")
     root = Path(str(report.get("root", ""))).resolve()
+    production_root = str(root) in ALLOWED_RETENTION_ROOTS
+    if production_root and not allow_production_roots:
+        raise ValueError("production SSN retention root cleanup requires --allow-production-roots")
+    if not production_root and allow_production_roots:
+        raise ValueError(f"not an allowed SSN retention root: {root}")
     results = []
     for candidate in report.get("candidates") or []:
         raw_path = Path(str(candidate.get("path", "")))
@@ -132,8 +156,9 @@ def apply_test_retention_cleanup(
         if raw_path.is_symlink():
             results.append({"path": display_path, "status": "skipped", "reason": "symlink"})
             continue
-        if not _safe_retention_test_path(raw_path, fixture_prefix=fixture_prefix):
-            results.append({"path": display_path, "status": "skipped", "reason": "not an allowed SSN test artifact"})
+        if not _safe_retention_path(raw_path, root=root, fixture_prefix=fixture_prefix, production_root=production_root):
+            reason = "not an allowed SSN retention artifact" if production_root else "not an allowed SSN test artifact"
+            results.append({"path": display_path, "status": "skipped", "reason": reason})
             continue
         if not raw_path.exists():
             results.append({"path": display_path, "status": "skipped", "reason": "already absent"})
@@ -144,7 +169,7 @@ def apply_test_retention_cleanup(
             raw_path.unlink()
         results.append({"path": display_path, "status": "deleted"})
     applied = dict(report)
-    applied["mode"] = "test_artifact_apply"
+    applied["mode"] = "production_root_apply" if production_root else "test_artifact_apply"
     applied["deletion_results"] = results
     return applied
 
@@ -153,3 +178,18 @@ def _safe_retention_test_path(path: Path, *, fixture_prefix: str) -> bool:
     if path.name.startswith(fixture_prefix) or path.name.startswith("tmp-ssn-test-"):
         return True
     return False
+
+
+def _safe_retention_path(path: Path, *, root: Path, fixture_prefix: str, production_root: bool) -> bool:
+    if _safe_retention_test_path(path, fixture_prefix=fixture_prefix):
+        return True
+    if not production_root:
+        return False
+    prefixes = ALLOWED_RETENTION_ROOTS.get(str(root), ())
+    if str(root) == "/var/backups/slurm-single-node/fstab":
+        return path.is_dir() and _timestamp_like_name(path.name)
+    return any(path.name.startswith(prefix) for prefix in prefixes)
+
+
+def _timestamp_like_name(value: str) -> bool:
+    return len(value) >= 14 and value[:14].isdigit()

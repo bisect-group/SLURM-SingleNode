@@ -20,6 +20,8 @@ DEFAULT_UNHEALTHY_MARKER = Path("/run/slurm-single-node/scratch-unhealthy")
 DEFAULT_FIXTURE_PREFIX = "ssn-test-"
 DEFAULT_QUOTA_LABELS = ("home", "data", "scratch")
 STORAGE_QUOTA_ENABLE_RISK = "storage_quota_enable"
+SCRATCH_CLEANUP_RISK = "scratch_cleanup"
+FIXTURE_SCRATCH_CLEANUP_RISK = "fixture_scratch_cleanup"
 
 
 def command_stdout(cmd: list[str]) -> str | None:
@@ -43,27 +45,41 @@ def quota_capability_report(
     resolved: dict[str, Any],
     *,
     fixture_prefix: str = DEFAULT_FIXTURE_PREFIX,
+    scope: str = "fixture",
     quota_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if scope not in {"fixture", "all_managed"}:
+        raise ValueError(f"unsupported quota report scope: {scope}")
     paths = resolved["derived"].get("paths") or {}
     quotas = resolved["resolved_policies"]["storage"].get("quotas") or {}
     quota_overrides = quota_overrides or {}
     users = users_doc.get("users") or {}
+    fixture_users = sorted(name for name in users if name.startswith(fixture_prefix))
+    if scope == "all_managed":
+        selected_users = sorted(
+            name for name, user in users.items() if (user or {}).get("status") == "active"
+        )
+    else:
+        selected_users = fixture_users
     report: dict[str, Any] = {
         "schema_version": 1,
         "command": "sync-users",
         "profile": resolved["profile"],
         "config_hash": config_hash(resolved),
         "mode": "quota_report",
+        "scope": scope,
         "fixture_prefix": fixture_prefix,
         "commands": {
             "setquota": shutil.which("setquota"),
             "quotaon": shutil.which("quotaon"),
             "repquota": shutil.which("repquota"),
+            "quota": shutil.which("quota"),
             "findmnt": shutil.which("findmnt"),
         },
         "mounts": {},
-        "fixture_users": sorted(name for name in users if name.startswith(fixture_prefix)),
+        "fixture_users": fixture_users,
+        "managed_users": selected_users,
+        "users": [],
     }
     for label in DEFAULT_QUOTA_LABELS:
         path = paths.get(label)
@@ -71,6 +87,16 @@ def quota_capability_report(
         if not path or not limit:
             continue
         report["mounts"][label] = _quota_mount_capability(str(path), limit)
+    for username in selected_users:
+        user = users.get(username) or {}
+        report["users"].append(
+            _quota_user_report(
+                username,
+                user,
+                report["mounts"],
+                apply_allowed=scope == "fixture" and username.startswith(fixture_prefix),
+            )
+        )
     return report
 
 
@@ -87,6 +113,7 @@ def apply_fixture_quotas(
         users_doc,
         resolved,
         fixture_prefix=fixture_prefix,
+        scope="fixture",
         quota_overrides=quota_overrides,
     )
     report["mode"] = "fixture_quota_apply"
@@ -379,37 +406,51 @@ def scratch_cleanup_report(
     age_days: int,
     profile: str | None = None,
     resolved: dict[str, Any] | None = None,
+    cleanup_users: list[str] | None = None,
 ) -> dict[str, Any]:
     root = Path(root).resolve()
     jobs_root = Path(jobs_root).resolve()
     candidates = []
     if root.exists():
         cutoff = dt.datetime.now(dt.timezone.utc).timestamp() - age_days * 86400
-        for child in sorted(root.iterdir()):
-            if child == jobs_root or child.is_symlink():
-                continue
-            try:
-                child_stat = child.stat()
-            except OSError:
-                continue
-            if child_stat.st_mtime > cutoff:
-                continue
-            candidates.append(
-                {
-                    "path": str(child),
-                    "mtime": dt.datetime.fromtimestamp(child_stat.st_mtime, dt.timezone.utc).isoformat(),
-                    "type": "directory" if child.is_dir() else "file",
-                }
-            )
+        if cleanup_users:
+            for username in sorted(set(cleanup_users)):
+                for base_name in ("cache", "tmp"):
+                    base = root / username / base_name
+                    if not base.exists() or base.is_symlink() or not base.is_dir():
+                        continue
+                    for child in sorted(base.iterdir()):
+                        if child == jobs_root or child.is_symlink():
+                            continue
+                        try:
+                            child_stat = child.stat()
+                        except OSError:
+                            continue
+                        if child_stat.st_mtime > cutoff:
+                            continue
+                        candidates.append(_cleanup_candidate(child, username=username, base=str(base)))
+        else:
+            for child in sorted(root.iterdir()):
+                if child == jobs_root or child.is_symlink():
+                    continue
+                try:
+                    child_stat = child.stat()
+                except OSError:
+                    continue
+                if child_stat.st_mtime > cutoff:
+                    continue
+                candidates.append(_cleanup_candidate(child))
     report: dict[str, Any] = {
         "schema_version": 1,
         "command": "scratch-cleanup",
         "mode": "report_only",
+        "risk": SCRATCH_CLEANUP_RISK if cleanup_users else FIXTURE_SCRATCH_CLEANUP_RISK,
         "profile": profile,
         "config_hash": config_hash(resolved) if resolved is not None else None,
         "root": str(root),
         "jobs_root_excluded": str(jobs_root),
         "age_days": age_days,
+        "cleanup_users": sorted(set(cleanup_users or [])),
         "candidate_count": len(candidates),
         "candidates": candidates,
     }
@@ -449,6 +490,54 @@ def apply_fixture_scratch_cleanup(
         results.append({"path": str(path), "status": "deleted"})
     applied = dict(report)
     applied["mode"] = "fixture_apply"
+    applied["deletion_results"] = results
+    return applied
+
+
+def apply_user_scratch_cleanup(
+    report: dict[str, Any],
+    *,
+    allowed_users: set[str],
+    require_scratch_root: bool = True,
+) -> dict[str, Any]:
+    root = Path(str(report.get("root", ""))).resolve()
+    jobs_root = Path(str(report.get("jobs_root_excluded", ""))).resolve()
+    if require_scratch_root and str(root) != "/scratch":
+        raise ValueError(f"refusing scratch cleanup outside /scratch: {root}")
+    if require_scratch_root and str(jobs_root) != "/scratch/jobs":
+        raise ValueError(f"refusing jobs root outside /scratch/jobs: {jobs_root}")
+    if report.get("operation_hash") != cleanup_operation_hash(report):
+        raise ValueError("scratch cleanup report operation_hash does not match candidates")
+    if not allowed_users:
+        raise ValueError("scratch cleanup apply requires at least one exact --allow-cleanup-user")
+    if not set(report.get("cleanup_users") or []).issubset(allowed_users):
+        raise ValueError("scratch cleanup token/report includes users that were not explicitly allowlisted")
+    results = []
+    for candidate in report.get("candidates") or []:
+        username = str(candidate.get("username") or "")
+        path = Path(str(candidate.get("path", ""))).resolve()
+        if username not in allowed_users:
+            results.append({"path": str(path), "status": "skipped", "reason": "user not allowlisted"})
+            continue
+        if _user_has_active_slurm_job(username):
+            results.append({"path": str(path), "status": "skipped", "reason": "user has active Slurm jobs"})
+            continue
+        if not _safe_user_cleanup_path(path, root=root, username=username):
+            results.append({"path": str(path), "status": "skipped", "reason": "not an allowed user scratch cache/tmp path"})
+            continue
+        if path == jobs_root or path.is_symlink():
+            results.append({"path": str(path), "status": "skipped", "reason": "protected path or symlink"})
+            continue
+        if not path.exists():
+            results.append({"path": str(path), "status": "skipped", "reason": "already absent"})
+            continue
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+        results.append({"path": str(path), "status": "deleted", "user": username})
+    applied = dict(report)
+    applied["mode"] = "allowlisted_user_apply"
     applied["deletion_results"] = results
     return applied
 
@@ -495,6 +584,82 @@ def _quota_mount_capability(path: str, limit: Any, *, fstab_path: str | Path = "
     if not mount["can_apply"]:
         mount["reason"] = "user quota is not active or setquota is missing"
     return mount
+
+
+def _quota_user_report(
+    username: str,
+    user: dict[str, Any],
+    mounts: dict[str, Any],
+    *,
+    apply_allowed: bool,
+) -> dict[str, Any]:
+    entry = _pwd_entry(username)
+    user_report: dict[str, Any] = {
+        "username": username,
+        "status": user.get("status"),
+        "tier": user.get("tier"),
+        "exists": entry is not None,
+        "apply_allowed": bool(apply_allowed and entry is not None),
+        "targets": {},
+    }
+    if entry is None:
+        user_report["reason"] = "user does not exist"
+    elif not apply_allowed:
+        user_report["reason"] = "report-only scope"
+    for label, mount in sorted(mounts.items()):
+        target = {
+            "path": mount.get("path"),
+            "mountpoint": mount.get("mountpoint"),
+            "policy_quota": mount.get("policy_quota"),
+            "hard_kb": mount.get("hard_kb"),
+            "can_apply": mount.get("can_apply"),
+            "current": _current_user_quota(username, str(mount.get("mountpoint") or "")) if entry else None,
+        }
+        current_hard = (target.get("current") or {}).get("hard_kb")
+        target["drift"] = (
+            "unknown"
+            if current_hard is None
+            else "ok"
+            if int(current_hard) == int(mount.get("hard_kb") or 0)
+            else "different"
+        )
+        user_report["targets"][label] = target
+    return user_report
+
+
+def _current_user_quota(username: str, mountpoint: str) -> dict[str, Any]:
+    if not mountpoint or shutil.which("repquota") is None:
+        return {"available": False, "reason": "repquota unavailable"}
+    entry = _pwd_entry(username)
+    if entry is None:
+        return {"available": False, "reason": "user missing"}
+    result = command_result(["repquota", "-uP", mountpoint])
+    evidence = {
+        "available": result["rc"] == 0,
+        "mountpoint": mountpoint,
+        "rc": result["rc"],
+    }
+    if result["rc"] != 0:
+        evidence["stderr"] = result["stderr"]
+        return evidence
+    wanted = {username, f"#{entry.pw_uid}"}
+    for line in result["stdout"].splitlines():
+        parts = line.split()
+        if len(parts) < 4 or parts[0] not in wanted:
+            continue
+        try:
+            evidence.update({"used_kb": int(parts[2]), "soft_kb": int(parts[3]), "hard_kb": int(parts[4])})
+        except (ValueError, IndexError):
+            evidence["raw"] = line
+        break
+    return evidence
+
+
+def _pwd_entry(username: str) -> pwd.struct_passwd | None:
+    try:
+        return pwd.getpwnam(username)
+    except KeyError:
+        return None
 
 
 def _selected_quota_labels(resolved: dict[str, Any], labels: list[str] | None) -> list[str]:
@@ -730,6 +895,20 @@ def _user_scratch_dir_check(username: str, path: Path) -> dict[str, str]:
     return {"name": f"user_scratch_{username}_{path.name}", "status": "PASS" if ok else "FAIL", "detail": detail}
 
 
+def _cleanup_candidate(path: Path, *, username: str | None = None, base: str | None = None) -> dict[str, Any]:
+    path_stat = path.stat()
+    candidate = {
+        "path": str(path),
+        "mtime": dt.datetime.fromtimestamp(path_stat.st_mtime, dt.timezone.utc).isoformat(),
+        "type": "directory" if path.is_dir() else "file",
+    }
+    if username:
+        candidate["username"] = username
+    if base:
+        candidate["base"] = base
+    return candidate
+
+
 def _safe_fixture_cleanup_path(path: Path, *, root: Path, fixture_prefix: str) -> bool:
     try:
         path.relative_to(root)
@@ -738,9 +917,31 @@ def _safe_fixture_cleanup_path(path: Path, *, root: Path, fixture_prefix: str) -
     return path.parent == root and path.name.startswith(fixture_prefix) and fixture_prefix.startswith("ssn-test-")
 
 
+def _safe_user_cleanup_path(path: Path, *, root: Path, username: str) -> bool:
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return False
+    parts = relative.parts
+    if len(parts) < 3:
+        return False
+    if parts[0] != username or parts[1] not in {"cache", "tmp"}:
+        return False
+    protected_roots = {root / username / "cache", root / username / "tmp", root / "jobs"}
+    return path not in protected_roots
+
+
 def _user_exists(username: str) -> bool:
     try:
         pwd.getpwnam(username)
         return True
     except KeyError:
         return False
+
+
+def _user_has_active_slurm_job(username: str) -> bool:
+    if shutil.which("squeue") is None:
+        return False
+    output = command_stdout(["squeue", "-h", "-u", username, "-o", "%T"]) or ""
+    active = {"BOOT_FAIL", "CONFIGURING", "COMPLETING", "RESIZING", "RUNNING", "SUSPENDED"}
+    return any(line.strip() in active for line in output.splitlines())

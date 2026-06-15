@@ -67,6 +67,18 @@ class UserTests(unittest.TestCase):
         errors = validate_users(users_doc, resolved)
         self.assertTrue(any("unknown keys" in error for error in errors))
 
+    def test_validate_users_rejects_protected_local_user(self) -> None:
+        resolved = resolve_profile("gpu-bisect-quadro-p620", ROOT)
+        users_doc = {
+            "schema_version": 1,
+            "groups": {},
+            "users": {
+                "adhil": {"status": "active", "tier": "standard"},
+            },
+        }
+        errors = validate_users(users_doc, resolved)
+        self.assertTrue(any("protected local user" in error for error in errors))
+
     def test_validate_users_rejects_uid_conflict(self) -> None:
         resolved = resolve_profile("cpu-dev-local", ROOT)
         users_doc = {

@@ -212,6 +212,11 @@ def validate_feature_gates(resolved: dict[str, Any], *, mode: str, capabilities:
             errors.append("Slurm cli_filter/lua plugin is required but cli_filter_lua.so was not found")
     storage = resolved["resolved_policies"]["storage"]
     paths = resolved["derived"].get("paths") or {}
+    if mode in {"apply", "install"}:
+        durability = storage.get("durability") or {}
+        acknowledgements = (resolved.get("operations") or {}).get("storage_acknowledgements") or {}
+        if durability.get("nondurable_ack_required") and acknowledgements.get("nondurable_data") is not True:
+            errors.append("storage policy requires explicit nondurable_data acknowledgment before apply/install")
     if storage.get("quotas", {}).get("fail_if_unavailable") or storage.get("job_scratch", {}).get("required_for_jobs"):
         for label in ("data", "scratch"):
             path = paths.get(label)
